@@ -18,6 +18,7 @@ def ti_icon(icon_enum, size=24, color="#FFFFFF", stroke_width=2.0) -> QIcon:
 
 # Packages to hide from the list (exact names provided)
 HIDDEN_PACKAGES_EXACT: set[str] = {
+    'pywin32',
     'autocommand',
     'backports.tarfile',
     'darkdetect',
@@ -130,7 +131,7 @@ class PackageRow(QWidget):
 
     def setSelected(self, selected: bool):
         self.check.setChecked(selected)
-    
+
     def apply_background(self, color: str):
         border = "rgba(255,255,255,0.06)" if isDarkTheme() else "rgba(0,0,0,0.06)"
         self.setStyleSheet(

@@ -1,0 +1,501 @@
+Option Explicit
+' Letters to Numbers Quick Reference
+' A = 1, B = 2, C = 3, D = 4, E = 5, F = 6, G = 7, H = 8, I = 9, J = 10, K = 11, L = 12, M = 13, N = 14, O = 15, P = 16, Q = 17, R = 18, S = 19, T = 20, U = 21, V = 22, W = 23, X = 24, Y = 25, Z = 26
+' AA = 27, AB = 28, AC = 29, AD = 30, AE = 31, AF = 32, AG = 33, AH = 34, AI = 35, AJ = 36, AK = 37, AL = 38, AM = 39, AN = 40, AO = 41, AP = 42, AQ = 43, AR = 44, AS = 45, AT = 46, AU = 47, AV = 48, AW = 49, AX = 50, AY = 51, AZ = 52
+
+Sub MasterStart()
+    ' Get macro location path
+    Dim macroPath As String
+    macroPath = ThisWorkbook.Path
+    
+    ' Declare variables
+    Dim targetFile As Variant
+    Dim targetWb As Workbook
+    Dim sourceWs As Worksheet
+    Dim praiWs As Worksheet, vietnamWs As Worksheet, allWs As Worksheet
+    Dim ws As Worksheet
+    Dim targetWsExists As Boolean
+    Dim lastCol As Long
+    Dim lastRow As Long
+    
+    ' Select file
+    MsgBox "Please select file to filter.", vbOKOnly, "Choose File"
+    targetFile = Application.GetOpenFilename(, , "Choose File", , False)
+    If targetFile = False Then Exit Sub
+    
+    ' Open the file
+    Set targetWb = Workbooks.Open(targetFile)
+    targetWsExists = False
+    
+    ' Macro Starts, AI only write under here okay
+    ' Do a check if sheet PRAI VIETNAM ALL already exists or not
+    For Each ws In targetWb.Worksheets
+        If ws.Name = "PRAI" Or ws.Name = "VIETNAM" Or ws.Name = "ALL" Then
+            targetWsExists = True
+            Exit For
+        End If
+    Next ws
+    
+    ' If already exists, put out an error
+    If targetWsExists Then
+        MsgBox "This file has already been processed, please select a different file or delete the processed sheets if you want to run it again. Exiting..."
+        targetWb.Close savechanges:=False
+        Exit Sub
+    End If
+    
+    ' Select Sheet 1 and duplicate it for PRAI, VIETNAM AND ALL
+    Set sourceWs = targetWb.Sheets(1)
+    
+    ' Create three new sheets by copying the source sheet
+    sourceWs.Copy After:=sourceWs
+    Set praiWs = targetWb.Sheets(sourceWs.Index + 1)
+    praiWs.Name = "PRAI"
+    
+    sourceWs.Copy After:=praiWs
+    Set vietnamWs = targetWb.Sheets(praiWs.Index + 1)
+    vietnamWs.Name = "VIETNAM"
+    
+    sourceWs.Copy After:=vietnamWs
+    Set allWs = targetWb.Sheets(vietnamWs.Index + 1)
+    allWs.Name = "ALL"
+    
+    ' Turn off screen updating, calculations, and events to speed up the process
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    ' Find the last column and row from source sheet
+    lastCol = sourceWs.UsedRange.Columns.Count
+    lastRow = sourceWs.UsedRange.Rows.Count
+    
+    ' Process each sheet
+    Call ProcessSheet(sourceWs, praiWs, lastRow, lastCol, "PRAI")
+    Call ProcessSheet(sourceWs, vietnamWs, lastRow, lastCol, "VIETNAM")
+    Call ProcessSheet(sourceWs, allWs, lastRow, lastCol, "ALL")
+    
+    ' Macro Ends, AI Stop writing under here okay. I love you <3.
+    
+    ' Format all three sheets
+    Call FormatSheet(praiWs)
+    Call FormatSheet(vietnamWs)
+    Call FormatSheet(allWs)
+    
+    ' Remove columns D, F, G, H, I, N, Q from all three processed sheets
+    Call DeleteColumns(praiWs)
+    Call DeleteColumns(vietnamWs)
+    Call DeleteColumns(allWs)
+    
+    ' Format column L for all three sheets
+    Call FormatColumnL(praiWs)
+    Call FormatColumnL(vietnamWs)
+    Call FormatColumnL(allWs)
+    
+    ' Turn on screen updating, calculations, and events
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    
+    MsgBox "Processing complete.", vbInformation
+End Sub
+
+Sub ProcessSheet(sourceWs As Worksheet, targetWs As Worksheet, lastRow As Long, lastCol As Long, sheetType As String)
+    ' Clear existing data except header
+    If lastRow > 1 Then
+        targetWs.Rows("2:" & lastRow).Delete
+    End If
+    
+    ' Read all source data into array for faster processing
+    Dim sourceData As Variant
+    sourceData = sourceWs.Range("A1").Resize(lastRow, lastCol).Value
+    
+    ' Filter into an intermediate array (keeps original column indices for logic)
+    Dim filteredData() As Variant
+    Dim filteredCount As Long
+    Dim i As Long, j As Long
+    
+    ReDim filteredData(1 To lastRow, 1 To lastCol)
+    filteredCount = 1
+    
+    ' Copy header row
+    For j = 1 To lastCol
+        filteredData(1, j) = sourceData(1, j)
+    Next j
+    filteredCount = 2
+    
+    ' Filter rows based on original Column E (5) value's first two chars
+    Dim columnEValue As String, firstTwoChars As String
+    Dim included As Boolean
+    
+    For i = 2 To lastRow
+        included = False
+        If Not IsEmpty(sourceData(i, 5)) Then
+            columnEValue = CStr(sourceData(i, 5))
+            If Len(columnEValue) >= 2 Then
+                firstTwoChars = Left(columnEValue, 2)
+                Select Case sheetType
+                    Case "VIETNAM"
+                        If firstTwoChars = "03" Then included = True
+                    Case "PRAI"
+                        If firstTwoChars <> "03" Then included = True
+                    Case "ALL"
+                        included = True
+                End Select
+            End If
+        ElseIf sheetType = "ALL" Then
+            ' If ALL and Column E empty, we still don't include the row itself here
+            ' (serial rows will be pulled via the i+1 logic below when i-1 included)
+        End If
+    
+        If included Then
+            ' 1) copy the data row
+            CopyRowToFiltered sourceData, filteredData, i, filteredCount, lastCol
+            filteredCount = filteredCount + 1
+    
+            ' 2) also copy the serial row right under it (if any)
+            If i + 1 <= lastRow Then
+                If Not IsEmpty(sourceData(i + 1, 1)) Then
+                    Dim a1 As String
+                    a1 = CStr(sourceData(i + 1, 1))
+                    If InStr(1, a1, "Serial Number", vbTextCompare) > 0 Then
+                        CopyRowToFiltered sourceData, filteredData, i + 1, filteredCount, lastCol
+                        filteredCount = filteredCount + 1
+                    End If
+                End If
+            End If
+        End If
+    Next i
+    
+    ' If we have data to process, categorize & write it
+    If filteredCount > 2 Then
+        CategorizeAndWriteData targetWs, filteredData, filteredCount - 1, lastCol
+    Else
+        ' Just write the (cleaned) header if no data
+        For j = 1 To lastCol
+            If Not IsEmpty(filteredData(1, j)) Then
+                targetWs.Cells(1, j).Value = CleanText(CStr(filteredData(1, j)))
+            Else
+                targetWs.Cells(1, j).Value = filteredData(1, j)
+            End If
+        Next j
+    End If
+End Sub
+
+Sub CopyRowToFiltered(sourceData As Variant, ByRef filteredData As Variant, sourceRow As Long, targetRow As Long, lastCol As Long)
+    Dim j As Long
+    For j = 1 To lastCol
+        filteredData(targetRow, j) = sourceData(sourceRow, j)
+    Next j
+End Sub
+
+Private Function IsSerialRow(dataArray As Variant, r As Long, lastCol As Long) As Boolean
+    Dim hasOnlyA As Boolean
+    Dim j As Long
+    hasOnlyA = False
+    If Not IsEmpty(dataArray(r, 1)) Then
+        If InStr(1, CStr(dataArray(r, 1)), "Serial Number", vbTextCompare) > 0 Then
+            hasOnlyA = True
+            For j = 2 To lastCol
+                If Not IsEmpty(dataArray(r, j)) Then
+                    hasOnlyA = False
+                    Exit For
+                End If
+            Next j
+        End If
+    End If
+    IsSerialRow = hasOnlyA
+End Function
+
+Private Function ExtractSerial(ByVal s As String) As String
+    Dim p As Long
+    p = InStr(1, s, ":")
+    If p > 0 Then
+        ExtractSerial = Trim(Mid$(s, p + 1))
+    Else
+        ExtractSerial = Trim(s)
+    End If
+End Function
+
+Private Function IsReportTotalRow(dataArray As Variant, r As Long, lastCol As Long) As Boolean
+    Dim t As String
+    t = LCase$(Trim$(CStr(dataArray(r, 1))))
+    If t Like "*total*" Or t Like "*report total*" Then
+        IsReportTotalRow = True
+    Else
+        IsReportTotalRow = False
+    End If
+End Function
+
+Sub CategorizeAndWriteData(ws As Worksheet, dataArray As Variant, dataRows As Long, lastCol As Long)
+    ' ===== Category mappings (updated):
+    ' CD and CE both map to Computer Equipment, CQ = Canteen Equipment
+    ' Unknowns -> UC
+    Dim categories(1 To 12, 1 To 2) As String
+    categories(1, 1) = "FL": categories(1, 2) = "Freehold Land"
+    categories(2, 1) = "LL": categories(2, 2) = "Leasehold Land"
+    categories(3, 1) = "BD": categories(3, 2) = "Building"
+    categories(4, 1) = "RN": categories(4, 2) = "Renovation"
+    categories(5, 1) = "EI": categories(5, 2) = "Electricity Item"
+    categories(6, 1) = "PM": categories(6, 2) = "Plant and Machinery"
+    categories(7, 1) = "FF": categories(7, 2) = "Furniture and Fitting"
+    categories(8, 1) = "CD": categories(8, 2) = "Computer Equipment"
+    categories(9, 1) = "OE": categories(9, 2) = "Other Equipment"
+    categories(10, 1) = "CQ": categories(10, 2) = "Canteen Equipment"
+    categories(11, 1) = "MV": categories(11, 2) = "Motor Vehicle"
+    categories(12, 1) = "UC": categories(12, 2) = "Unknown Category" ' fallback
+    
+    Dim knownCount As Long
+    knownCount = 11 ' last is 12 (UC)
+    
+    ' Collections for each category
+    Dim categoryData(1 To 12) As Collection
+    Dim i As Long, j As Long, k As Long
+    For i = 1 To 12
+        Set categoryData(i) = New Collection
+    Next i
+    
+    ' Track serial numbers for each DATA row (keyed by its source row index)
+    Dim serialMap As Object
+    Set serialMap = CreateObject("Scripting.Dictionary")
+    
+    ' We will skip serial-only rows and report-total row; attach serial to previous data row
+    Dim prevDataRow As Long: prevDataRow = 0
+    Dim columnDValue As String, categoryCode As String
+    Dim categoryIndex As Long
+    
+    For i = 2 To dataRows
+        If IsReportTotalRow(dataArray, i, lastCol) Then
+            ' ignore report total
+            GoTo ContinueNextRow
+        End If
+        
+        If IsSerialRow(dataArray, i, lastCol) Then
+            If prevDataRow > 0 Then
+                serialMap(prevDataRow) = ExtractSerial(CStr(dataArray(i, 1)))
+            End If
+            GoTo ContinueNextRow
+        End If
+        
+        ' determine category from ORIGINAL Column D (4th) -> code is chars 3-4 of that value
+        categoryIndex = 0
+        If Not IsEmpty(dataArray(i, 4)) Then
+            columnDValue = CStr(dataArray(i, 4))
+            If Len(columnDValue) >= 4 Then
+                categoryCode = Mid$(columnDValue, 3, 2)
+                ' Map CE to CD (Computer Equipment) so they're grouped together
+                If categoryCode = "CE" Then categoryCode = "CD"
+                For j = 1 To knownCount
+                    If categories(j, 1) = categoryCode Then
+                        categoryIndex = j
+                        Exit For
+                    End If
+                Next j
+            End If
+        End If
+        If categoryIndex = 0 Then categoryIndex = 12 ' UC
+        
+        categoryData(categoryIndex).Add i
+        prevDataRow = i
+        
+ContinueNextRow:
+    Next i
+    
+    ' ---- Writing stage (with column shifts and new Serial Number column) ----
+    Dim currentRow As Long
+    Dim categoryRow As Variant
+    
+    ' After inserting Description, all original columns B..lastCol shift right by +1 in output.
+    ' We also append "Serial Number" as the final column.
+    Dim outSerialCol As Long
+    outSerialCol = lastCol + 2 ' one for Description inserted at B, one for Serial Number at end
+    
+    ' Write header row:
+    currentRow = 1
+    ws.Cells(currentRow, 1).Value = "Asset ID"
+    ws.Cells(currentRow, 2).Value = "Description"
+    ' Shift original headers B..lastCol by +1 (into C..)
+    For j = 2 To lastCol
+        If Not IsEmpty(dataArray(1, j)) Then
+            ws.Cells(currentRow, j + 1).Value = CleanText(CStr(dataArray(1, j)))
+        Else
+            ws.Cells(currentRow, j + 1).Value = dataArray(1, j)
+        End If
+    Next j
+    ' Serial Number header at the very end
+    ws.Cells(currentRow, outSerialCol).Value = "Serial Number"
+    currentRow = currentRow + 1
+    
+    ' Totals accumulators (for original numeric columns J..Q => indices 10..17)
+    ' NOTE: Life (original J = 10) must be EXCLUDED from subtotals and grand totals.
+    Dim grandTotals(10 To 17) As Double
+    For k = 10 To 17
+        grandTotals(k) = 0
+    Next k
+    
+    ' Where to print the "Subtotal:" and totals (now one col to the right because of Description)
+    Dim sumLabelCol As Long: sumLabelCol = 10             ' was 9 (I), now J (10) after insert
+    Dim sumStartOutCol As Long: sumStartOutCol = 11        ' start of numeric range in OUTPUT (K)
+    Dim sumEndOutCol As Long
+    sumEndOutCol = Application.WorksheetFunction.Min(lastCol + 1, 18) ' cap at R (18), exclude Serial Number col
+    
+    ' Loop through categories and write data
+    For i = 1 To 12 ' include Unknown at end if it has data
+        If categoryData(i).Count > 0 Then
+            ' Category header
+            ws.Cells(currentRow, 1).Value = categories(i, 2)
+            ws.Cells(currentRow, 1).Font.Bold = True
+            currentRow = currentRow + 1
+            
+            ' Subtotals for original columns 10..17 (J..Q), skip 10 (Life)
+            Dim subtotals(10 To 17) As Double
+            For k = 10 To 17
+                subtotals(k) = 0
+            Next k
+            
+            ' Rows
+            Dim rawA As String, p As Long, assetID As String, descText As String
+            For Each categoryRow In categoryData(i)
+                ' Split Column A into Asset ID / Description
+                rawA = CStr(dataArray(CLng(categoryRow), 1))
+                p = InStr(1, rawA, "/")
+                If p > 0 Then
+                    assetID = Trim$(Left$(rawA, p - 1))
+                    descText = Trim$(Mid$(rawA, p + 1))
+                Else
+                    assetID = Trim$(rawA)
+                    descText = vbNullString
+                End If
+                
+                ws.Cells(currentRow, 1).Value = assetID
+                ws.Cells(currentRow, 2).Value = descText
+                
+                ' Write the rest of the columns shifted by +1 (B.. -> C..)
+                For j = 2 To lastCol
+                    ws.Cells(currentRow, j + 1).Value = dataArray(CLng(categoryRow), j)
+                Next j
+                
+                ' Serial number goes to the final column
+                If serialMap.Exists(CLng(categoryRow)) Then
+                    ws.Cells(currentRow, outSerialCol).Value = serialMap(CLng(categoryRow))
+                End If
+                
+                ' Subtotals from ORIGINAL data columns 10..17 (skip 10 = Life)
+                For k = 10 To 17
+                    If k <> 10 Then ' exclude Life
+                        If k <= lastCol And IsNumeric(dataArray(CLng(categoryRow), k)) Then
+                            subtotals(k) = subtotals(k) + CDbl(dataArray(CLng(categoryRow), k))
+                        End If
+                    End If
+                Next k
+                
+                currentRow = currentRow + 1
+            Next categoryRow
+            
+            ' Subtotal row (label at sumLabelCol, values at output cols (k+1))
+            ws.Cells(currentRow, sumLabelCol).Value = "Subtotal:"
+            ws.Cells(currentRow, sumLabelCol).Font.Bold = True
+            For k = 10 To 17
+                If k <> 10 Then ' exclude Life
+                    If (k + 1) <= sumEndOutCol And subtotals(k) <> 0 Then
+                        ws.Cells(currentRow, k + 1).Value = subtotals(k)
+                        ws.Cells(currentRow, k + 1).NumberFormat = "#,##0.00"
+                    End If
+                End If
+            Next k
+            With ws.Range(ws.Cells(currentRow, sumLabelCol), ws.Cells(currentRow, sumEndOutCol))
+                .Font.Bold = True
+                .Borders.Item(xlEdgeTop).LineStyle = xlContinuous
+            End With
+            
+            ' Roll into grand totals (skip Life)
+            For k = 10 To 17
+                If k <> 10 Then
+                    grandTotals(k) = grandTotals(k) + subtotals(k)
+                End If
+            Next k
+            
+            currentRow = currentRow + 2 ' gap
+        End If
+    Next i
+    
+    ' Grand Total row at end
+    ws.Cells(currentRow, sumLabelCol).Value = "Grand Total:"
+    ws.Cells(currentRow, sumLabelCol).Font.Bold = True
+    For k = 10 To 17
+        If k <> 10 Then ' exclude Life
+            If (k + 1) <= sumEndOutCol And grandTotals(k) <> 0 Then
+                ws.Cells(currentRow, k + 1).Value = grandTotals(k)
+                ws.Cells(currentRow, k + 1).NumberFormat = "#,##0.00"
+            End If
+        End If
+    Next k
+    With ws.Range(ws.Cells(currentRow, sumLabelCol), ws.Cells(currentRow, sumEndOutCol))
+        .Font.Bold = True
+        .Borders.Item(xlEdgeTop).LineStyle = xlDouble
+        .Borders.Item(xlEdgeBottom).LineStyle = xlContinuous
+    End With
+    
+    ' --- Ensure 2 decimal places with comma separators for all rows in the subtotal/grand total columns ---
+    ' Applies to the output numeric band corresponding to original J..Q (now K..R after Description insert).
+    Dim lastOutRow As Long
+    lastOutRow = currentRow
+    If sumStartOutCol <= sumEndOutCol Then
+        With ws.Range(ws.Cells(2, sumStartOutCol), ws.Cells(lastOutRow, sumEndOutCol))
+            .NumberFormat = "#,##0.00"
+        End With
+    End If
+End Sub
+
+Function CleanText(inputText As String) As String
+    ' Remove various whitespace characters including spaces, line breaks, carriage returns, tabs
+    Dim cleanedText As String
+    cleanedText = inputText
+    
+    ' Remove line breaks (Chr(10)), carriage returns (Chr(13)), tabs (Chr(9))
+    cleanedText = Replace(cleanedText, Chr(10), "")   ' Line Feed
+    cleanedText = Replace(cleanedText, Chr(13), "")   ' Carriage Return
+    cleanedText = Replace(cleanedText, Chr(9), " ")   ' Tab (replace with space)
+    cleanedText = Replace(cleanedText, Chr(160), " ") ' Non-breaking space
+    
+    ' Trim leading and trailing spaces
+    cleanedText = Trim(cleanedText)
+    
+    ' Remove multiple consecutive spaces
+    Do While InStr(cleanedText, "  ") > 0
+        cleanedText = Replace(cleanedText, "  ", " ")
+    Loop
+    
+    CleanText = cleanedText
+End Function
+
+Sub FormatSheet(ws As Worksheet)
+    ' Autofit columns
+    ws.Columns.AutoFit
+    
+    ' Freeze the top row
+    ws.Activate
+    ws.Application.ActiveWindow.FreezePanes = False
+    With ActiveWindow
+        .SplitColumn = 0
+        .SplitRow = 1
+    End With
+    ActiveWindow.FreezePanes = True
+End Sub
+
+Private Sub DeleteColumns(ws As Worksheet)
+    ' Delete higher-indexed columns first to avoid shifting issues
+    Dim cols As Variant, i As Long
+    cols = Array("R", "O", "J", "I", "H", "G", "E")
+    For i = LBound(cols) To UBound(cols)
+        On Error Resume Next
+        ws.Columns(cols(i) & ":" & cols(i)).Delete
+        On Error GoTo 0
+    Next i
+End Sub
+
+Private Sub FormatColumnL(ws As Worksheet)
+    ' Left align column L
+    ws.Columns("L:L").HorizontalAlignment = xlLeft
+    
+    ' Prevent scientific notation for numeric values
+    ws.Columns("L:L").NumberFormat = "0"
+End Sub
