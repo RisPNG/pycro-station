@@ -93,6 +93,15 @@ class PycroGrid(QScrollArea):
             main_py = os.path.join(folder, 'main.py')
             req_txt = os.path.join(folder, 'requirements.txt')
             desc_md = os.path.join(folder, 'description.md')
+            # determine if folder contains any .py file
+            has_python = False
+            try:
+                for fn in os.listdir(folder):
+                    if fn.lower().endswith('.py'):
+                        has_python = True
+                        break
+            except Exception:
+                has_python = False
 
             short_desc, long_desc = self._parse_description(desc_md)
             display_name = d.replace('--', ' ')
@@ -105,7 +114,8 @@ class PycroGrid(QScrollArea):
                 requirements=req_txt if os.path.isfile(req_txt) else None,
                 description=desc_md if os.path.isfile(desc_md) else None,
                 short_desc=short_desc,
-                long_desc=long_desc
+                long_desc=long_desc,
+                has_python=has_python
             )
 
             infos.append(info)
@@ -181,7 +191,7 @@ class PycroGrid(QScrollArea):
 
 
 class PycroInfo:
-    def __init__(self, name, display_name, folder, main_py, requirements, description, short_desc, long_desc):
+    def __init__(self, name, display_name, folder, main_py, requirements, description, short_desc, long_desc, has_python: bool):
         self.name = name
         self.display_name = display_name
         self.folder = folder
@@ -190,6 +200,7 @@ class PycroInfo:
         self.description = description
         self.short_desc = short_desc
         self.long_desc = long_desc
+        self.has_python = has_python
 
 
 class PycroCard(QWidget):
@@ -250,7 +261,11 @@ class PycroCard(QWidget):
         h.addWidget(self.install_btn)
         v.addLayout(h)
 
-        self._update_requirements_state()
+        if not self.info.has_python:
+            self.launch_btn.hide()
+            self.install_btn.hide()
+        else:
+            self._update_requirements_state()
 
     def _req_packages(self):
         path = self.info.requirements

@@ -94,6 +94,11 @@ class Window(MSFluentWindow):
             self.titleBar.setTabsSelectionHighlightEnabled(False)
         except Exception:
             pass
+        # initialize packages lock state
+        try:
+            self.packagesPage.setLocked(False)
+        except Exception:
+            pass
 
     def initNavigation(self):
         hub = QIcon(QPixmap.fromImage(ImageQt(TablerIcons.load(
@@ -445,6 +450,11 @@ class Window(MSFluentWindow):
                 self.titleBar.setTabsSelectionHighlightEnabled(True)
             except Exception:
                 pass
+            # lock packages while tabs are open
+            try:
+                self.packagesPage.setLocked(True)
+            except Exception:
+                pass
             return
 
         # New macro page
@@ -468,6 +478,11 @@ class Window(MSFluentWindow):
         self._deselect_navigation()
         try:
             self.titleBar.setTabsSelectionHighlightEnabled(True)
+        except Exception:
+            pass
+        # lock packages while tabs are open
+        try:
+            self.packagesPage.setLocked(True)
         except Exception:
             pass
 
@@ -530,6 +545,11 @@ class Window(MSFluentWindow):
         self.homeInterface.setCurrentWidget(self.hubGrid)
         try:
             self.titleBar.setTabsSelectionHighlightEnabled(False)
+        except Exception:
+            pass
+        # unlock packages if no tabs remain
+        try:
+            self.packagesPage.setLocked(len(self.macro_pages) > 0)
         except Exception:
             pass
 

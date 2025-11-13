@@ -142,16 +142,22 @@ class PackagesPage(QWidget):
         self.trash_selected_btn.setToolTip('Uninstall selected')
         self.trash_selected_btn.clicked.connect(self._remove_selected)
 
-        invert_btn = PrimaryPushButton('Invert Selections', self)
-        invert_btn.clicked.connect(self._invert_selections)
+        self.invert_btn = PrimaryPushButton('Invert Selections', self)
+        self.invert_btn.clicked.connect(self._invert_selections)
 
         toolbar.addWidget(self.select_all_btn, 0, Qt.AlignVCenter)
         toolbar.addWidget(self.trash_selected_btn, 0, Qt.AlignVCenter)
         toolbar.addSpacing(8)
-        toolbar.addWidget(invert_btn)
+        toolbar.addWidget(self.invert_btn)
         toolbar.addStretch(1)
 
         v.addLayout(toolbar)
+
+        # Lock notice when packages adjustments are disabled
+        self.lock_label = QLabel('Close all tabs to manage packages.', self)
+        self.lock_label.setStyleSheet('color:#d9534f;')
+        self.lock_label.setVisible(False)
+        v.addWidget(self.lock_label)
 
         # List area
         self.scroll = QScrollArea(self)
@@ -313,5 +319,11 @@ class PackagesPage(QWidget):
     def _set_enabled(self, enabled: bool):
         self.select_all_btn.setEnabled(enabled)
         self.trash_selected_btn.setEnabled(enabled)
+        self.invert_btn.setEnabled(enabled)
         for row in self._rows.values():
             row.setEnabled(enabled)
+
+    def setLocked(self, locked: bool):
+        """Disable all adjustments when locked is True."""
+        self.lock_label.setVisible(locked)
+        self._set_enabled(not locked)
