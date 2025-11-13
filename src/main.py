@@ -22,88 +22,12 @@ from PIL.ImageQt import ImageQt
 from qframelesswindow import *
 
 from TextWidget import TWidget
+from PycroGrid import PycroGrid
 from TitleBar import CustomTitleBar
 
-
-class MarkdownPreview(QWidget):
-    def __init__(self, objectName):
-        super().__init__(parent=None)
-
-        self.setObjectName(objectName)
-
-        # Create a vertical splitter
-        splitter = QSplitter(self)
-        layout = QVBoxLayout(self)
-        layout.addWidget(splitter)
-
-        stylesheet = "QTextEdit{background-color : #272727; color : white; border : 0; font-size: 16}"
-
-        # Left half: Markdown editor
-        markdown_editor = QWidget(self)
-        markdown_layout = QVBoxLayout(markdown_editor)
-        self.txt = QTextEdit(self)
-        self.txt.textChanged.connect(self.updateMarkdownPreview)
-        self.txt.setStyleSheet(stylesheet)
-        markdown_layout.addWidget(self.txt)
-        splitter.addWidget(markdown_editor)
-
-        # Right half: Preview
-        preview = QWidget(self)
-        preview_layout = QVBoxLayout(preview)
-        self.preview_txt = QTextEdit(self)
-        self.preview_txt.setReadOnly(True)
-        self.preview_txt.setStyleSheet(stylesheet)
-        preview_layout.addWidget(self.preview_txt)
-        splitter.addWidget(preview)
-
-        # Set the splitter size policy to distribute the space evenly
-        splitter.setSizes([self.width() // 2, self.width() // 2])
-
-        # Set the splitter handle width (optional)
-        splitter.setHandleWidth(1)
-
-        # Add a stats and export section below the editor
-        stats_export_layout = QHBoxLayout()
-        self.word_stats_label = QLabel("Words: 0 | Characters: 0")
-        self.word_stats_label.setStyleSheet("color: white;")
-        stats_export_layout.addWidget(self.word_stats_label)
-
-        export_txt_button = QPushButton("Export to TXT")
-        export_txt_button.clicked.connect(self.export_to_txt)
-        stats_export_layout.addWidget(export_txt_button)
-
-        export_html_button = QPushButton("Export to HTML")
-        export_html_button.clicked.connect(self.export_to_html)
-        stats_export_layout.addWidget(export_html_button)
-
-        layout.addLayout(stats_export_layout)
-
-    def updateMarkdownPreview(self):
-        txt = self.txt.toPlainText()
-        self.preview_txt.setMarkdown(txt)
-
-        # Update word and character stats
-        words = len(txt.split())
-        characters = len(txt)
-        self.word_stats_label.setText(f"Words: {words} | Characters: {characters}")
-
-    def export_to_txt(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Export to TXT", "", "Text Files (*.txt)")
-        if file_path:
-            with open(file_path, 'w') as file:
-                file.write(self.txt.toPlainText())
-
-    def export_to_html(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Export to HTML", "", "HTML Files (*.html)")
-        if file_path:
-            with open(file_path, 'w') as file:
-                file.write(self.preview_txt.toHtml())
-
-
 class Settings(QWidget):
-    def __init__(self, markdown_preview, main_editor_widgets, parent=None):
+    def __init__(self, main_editor_widgets, parent=None):
         super().__init__(parent)
-        self.markdown_preview = markdown_preview
         self.main_editor_widgets = main_editor_widgets
 
         layout = QVBoxLayout(self)
@@ -114,14 +38,15 @@ class TabInterface(QFrame):
 
     def __init__(self, text: str, icon, objectName, parent=None):
         super().__init__(parent=parent)
-        self.iconWidget = IconWidget(icon, self)
-        self.iconWidget.setFixedSize(120, 120)
+
+        # Make the tab page act as a full-bleed frame
+        self.setObjectName(objectName)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet("background: transparent;")
 
         self.vBoxLayout = QVBoxLayout(self)
-        self.vBoxLayout.setAlignment(Qt.AlignCenter)
-        self.vBoxLayout.setSpacing(30)
-
-        self.setObjectName(objectName)
+        self.vBoxLayout.setContentsMargins(0, 0, 0, 0)
+        self.vBoxLayout.setSpacing(0)
 
 
 class Window(MSFluentWindow):
@@ -143,13 +68,17 @@ class Window(MSFluentWindow):
         self.save_shortcut.activated.connect(self.save_document)
         self.open_shortcut.activated.connect(self.open_document)
 
-        self.text_widgets = {}  # Create a dictionary to store TWidget instances for each tab
+        # Holds the per-tab content widget (now a PycroGrid instead of a text editor)
+        self.text_widgets = {}
 
 
         # create sub interface
         self.homeInterface = QStackedWidget(self, objectName='homeInterface')
-        self.markdownInterface = MarkdownPreview(objectName="markdownInterface")
-        self.settingsInterface = Settings(self.markdownInterface, self.text_widgets)
+        # remove frame and let it use full space
+        self.homeInterface.setFrameShape(QFrame.NoFrame)
+        self.homeInterface.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.homeInterface.setStyleSheet("background: transparent;")
+        self.settingsInterface = Settings(self.text_widgets)
         self.settingsInterface.setObjectName("settingsInterface")
         self.tabBar.addTab(text="Untitled 1", routeKey="Untitled 1")
         self.tabBar.setCurrentTab('Untitled 1')
@@ -158,15 +87,13 @@ class Window(MSFluentWindow):
         self.initWindow()
 
     def initNavigation(self):
-        markdown_qimage = ImageQt(TablerIcons.load(
-            OutlineIcon.ROTATE,
+        hub = QIcon(QPixmap.fromImage(ImageQt(TablerIcons.load(
+            OutlineIcon.CATEGORY,
             size=24,
             color="#FFFFFF",
             stroke_width=2.0,
-        ))
-        self.addSubInterface(self.homeInterface, FIF.EDIT, 'Write', FIF.EDIT, NavigationItemPosition.TOP)
-        self.addSubInterface(self.markdownInterface, QIcon(QPixmap.fromImage(markdown_qimage)), 'Markdown',
-                             QIcon(QPixmap.fromImage(markdown_qimage)))
+        ))))
+        self.addSubInterface(self.homeInterface, hub, 'Hub', hub, NavigationItemPosition.TOP)
         self.addSubInterface(self.settingsInterface, FIF.SETTING, 'Settings', FIF.SETTING, NavigationItemPosition.BOTTOM)
         # self.addSubInterface(self.settingInterface, FIF.SETTING, 'Settings', FIF.SETTING,  NavigationItemPosition.BOTTOM)
         self.navigationInterface.addItem(
@@ -180,19 +107,20 @@ class Window(MSFluentWindow):
         self.navigationInterface.setCurrentItem(
             self.homeInterface.objectName())
 
-        self.text_widgets = {}  # Create a dictionary to store TWidget instances for each tab
+        self.text_widgets = {}
         for i in range(self.tabBar.count()):  # Iterate through the tabs using count
             routeKey = self.tabBar.tabText(i)  # Get the routeKey from tabText
 
-            # Create a new instance of TWidget for each tab
-            t_widget = TWidget(self)
-            self.text_widgets[routeKey] = t_widget  # Store the TWidget instance in the dictionary
+            # Create a new instance of grid container for each tab (replaces text editor)
+            grid_widget = PycroGrid(self)
+            self.text_widgets[routeKey] = grid_widget
 
-            self.current_editor = t_widget
+            self.current_editor = grid_widget
 
             # Add the TWidget to the corresponding TabInterface
             tab_interface = TabInterface(self.tabBar.tabText(i), 'icon', routeKey, self)
-            tab_interface.vBoxLayout.addWidget(t_widget)
+            grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            tab_interface.vBoxLayout.addWidget(grid_widget)
             self.homeInterface.addWidget(tab_interface)
 
         self.tabBar.currentChanged.connect(self.onTabChanged)
@@ -214,6 +142,8 @@ class Window(MSFluentWindow):
         self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
 
     def dateTime(self):
+        if not self._has_text_editor():
+            return
         cdate = str(datetime.datetime.now())
         self.current_editor.append(cdate)
 
@@ -242,17 +172,26 @@ class Window(MSFluentWindow):
         current_tab = self.homeInterface.widget(index)
 
         if current_tab and isinstance(current_tab, TabInterface):
-            # Update the current TWidget
+            # Update the current content widget
             self.current_editor = self.text_widgets[current_tab.objectName()]
 
     def onTabAddRequested(self):
         text = f'Untitled {self.tabBar.count() + 1}'
         self.addTab(text, text, '')
 
-        # Set the current_editor to the newly added TWidget
+        # Set the current content widget for the newly added tab
         self.current_editor = self.text_widgets[text]
 
     def open_document(self):
+        # Guard: open document only applies to text editor mode
+        if not self._has_text_editor():
+            MessageBox(
+                'Not Available',
+                'Open is not available in the Pycro grid view.',
+                self
+            ).exec()
+            return
+
         file_dir = filedialog.askopenfilename(
             title="Select file",
         )
@@ -280,6 +219,11 @@ class Window(MSFluentWindow):
                 )
 
     def closeEvent(self, event):
+        # If there's no text editor active, just accept the close
+        if not self._has_text_editor():
+            event.accept()
+            return
+
         a = self.current_editor.toPlainText()
 
         if a != "":
@@ -301,6 +245,8 @@ class Window(MSFluentWindow):
             event.accept()  # Close the application
 
     def find_first(self):
+        if not self._has_text_editor():
+            return
         def find_word(word):
             cursor = self.current_editor.document().find(word)
 
@@ -318,6 +264,8 @@ class Window(MSFluentWindow):
             find_word(word_to_find)
 
     def findWord(self):
+        if not self._has_text_editor():
+            return
         def find_word(word):
             if not self.current_editor:
                 return
@@ -341,7 +289,7 @@ class Window(MSFluentWindow):
 
     def save_document(self):
         try:
-            if not self.current_editor:
+            if not self._has_text_editor():
                 print("No active TWidget found.")
                 return  # Check if there is an active TWidget
 
@@ -366,6 +314,8 @@ class Window(MSFluentWindow):
             print(f"An error occurred while saving the document: {e}")
 
     def tts(self):
+        if not self._has_text_editor():
+            return
         cursor = self.current_editor.textCursor()
         text = cursor.selectedText()
 
@@ -378,6 +328,8 @@ class Window(MSFluentWindow):
         thread1.start()
 
     def go_to_line(self):
+        if not self._has_text_editor():
+            return
 
         line_number, ok = QInputDialog.getInt(
             self,
@@ -399,12 +351,20 @@ class Window(MSFluentWindow):
     def addTab(self, routeKey, text, icon):
         self.tabBar.addTab(routeKey, text, icon)
         self.homeInterface.addWidget(TabInterface(text, icon, routeKey, self))
-        # Create a new TWidget instance for the new tab
-        t_widget = TWidget(self)
-        self.text_widgets[routeKey] = t_widget  # Store the TWidget instance in the dictionary
+        # Create a new PycroGrid instance for the new tab
+        grid_widget = PycroGrid(self)
+        self.text_widgets[routeKey] = grid_widget
         tab_interface = self.findChild(TabInterface, routeKey)
-        tab_interface.vBoxLayout.addWidget(t_widget)
-        self.current_editor = t_widget  # Add TWidget to the corresponding TabInterface
+        grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        tab_interface.vBoxLayout.addWidget(grid_widget)
+        self.current_editor = grid_widget
+
+    def _has_text_editor(self) -> bool:
+        """Return True if the current view is a text editor-like widget."""
+        editor = getattr(self, 'current_editor', None)
+        if editor is None:
+            return False
+        return callable(getattr(editor, 'toPlainText', None)) and callable(getattr(editor, 'textCursor', None))
 
 
 if __name__ == '__main__':
