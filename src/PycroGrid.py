@@ -59,9 +59,6 @@ class PycroGrid(QScrollArea):
         # Build initially
         QTimer.singleShot(0, self.refresh)
 
-    def gridLayout(self) -> QGridLayout:
-        """Expose the underlying grid layout for adding Pycro widgets later."""
-        return self._grid
 
     # --- Public API ---
     def refresh(self):

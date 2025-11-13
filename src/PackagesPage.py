@@ -16,6 +16,38 @@ def ti_icon(icon_enum, size=24, color="#FFFFFF", stroke_width=2.0) -> QIcon:
     return QIcon(QPixmap.fromImage(ImageQt(img)))
 
 
+# Packages to hide from the list (exact names provided)
+HIDDEN_PACKAGES_EXACT: set[str] = {
+    'autocommand',
+    'backports.tarfile',
+    'darkdetect',
+    'importlib_metadata',
+    'inflect',
+    'jaraco.collections',
+    'jaraco.context',
+    'jaraco.functools',
+    'jaraco.text',
+    'more-itertools',
+    'packaging',
+    'pillow',
+    'pip',
+    'platformdirs',
+    'pygame',
+    'PySide6_Addons',
+    'PySide6_Essentials',
+    'PySideSix-Frameless-Window',
+    'setuptools',
+    'shiboken6',
+    'tomli',
+    'typeguard',
+    'typing_extensions',
+    'wheel',
+    'zipp',
+}
+# Also compare in lower-case to avoid case-only mismatches while keeping exact-name intent
+_HIDDEN_PACKAGES_LOWER = {s.lower() for s in HIDDEN_PACKAGES_EXACT}
+
+
 class CheckIconButton(TransparentToolButton):
     toggledManually = Signal(bool)
 
@@ -217,6 +249,9 @@ class PackagesPage(QWidget):
         extras = []
         baseline = self._baseline
         for n in self._installed_packages():
+            # hide by exact or case-insensitive match
+            if n in HIDDEN_PACKAGES_EXACT or n.lower() in _HIDDEN_PACKAGES_LOWER:
+                continue
             if n.lower() not in baseline:
                 extras.append(n)
         return extras

@@ -1,15 +1,10 @@
 """
-The main python file. Run this file to use the app. Also, for googletrans, use the command:
-` pip install googletrans==4.0.0rc1 ` since the newer versions doesnt work well with PyCharm.
-
+The main python file. Run this file to use the app.
 """
 import datetime
 import os
-import sys
-import threading
 from tkinter import filedialog
 
-import pyttsx3
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 from PySide6.QtWidgets import *
@@ -17,11 +12,9 @@ from qfluentwidgets import *
 # https://fluenticons.co
 from qfluentwidgets import FluentIcon as FIF
 # https://tabler.io/icons
-from pytablericons import TablerIcons, OutlineIcon, FilledIcon
+from pytablericons import TablerIcons, OutlineIcon
 from PIL.ImageQt import ImageQt
-from qframelesswindow import *
 
-from TextWidget import TWidget
 from PycroGrid import PycroGrid
 from PackagesPage import PackagesPage
 from TitleBar import CustomTitleBar
@@ -34,25 +27,8 @@ class Settings(QWidget):
         layout = QVBoxLayout(self)
 
 
-class TabInterface(QFrame):
-    """ Tab interface. Contains the base class to add/remove tabs """
-
-    def __init__(self, text: str, icon, objectName, parent=None):
-        super().__init__(parent=parent)
-
-        # Make the tab page act as a full-bleed frame
-        self.setObjectName(objectName)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setStyleSheet("background: transparent;")
-
-        self.vBoxLayout = QVBoxLayout(self)
-        self.vBoxLayout.setContentsMargins(0, 0, 0, 0)
-        self.vBoxLayout.setSpacing(0)
-
 
 class Window(MSFluentWindow):
-    """ Main window class. Uses MSFLuentWindow to imitate the Windows 11 FLuent Design windows. """
-
     def __init__(self):
         # self.isMicaEnabled = False
         super().__init__()
@@ -178,18 +154,12 @@ class Window(MSFluentWindow):
         except Exception:
             pass
 
-    def dateTime(self):
-        if not self._has_text_editor():
-            return
-        cdate = str(datetime.datetime.now())
-        self.current_editor.append(cdate)
-
     def showMessageBox(self):
         w = MessageBox(
             'Pycro Station',
             (
                     "Version : 0.0.1"
-                    + "\n" + "\n" + "\n" + "Welcome aboard Pycronauts!" + "\n" + "This is the hub to store and launch OD/XL Pycros" + "\n" + "\n" + "\n" +
+                    + "\n" + "\n" + "\n" + "Welcome aboard Pycronauts!" + "\n" + "This is the hub to store and launch Pycros" + "\n" + "\n" + "\n" +
                     "Made with 💚 By Ris Peng"
             ),
             self
@@ -207,7 +177,7 @@ class Window(MSFluentWindow):
         except Exception:
             return
         self._show_macro_page(routeKey)
-    
+
     def onTabClicked(self, index: int):
         """Handle clicks on the current tab to re-activate its content when Hub is active."""
         # Try to derive routeKey from the tab label
@@ -274,8 +244,11 @@ class Window(MSFluentWindow):
             try:
                 with open(file_dir, "r") as f:
                     filedata = f.read()
-                    self.addTab(filename, filename, '')
                     self.current_editor.setPlainText(filedata)
+                    try:
+                        self.setWindowTitle(f"{os.path.basename(filename)} ~ ZenNotes")
+                    except Exception:
+                        pass
 
                     # Check the first line of the text
                     first_line = filedata.split('\n')[0].strip()
@@ -317,49 +290,6 @@ class Window(MSFluentWindow):
         else:
             event.accept()  # Close the application
 
-    def find_first(self):
-        if not self._has_text_editor():
-            return
-        def find_word(word):
-            cursor = self.current_editor.document().find(word)
-
-            if not cursor.isNull():
-                self.current_editor.setTextCursor(cursor)
-                self.current_editor.ensureCursorVisible()
-
-        word_to_find, ok = QInputDialog.getText(
-            self,
-            "Find Word",
-            "Enter the word you want to find:"
-        )
-
-        if ok and word_to_find:
-            find_word(word_to_find)
-
-    def findWord(self):
-        if not self._has_text_editor():
-            return
-        def find_word(word):
-            if not self.current_editor:
-                return
-
-            text_cursor = QTextCursor(self.current_editor.document())
-            format = QTextCharFormat()
-            format.setBackground(QColor("yellow"))
-
-            while text_cursor.movePosition(QTextCursor.NextWord, QTextCursor.KeepAnchor):
-                if text_cursor.selectedText() == word:
-                    text_cursor.mergeCharFormat(format)
-
-        word_to_find, ok = QInputDialog.getText(
-            self,
-            "Find Word",
-            "Enter the word you want to find:"
-        )
-
-        if ok and word_to_find:
-            find_word(word_to_find)
-
     def save_document(self):
         try:
             if not self._has_text_editor():
@@ -385,45 +315,6 @@ class Window(MSFluentWindow):
                     print("File saved successfully.")  # Debug print
         except Exception as e:
             print(f"An error occurred while saving the document: {e}")
-
-    def tts(self):
-        if not self._has_text_editor():
-            return
-        cursor = self.current_editor.textCursor()
-        text = cursor.selectedText()
-
-        def thread_tts():
-            engine = pyttsx3.init()
-            engine.say(text)
-            engine.runAndWait()
-
-        thread1 = threading.Thread(target=thread_tts)
-        thread1.start()
-
-    def go_to_line(self):
-        if not self._has_text_editor():
-            return
-
-        line_number, ok = QInputDialog.getInt(
-            self,
-            "Go to Line",
-            "Enter line number:",
-            value=1,
-        )
-
-        cursor = self.current_editor.textCursor()
-        cursor.movePosition(QTextCursor.Start)
-        cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor, line_number - 1)
-
-        # Set the cursor as the new cursor for the QTextEdit
-        self.current_editor.setTextCursor(cursor)
-
-        # Ensure the target line is visible
-        self.current_editor.ensureCursorVisible()
-
-    def addTab(self, routeKey, text, icon):
-        # Deprecated in new flow (tabs only for launched Pycros)
-        pass
 
     def addMacroTab(self, routeKey: str, text: str, icon: QIcon, content_widget: QWidget):
         """Add or activate a macro tab and show its content."""
@@ -570,22 +461,7 @@ class Window(MSFluentWindow):
             except Exception:
                 pass
 
-    def _deselect_tabs(self):
-        # Best-effort deselection of TabBar
-        try:
-            self.tabBar.setCurrentIndex(-1)  # if supported
-            return
-        except Exception:
-            pass
-        try:
-            self.tabBar.clearFocus()
-        except Exception:
-            pass
-        try:
-            # Try selecting a non-existent routeKey
-            self.tabBar.setCurrentTab("")
-        except Exception:
-            pass
+    # removed unused text-editor helpers and tab stubs
 
     def _deselect_navigation(self):
         # Explicitly clear selection on NavigationBar

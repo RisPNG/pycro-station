@@ -1,4 +1,3 @@
-import sys
 from PySide6.QtWidgets import QHBoxLayout, QApplication
 from PySide6.QtCore import *
 #from PyQt6.QtGui import QIcon
@@ -110,9 +109,6 @@ class CustomTitleBar(MSFluentTitleBar):
 
         pos.setX(pos.x() - self.tabBar.x())
         return not self.tabBar.tabRegion().contains(pos)
-
-    def test(self):
-        print("hello")
 
     def eventFilter(self, obj, e):
         # Handle middle-click close on the tab bar: close only the tab under cursor
