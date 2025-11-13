@@ -23,6 +23,7 @@ from qframelesswindow import *
 
 from TextWidget import TWidget
 from PycroGrid import PycroGrid
+from PackagesPage import PackagesPage
 from TitleBar import CustomTitleBar
 
 class Settings(QWidget):
@@ -68,8 +69,9 @@ class Window(MSFluentWindow):
         self.save_shortcut.activated.connect(self.save_document)
         self.open_shortcut.activated.connect(self.open_document)
 
-        # Holds the per-tab content widget (now a PycroGrid instead of a text editor)
-        self.text_widgets = {}
+        # Holds active macro pages mapped by routeKey
+        self.macro_pages: dict[str, QWidget] = {}
+        self.macro_labels: dict[str, str] = {}
 
 
         # create sub interface
@@ -78,13 +80,20 @@ class Window(MSFluentWindow):
         self.homeInterface.setFrameShape(QFrame.NoFrame)
         self.homeInterface.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.homeInterface.setStyleSheet("background: transparent;")
-        self.settingsInterface = Settings(self.text_widgets)
+        self.settingsInterface = Settings({})
         self.settingsInterface.setObjectName("settingsInterface")
-        self.tabBar.addTab(text="Untitled 1", routeKey="Untitled 1")
-        self.tabBar.setCurrentTab('Untitled 1')
+        # No initial tabs; Hub shows the grid
 
         self.initNavigation()
         self.initWindow()
+        # Keep Hub/tab selection mutually exclusive
+        self.stackedWidget.currentChanged.connect(self.onContentChanged)
+        # Hub active: keep last tab selection internally; hide its highlight
+        # Also disable tab highlight when Hub is active
+        try:
+            self.titleBar.setTabsSelectionHighlightEnabled(False)
+        except Exception:
+            pass
 
     def initNavigation(self):
         hub = QIcon(QPixmap.fromImage(ImageQt(TablerIcons.load(
@@ -94,6 +103,25 @@ class Window(MSFluentWindow):
             stroke_width=2.0,
         ))))
         self.addSubInterface(self.homeInterface, hub, 'Hub', hub, NavigationItemPosition.TOP)
+        # Ensure clicking Hub also switches inner stack back to the grid view
+        try:
+            self.navigationInterface.widget(self.homeInterface.objectName()).clicked.connect(self.showHub)
+        except Exception:
+            pass
+        # Packages page button under Hub
+        ti_pkg = QIcon(QPixmap.fromImage(ImageQt(TablerIcons.load(
+            OutlineIcon.PLAYLIST_X,
+            size=24,
+            color="#FFFFFF",
+            stroke_width=2.0,
+        ))))
+        self.packagesPage = PackagesPage(self)
+        self.addSubInterface(self.packagesPage, ti_pkg, 'Packages', ti_pkg, NavigationItemPosition.TOP)
+        # revalidate hub grid after uninstall/install changes
+        try:
+            self.packagesPage.packagesChanged.connect(lambda: self.hubGrid.refresh())
+        except Exception:
+            pass
         self.addSubInterface(self.settingsInterface, FIF.SETTING, 'Settings', FIF.SETTING, NavigationItemPosition.BOTTOM)
         # self.addSubInterface(self.settingInterface, FIF.SETTING, 'Settings', FIF.SETTING,  NavigationItemPosition.BOTTOM)
         self.navigationInterface.addItem(
@@ -104,27 +132,16 @@ class Window(MSFluentWindow):
             selectable=False,
             position=NavigationItemPosition.BOTTOM)
 
-        self.navigationInterface.setCurrentItem(
-            self.homeInterface.objectName())
+        # Build Hub grid page
+        self.hubGrid = PycroGrid(self)
+        self.homeInterface.addWidget(self.hubGrid)
+        self.homeInterface.setCurrentWidget(self.hubGrid)
 
-        self.text_widgets = {}
-        for i in range(self.tabBar.count()):  # Iterate through the tabs using count
-            routeKey = self.tabBar.tabText(i)  # Get the routeKey from tabText
+        # Select Hub in navigation
+        self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
 
-            # Create a new instance of grid container for each tab (replaces text editor)
-            grid_widget = PycroGrid(self)
-            self.text_widgets[routeKey] = grid_widget
-
-            self.current_editor = grid_widget
-
-            # Add the TWidget to the corresponding TabInterface
-            tab_interface = TabInterface(self.tabBar.tabText(i), 'icon', routeKey, self)
-            grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            tab_interface.vBoxLayout.addWidget(grid_widget)
-            self.homeInterface.addWidget(tab_interface)
-
+        # Tab bar hooks: tabs represent launched Pycros only
         self.tabBar.currentChanged.connect(self.onTabChanged)
-        self.tabBar.tabAddRequested.connect(self.onTabAddRequested)
 
     def initWindow(self):
         ti_planet = ImageQt(TablerIcons.load(
@@ -140,6 +157,21 @@ class Window(MSFluentWindow):
 
         w, h = 1200, 800
         self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
+
+    def showHub(self):
+        """Switch to the Hub (inner grid) regardless of current tab state."""
+        try:
+            self.switchTo(self.homeInterface)
+        except Exception:
+            self.stackedWidget.setCurrentWidget(self.homeInterface)
+        try:
+            self.homeInterface.setCurrentWidget(self.hubGrid)
+        except Exception:
+            pass
+        try:
+            self.titleBar.setTabsSelectionHighlightEnabled(False)
+        except Exception:
+            pass
 
     def dateTime(self):
         if not self._has_text_editor():
@@ -164,23 +196,59 @@ class Window(MSFluentWindow):
             QDesktopServices.openUrl(QUrl("https://github.com/rispng/"))
 
     def onTabChanged(self, index: int):
-        objectName = self.tabBar.currentTab().routeKey()
-        self.homeInterface.setCurrentWidget(self.findChild(TabInterface, objectName))
-        self.stackedWidget.setCurrentWidget(self.homeInterface)
+        # Switch content area to the selected macro page (robust)
+        try:
+            routeKey = self.tabBar.currentTab().routeKey()
+        except Exception:
+            return
+        self._show_macro_page(routeKey)
+    
+    def onTabClicked(self, index: int):
+        """Handle clicks on the current tab to re-activate its content when Hub is active."""
+        # Try to derive routeKey from the tab label
+        routeKey = None
+        try:
+            label = self.tabBar.tabText(index)
+            for rk, txt in self.macro_labels.items():
+                if txt == label:
+                    routeKey = rk
+                    break
+        except Exception:
+            pass
+        # Fallback to current tab's routeKey if available
+        if routeKey is None:
+            try:
+                routeKey = self.tabBar.currentTab().routeKey()
+            except Exception:
+                return
+        self._show_macro_page(routeKey)
 
-        # Get the currently active tab
-        current_tab = self.homeInterface.widget(index)
+    def _show_macro_page(self, routeKey: str):
+        """Ensure the macro page is in the stack and visible."""
+        page = self.macro_pages.get(routeKey)
+        if page is None:
+            return
+        # Ensure page is in homeInterface and visible
+        try:
+            if self.homeInterface.indexOf(page) == -1:
+                self.homeInterface.addWidget(page)
+        except Exception:
+            pass
+        try:
+            self.stackedWidget.setCurrentWidget(self.homeInterface)
+        except Exception:
+            pass
+        self.homeInterface.setCurrentWidget(page)
+        # ensure highlight is visible and hub deselected
+        try:
+            self.titleBar.setTabsSelectionHighlightEnabled(True)
+        except Exception:
+            pass
+        self._deselect_navigation()
 
-        if current_tab and isinstance(current_tab, TabInterface):
-            # Update the current content widget
-            self.current_editor = self.text_widgets[current_tab.objectName()]
-
+    # No external tab add; tabs are created by launching a Pycro from the Hub
     def onTabAddRequested(self):
-        text = f'Untitled {self.tabBar.count() + 1}'
-        self.addTab(text, text, '')
-
-        # Set the current content widget for the newly added tab
-        self.current_editor = self.text_widgets[text]
+        pass
 
     def open_document(self):
         # Guard: open document only applies to text editor mode
@@ -349,15 +417,163 @@ class Window(MSFluentWindow):
         self.current_editor.ensureCursorVisible()
 
     def addTab(self, routeKey, text, icon):
+        # Deprecated in new flow (tabs only for launched Pycros)
+        pass
+
+    def addMacroTab(self, routeKey: str, text: str, icon: QIcon, content_widget: QWidget):
+        """Add or activate a macro tab and show its content."""
+        # If already open, just focus the tab and page
+        if routeKey in self.macro_pages:
+            try:
+                self.tabBar.setCurrentTab(routeKey)
+            except Exception:
+                pass
+            # Ensure page is in homeInterface and visible
+            page = self.macro_pages[routeKey]
+            try:
+                if self.homeInterface.indexOf(page) == -1:
+                    self.homeInterface.addWidget(page)
+            except Exception:
+                pass
+            try:
+                self.stackedWidget.setCurrentWidget(self.homeInterface)
+            except Exception:
+                pass
+            self.homeInterface.setCurrentWidget(page)
+            self._deselect_navigation()
+            try:
+                self.titleBar.setTabsSelectionHighlightEnabled(True)
+            except Exception:
+                pass
+            return
+
+        # New macro page
+        content_widget.setObjectName(routeKey)
+        content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Add to homeInterface instead of top-level stackedWidget
+        self.homeInterface.addWidget(content_widget)
+        self.macro_pages[routeKey] = content_widget
+        self.macro_labels[routeKey] = text
+
         self.tabBar.addTab(routeKey, text, icon)
-        self.homeInterface.addWidget(TabInterface(text, icon, routeKey, self))
-        # Create a new PycroGrid instance for the new tab
-        grid_widget = PycroGrid(self)
-        self.text_widgets[routeKey] = grid_widget
-        tab_interface = self.findChild(TabInterface, routeKey)
-        grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        tab_interface.vBoxLayout.addWidget(grid_widget)
-        self.current_editor = grid_widget
+        try:
+            self.tabBar.setCurrentTab(routeKey)
+        except Exception:
+            pass
+        try:
+            self.stackedWidget.setCurrentWidget(self.homeInterface)
+        except Exception:
+            pass
+        self.homeInterface.setCurrentWidget(content_widget)
+        self._deselect_navigation()
+        try:
+            self.titleBar.setTabsSelectionHighlightEnabled(True)
+        except Exception:
+            pass
+
+    def onTabCloseRequested(self, index: int):
+        # Find routeKey by temporarily selecting the tab or matching text
+        routeKey = None
+        label = None
+        try:
+            label = self.tabBar.tabText(index)
+        except Exception:
+            pass
+
+        # Match by label first
+        if label is not None:
+            for rk, txt in list(self.macro_labels.items()):
+                if txt == label:
+                    routeKey = rk
+                    break
+
+        # Fallback: select and read routeKey
+        if routeKey is None:
+            try:
+                prev = self.tabBar.currentIndex()
+                self.tabBar.setCurrentIndex(index)
+                routeKey = self.tabBar.currentTab().routeKey()
+                self.tabBar.setCurrentIndex(prev)
+            except Exception:
+                pass
+
+        if routeKey is None:
+            # as a last resort, remove the tab and return to Hub
+            try:
+                self.tabBar.removeTab(index)
+            except Exception:
+                pass
+            self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
+            self.stackedWidget.setCurrentWidget(self.homeInterface)
+            self.homeInterface.setCurrentWidget(self.hubGrid)
+            return
+
+        # Dispose content widget
+        page = self.macro_pages.pop(routeKey, None)
+        self.macro_labels.pop(routeKey, None)
+        if page is not None:
+            try:
+                self.homeInterface.removeWidget(page)
+            except Exception:
+                pass
+            page.deleteLater()
+
+        # Remove the tab
+        try:
+            self.tabBar.removeTab(index)
+        except Exception:
+            pass
+
+        # Show Hub
+        self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
+        self.stackedWidget.setCurrentWidget(self.homeInterface)
+        self.homeInterface.setCurrentWidget(self.hubGrid)
+        try:
+            self.titleBar.setTabsSelectionHighlightEnabled(False)
+        except Exception:
+            pass
+
+    def onContentChanged(self, index: int):
+        """Ensure Hub and tabs aren't selected simultaneously."""
+        w = self.stackedWidget.widget(index)
+        if w is self.homeInterface or w is self.settingsInterface or w is getattr(self, 'packagesPage', object()):
+            # Hub active -> just hide tab highlight (keep selection state)
+            try:
+                self.titleBar.setTabsSelectionHighlightEnabled(False)
+            except Exception:
+                pass
+        else:
+            # Some macro/settings active -> deselect Hub highlight
+            self._deselect_navigation()
+            try:
+                self.titleBar.setTabsSelectionHighlightEnabled(True)
+            except Exception:
+                pass
+
+    def _deselect_tabs(self):
+        # Best-effort deselection of TabBar
+        try:
+            self.tabBar.setCurrentIndex(-1)  # if supported
+            return
+        except Exception:
+            pass
+        try:
+            self.tabBar.clearFocus()
+        except Exception:
+            pass
+        try:
+            # Try selecting a non-existent routeKey
+            self.tabBar.setCurrentTab("")
+        except Exception:
+            pass
+
+    def _deselect_navigation(self):
+        # Explicitly clear selection on NavigationBar
+        try:
+            for widget in getattr(self.navigationInterface, 'items', {}).values():
+                widget.setSelected(False)
+        except Exception:
+            pass
 
     def _has_text_editor(self) -> bool:
         """Return True if the current view is a text editor-like widget."""
