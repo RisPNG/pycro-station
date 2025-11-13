@@ -339,6 +339,21 @@ class PycroCard(QWidget):
         self._proc = None
         # Re-evaluate requirements and update buttons
         self._update_requirements_state(installing=False)
+        # Notify packages page to refresh immediately and let Hub revalidate
+        try:
+            window = self.window()
+            packages_page = getattr(window, 'packagesPage', None)
+            if packages_page is not None:
+                try:
+                    packages_page.refresh()
+                except Exception:
+                    pass
+                try:
+                    packages_page.packagesChanged.emit()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _on_launch(self):
         # Call parent window to add a macro tab

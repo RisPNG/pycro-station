@@ -207,6 +207,15 @@ class PackagesPage(QWidget):
         self.setLayout(v)
         QTimer.singleShot(0, self.refresh)
 
+    def _clear_list(self):
+        # Remove all items (rows, empty label, spacers) from the list layout
+        layout = self.listLayout
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
     def _read_baseline_requirements(self) -> set[str]:
         path = os.path.join(os.getcwd(), 'requirements.txt')
         names: set[str] = set()
@@ -257,10 +266,8 @@ class PackagesPage(QWidget):
         return extras
 
     def refresh(self):
-        # clear
-        for row in self._rows.values():
-            self.listLayout.removeWidget(row)
-            row.deleteLater()
+        # clear any previous content including empty labels/spacers
+        self._clear_list()
         self._rows.clear()
         self._selected.clear()
 
