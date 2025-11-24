@@ -316,32 +316,70 @@ class Window(MSFluentWindow):
         except Exception as e:
             print(f"An error occurred while saving the document: {e}")
 
-    def addMacroTab(self, routeKey: str, text: str, icon: QIcon, content_widget: QWidget):
-        """Add or activate a macro tab and show its content."""
-        # If already open, just focus the tab and page
+    def addMacroTab(self, routeKey: str, text: str, icon: QIcon, content_widget: QWidget, replace_existing: bool = False):
+        """Add or activate a macro tab and show its content.
+
+        replace_existing=True will rebuild the page even if it's already open,
+        so live pycro code/description changes are reflected immediately.
+        """
         if routeKey in self.macro_pages:
+            if not replace_existing:
+                # Just focus existing tab/page
+                try:
+                    self.tabBar.setCurrentTab(routeKey)
+                except Exception:
+                    pass
+                page = self.macro_pages[routeKey]
+                try:
+                    if self.homeInterface.indexOf(page) == -1:
+                        self.homeInterface.addWidget(page)
+                except Exception:
+                    pass
+                try:
+                    self.stackedWidget.setCurrentWidget(self.homeInterface)
+                except Exception:
+                    pass
+                self.homeInterface.setCurrentWidget(page)
+                self._deselect_navigation()
+                try:
+                    self.titleBar.setTabsSelectionHighlightEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    self.packagesPage.setLocked(True)
+                except Exception:
+                    pass
+                return
+
+            # Replace existing page with fresh content (hot reload)
+            old_page = self.macro_pages.get(routeKey)
+            if old_page is not None:
+                try:
+                    self.homeInterface.removeWidget(old_page)
+                except Exception:
+                    pass
+                old_page.deleteLater()
+            self.macro_pages[routeKey] = content_widget
+            self.macro_labels[routeKey] = text
+
+            content_widget.setObjectName(routeKey)
+            content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.homeInterface.addWidget(content_widget)
+
             try:
                 self.tabBar.setCurrentTab(routeKey)
-            except Exception:
-                pass
-            # Ensure page is in homeInterface and visible
-            page = self.macro_pages[routeKey]
-            try:
-                if self.homeInterface.indexOf(page) == -1:
-                    self.homeInterface.addWidget(page)
             except Exception:
                 pass
             try:
                 self.stackedWidget.setCurrentWidget(self.homeInterface)
             except Exception:
                 pass
-            self.homeInterface.setCurrentWidget(page)
+            self.homeInterface.setCurrentWidget(content_widget)
             self._deselect_navigation()
             try:
                 self.titleBar.setTabsSelectionHighlightEnabled(True)
             except Exception:
                 pass
-            # lock packages while tabs are open
             try:
                 self.packagesPage.setLocked(True)
             except Exception:
@@ -351,7 +389,6 @@ class Window(MSFluentWindow):
         # New macro page
         content_widget.setObjectName(routeKey)
         content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # Add to homeInterface instead of top-level stackedWidget
         self.homeInterface.addWidget(content_widget)
         self.macro_pages[routeKey] = content_widget
         self.macro_labels[routeKey] = text
@@ -371,7 +408,6 @@ class Window(MSFluentWindow):
             self.titleBar.setTabsSelectionHighlightEnabled(True)
         except Exception:
             pass
-        # lock packages while tabs are open
         try:
             self.packagesPage.setLocked(True)
         except Exception:
@@ -443,6 +479,19 @@ class Window(MSFluentWindow):
             self.packagesPage.setLocked(len(self.macro_pages) > 0)
         except Exception:
             pass
+
+    def closeAllTabs(self):
+        """Close all open macro tabs."""
+        count = 0
+        try:
+            count = self.tabBar.count()
+        except Exception:
+            count = 0
+        for i in reversed(range(count)):
+            try:
+                self.onTabCloseRequested(i)
+            except Exception:
+                pass
 
     def onContentChanged(self, index: int):
         """Ensure Hub and tabs aren't selected simultaneously."""

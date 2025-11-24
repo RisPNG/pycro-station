@@ -43,6 +43,7 @@ class PycroGrid(QScrollArea):
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(250)
         self._debounce_timer.timeout.connect(self.refresh)
+        self._last_changed_path = None
 
         # Initial content
         self._empty_label = QLabel("Pycros will appear here", self._content)
@@ -65,6 +66,7 @@ class PycroGrid(QScrollArea):
         """Rescan pycros folder and rebuild cards."""
         infos = self._scan_pycros()
         self._rebuild(infos)
+        self._reload_open_tabs(infos)
 
     # --- Internal helpers ---
     def _scan_pycros(self):
@@ -79,8 +81,12 @@ class PycroGrid(QScrollArea):
 
         # Reset watcher to follow files within subdirs
         try:
-            self._watcher.removePaths(self._watcher.directories())
-            self._watcher.removePaths(self._watcher.files())
+            dirs = self._watcher.directories()
+            files = self._watcher.files()
+            if dirs:
+                self._watcher.removePaths(dirs)
+            if files:
+                self._watcher.removePaths(files)
         except Exception:
             pass
         self._watcher.addPath(root)
@@ -122,25 +128,30 @@ class PycroGrid(QScrollArea):
                 self._watcher.addPath(desc_md)
             if os.path.isfile(req_txt):
                 self._watcher.addPath(req_txt)
+            if os.path.isfile(main_py):
+                self._watcher.addPath(main_py)
+            if os.path.isfile(main_py):
+                self._watcher.addPath(main_py)
 
         return infos
 
     def _parse_description(self, path):
-        short_desc = ''
+        short_lines = []
         long_desc_lines = []
         if not os.path.isfile(path):
-            return short_desc, ''
+            return '', ''
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
             for line in lines:
                 s = line.strip('\n')
-                if s.startswith('>') and not short_desc:
-                    short_desc = s.lstrip('> ').strip()
-                elif not s.startswith('>'):
+                if s.startswith('>'):
+                    short_lines.append(s.lstrip('> ').strip())
+                else:
                     long_desc_lines.append(s)
         except Exception:
             pass
+        short_desc = '\n'.join(short_lines).strip()
         long_desc = '\n'.join(long_desc_lines).strip()
         return short_desc, long_desc
 
@@ -180,10 +191,65 @@ class PycroGrid(QScrollArea):
             self._grid.setColumnStretch(c, 0)
         self._grid.setColumnStretch(columns, 1)
 
-    def _on_dir_changed(self, _):
+    def _reload_open_tabs(self, infos):
+        """If a watched file changed, reload any open tab for that pycro."""
+        if not self._last_changed_path:
+            return
+        window = self.window()
+        if window is None or not hasattr(window, 'macro_pages'):
+            self._last_changed_path = None
+            return
+
+        changed = os.path.normcase(self._last_changed_path)
+        targets = [
+            info for info in infos
+            if changed.startswith(os.path.normcase(info.folder))
+        ]
+        if not targets:
+            self._last_changed_path = None
+            return
+
+        for info in targets:
+            try:
+                open_tabs = getattr(window, 'macro_pages', {})
+                if info.name not in open_tabs:
+                    continue
+                page = self._build_page(info)
+                if page is None:
+                    continue
+                window.addMacroTab(info.name, info.display_name, QIcon(), page, replace_existing=True)
+            except Exception:
+                continue
+
+        self._last_changed_path = None
+
+    def _build_page(self, info: 'PycroInfo') -> QWidget | None:
+        widget = _load_pycro_widget(info)
+        if widget is None:
+            return None
+
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(12)
+
+        if info.long_desc:
+            desc = QTextBrowser()
+            desc.setOpenExternalLinks(True)
+            desc.setPlainText(info.long_desc)
+            desc.setStyleSheet('QTextBrowser{background:transparent; color:#ddd; border:none;}')
+            desc.setFixedHeight(120)
+            v.addWidget(desc)
+
+        v.addWidget(widget, 1)
+        return page
+
+    def _on_dir_changed(self, path):
+        self._last_changed_path = path
         self._debounce_timer.start()
 
-    def _on_file_changed(self, _):
+    def _on_file_changed(self, path):
+        self._last_changed_path = path
         self._debounce_timer.start()
 
 
@@ -198,6 +264,40 @@ class PycroInfo:
         self.short_desc = short_desc
         self.long_desc = long_desc
         self.has_python = has_python
+
+
+def _load_pycro_widget(info: 'PycroInfo') -> QWidget | None:
+    main_path = info.main_py
+    if not os.path.isfile(main_path):
+        return None
+    try:
+        module_name = f"pycro_{info.name}"
+        if module_name in sys.modules:
+            del sys.modules[module_name]
+
+        spec = importlib.util.spec_from_file_location(module_name, main_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)  # type: ignore
+        # Prefer get_widget()
+        if hasattr(module, 'get_widget') and callable(module.get_widget):
+            w = module.get_widget()
+            if isinstance(w, QWidget):
+                return w
+        # Else try MainWidget class
+        if hasattr(module, 'MainWidget'):
+            cls = getattr(module, 'MainWidget')
+            try:
+                inst = cls()
+                if isinstance(inst, QWidget):
+                    return inst
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
 
 
 class PycroCard(QWidget):
@@ -231,10 +331,16 @@ class PycroCard(QWidget):
             f"background: transparent; border: none; color: {'#fff' if isDarkTheme() else '#111'}; font-size:16px; font-weight:600;"
         )
 
-        desc = QLabel(info.short_desc or '(no description)', self)
-        desc.setWordWrap(True)
+        desc = QTextBrowser(self)
+        desc.setReadOnly(True)
+        desc.setOpenExternalLinks(False)
+        desc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        desc.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        desc.setText(info.short_desc or '(no description)')
+        desc.setMaximumHeight(90)
+        desc.setFrameStyle(QFrame.NoFrame)
         desc.setStyleSheet(
-            f"background: transparent; border: none; color: {'#bbb' if isDarkTheme() else '#444'}; font-size:12px;"
+            f"QTextBrowser{{background: transparent; border: none; color: {'#bbb' if isDarkTheme() else '#444'}; font-size:12px;}}"
         )
 
         v.addWidget(title)
@@ -358,59 +464,19 @@ class PycroCard(QWidget):
     def _on_launch(self):
         # Call parent window to add a macro tab
         window = self.window()
-        widget = self._load_widget()
-        if widget is None:
+        page = self._grid._build_page(self.info)
+        if page is None:
             QMessageBox.warning(self, 'Launch failed', 'Could not load macro widget (missing MainWidget/get_widget)')
             return
-        # Add a wrapper page with long description + widget
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(12)
-
-        if self.info.long_desc:
-            desc = QTextBrowser()
-            desc.setOpenExternalLinks(True)
-            desc.setPlainText(self.info.long_desc)
-            desc.setStyleSheet('QTextBrowser{background:transparent; color:#ddd; border:none;}')
-            desc.setFixedHeight(120)
-            v.addWidget(desc)
-
-        v.addWidget(widget, 1)
-
         try:
-            window.addMacroTab(self.info.name, self.info.display_name, QIcon(), page)
+            window.addMacroTab(self.info.name, self.info.display_name, QIcon(), page, replace_existing=True)
         except Exception:
             # Fallback: show as separate window
-            widget.setWindowTitle(self.info.display_name)
-            widget.resize(800, 600)
-            widget.show()
+            widget = _load_pycro_widget(self.info)
+            if widget is not None:
+                widget.setWindowTitle(self.info.display_name)
+                widget.resize(800, 600)
+                widget.show()
 
     def _load_widget(self) -> QWidget | None:
-        main_path = self.info.main_py
-        if not os.path.isfile(main_path):
-            return None
-        try:
-            spec = importlib.util.spec_from_file_location(f"pycro_{self.info.name}", main_path)
-            if spec is None or spec.loader is None:
-                return None
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)  # type: ignore
-            # Prefer get_widget()
-            if hasattr(module, 'get_widget') and callable(module.get_widget):
-                w = module.get_widget()
-                if isinstance(w, QWidget):
-                    return w
-            # Else try MainWidget class
-            if hasattr(module, 'MainWidget'):
-                cls = getattr(module, 'MainWidget')
-                try:
-                    inst = cls()
-                    if isinstance(inst, QWidget):
-                        return inst
-                except Exception:
-                    return None
-        except Exception:
-            return None
-        return None
+        return _load_pycro_widget(self.info)

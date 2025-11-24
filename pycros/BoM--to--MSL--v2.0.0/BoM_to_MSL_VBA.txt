@@ -1,0 +1,834 @@
+'Option Explicit
+Dim wbResult As Workbook
+Dim wsResult As Worksheet
+Dim wsLog As Worksheet
+
+Dim logCount As Long
+Dim resultCount As Long
+
+Dim error As Boolean
+
+Dim inProcess As Boolean
+
+Const NORMAL_COL_COUNT As Integer = 12
+
+Const STYLE_LABEL As String = "STYLE#:"
+Const SEASON_LABEL As String = "SEASON:"
+
+Const STYLE_LENGTH As Integer = 6
+Const SEASON_LENGTH As Integer = 4
+Const ITEM_LENGTH As Integer = 7
+
+Const S_COL_SEQ As Integer = 1
+Const S_COL_DESC As Integer = 4
+Const S_COL_UOM As Integer = 8
+Const S_COL_CW  As Integer = 9
+
+Const S_UOM_VALUE As String = "UOM"
+
+Const R_START_ROW As Long = 1
+Const R_START_COL As Long = 0
+
+' Updated column constants for new header structure
+Const R_COL_SEASON As Integer = 6
+Const R_COL_SEQ As Integer = 7
+Const R_COL_STYLE_NUMBER As Integer = 8
+Const R_COL_STYLE_NAME As Integer = 9
+Const R_COL_STYLE_CW As Integer = 10
+Const R_COL_VENDOR_CODE As Integer = 11
+Const R_COL_VENDOR_NAME As Integer = 12
+Const R_COL_VENDOR_MCO As Integer = 13
+Const R_COL_ITEM As Integer = 14
+Const R_COL_DESC As Integer = 15
+Const R_COL_COLOR_CODE As Integer = 16
+Const R_COL_COLOR_NAME As Integer = 17
+Const R_COL_REMARKS As Integer = 23
+Const R_COL_END As Integer = 23
+
+Const cGreen As Long = 5296274
+Const cBlue As Long = 15189684
+Const cWhite As Long = 16777215
+Const cYellow As Long = 65535
+
+Sub MasterStart()
+    If inProcess Then Exit Sub
+
+    On Error GoTo err
+
+    MsgBox "Please select BOM File(s)"
+    Dim FileChosen As Integer
+    Dim fd As FileDialog
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    fd.AllowMultiSelect = True
+    fd.Filters.Clear
+    fd.Filters.Add "Excel Files", "*.xls;*.xlsx"
+
+    FileChosen = fd.Show
+
+    If FileChosen <> -1 Then Exit Sub
+
+    If MsgBox("Total file(s) selected : " & fd.SelectedItems.Count & vbCrLf & _
+              "Start Process?", vbYesNo + vbQuestion, "Start Process?") <> vbYes Then
+        Exit Sub
+    End If
+
+    inProcess = True
+
+    logCount = 0
+    resultCount = 0
+
+    Set wbResult = Workbooks.Add
+    Set wsResult = wbResult.Worksheets(1)
+    wsResult.Name = "RESULT"
+
+    Set wsLog = wbResult.Worksheets.Add(after:=wsResult)
+    wsLog.Name = "LOG"
+
+    wbResult.Windows(1).Visible = False
+    frmProgress.Show vbModeless
+
+    WriteLog ("Process Begin...")
+    error = False
+
+    '===================================
+    PrintHeader wsResult
+    AdjustColumns
+
+    For i = 1 To fd.SelectedItems.Count
+        Call ProcessStyleSheet(fd.SelectedItems(i))
+        frmProgress.ShowProgress i, fd.SelectedItems.Count
+    Next i
+
+    ChangeFormatting wsResult
+    ApplyLayoutShrink wsResult
+    AutoFitSelectedColumns wsResult
+
+    frmProgress.Hide
+    wbResult.Windows(1).Visible = True
+    WriteLog ("Process Completed")
+
+
+    If error Then
+        MsgBox "Process completed with error." & vbCrLf & "Please check log file for details.", vbInformation, "Process Complete"
+    Else
+        MsgBox "Process completed." & vbCrLf & "Please save your files.", vbInformation, "Process Complete"
+    End If
+
+    inProcess = False
+
+    Exit Sub
+
+err:
+    frmProgress.Hide
+    wbResult.Windows(1).Visible = True
+    MsgBox err.Description & vbCrLf & "Line:" & i, vbCritical, "Error"
+    inProcess = False
+    Exit Sub
+End Sub
+
+Private Sub ChangeFormatting(ByVal wsResult As Worksheet)
+    Dim maxrow, start
+
+    start = 2
+    maxrow = wsResult.UsedRange.Rows.Count
+
+    Do While start <= maxrow
+        If Trim(wsResult.Cells(start, ColLett(R_COL_SEASON)).Value) <> "" Then
+            wsResult.Cells(start, ColLett(R_COL_SEASON)).Value = Trim(Left(wsResult.Cells(start, ColLett(R_COL_SEASON)).Value, 2) & "'" & Right(wsResult.Cells(start, ColLett(R_COL_SEASON)).Value, 2))
+        End If
+
+        ' Updated to use new vendor columns
+        If Trim(wsResult.Cells(start, ColLett(R_COL_VENDOR_NAME)).Value) <> "" Then
+            wsResult.Cells(start, ColLett(R_COL_VENDOR_NAME)).Value = Trim(Replace(wsResult.Cells(start, ColLett(R_COL_VENDOR_NAME)).Value, ",", ""))
+            wsResult.Cells(start, ColLett(R_COL_VENDOR_NAME)).Value = Trim(Replace(wsResult.Cells(start, ColLett(R_COL_VENDOR_NAME)).Value, "NIKE-APPROVED VENDOR", ""))
+        End If
+
+        If Trim(wsResult.Cells(start, ColLett(R_COL_DESC)).Value) <> "" Then
+            wsResult.Cells(start, ColLett(R_COL_DESC)).Value = Trim(Replace(wsResult.Cells(start, ColLett(R_COL_DESC)).Value, ",", ""))
+        End If
+
+        If Trim(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value) <> "" Then
+            If Trim(Left(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value, 1)) = "*" Or Trim(Left(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value, 1)) = "@" Then
+                wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value = Trim("#" & Right(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value, Len(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value) - 1))
+            ElseIf InStr(Trim(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value), "#") <= 0 Then
+                wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value = Trim("#" & wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value)
+            End If
+
+            If Trim(Left(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value, 1)) = "#" Then
+                If Len(Trim(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value)) < 4 Then
+                    wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value = Trim("#0" & Replace(wsResult.Cells(start, ColLett(R_COL_STYLE_CW)).Value, "#", ""))
+                End If
+            End If
+        End If
+
+        If Trim(wsResult.Cells(start, ColLett(R_COL_COLOR_NAME)).Value) <> "" Then
+            If InStr(Trim(wsResult.Cells(start, ColLett(R_COL_COLOR_NAME)).Value), "DTM") > 0 Then
+                wsResult.Cells(start, ColLett(R_COL_COLOR_NAME)).Value = Trim(Replace(wsResult.Cells(start, ColLett(R_COL_COLOR_NAME)).Value, "DTM", ""))
+                wsResult.Cells(start, ColLett(R_COL_REMARKS)).Value = "DTM"
+            End If
+        End If
+
+        start = start + 1
+
+    Loop
+
+    'Remove wrap text from all column including header
+    wsResult.Cells.WrapText = False
+
+End Sub
+
+Private Sub ProcessStyleSheet(ByVal FileName As String)
+    Dim tempWB As Workbook
+    Dim tempWS As Worksheet
+    Dim tempMaxRow As Long
+    Dim tempMaxCol As Long
+
+    Dim tempFile As String
+
+    Dim tempStyleSeason As String
+    Dim style As String
+    Dim season As String
+
+    Dim seq As String
+    Dim supplier As String
+    Dim item As String
+    Dim desc As String
+    Dim cw As String
+    Dim color As String
+
+    Dim cwRow As Long
+
+    Dim importedRows As Long
+
+    On Error GoTo err
+
+    cwRow = 0
+
+    tempFile = Right$(FileName, Len(FileName) - InStrRev(FileName, "\"))
+
+    Dim app As New Application
+    Set tempWB = app.Workbooks.Add(FileName)
+    Set tempWS = tempWB.Worksheets(1)
+    tempWB.Windows(1).Visible = False
+
+    WriteLog tempFile & " - Start Processing..."
+
+    tempMaxRow = tempWS.UsedRange.Rows.Count
+    tempMaxCol = tempWS.UsedRange.Columns.Count
+
+    If tempMaxCol <> NORMAL_COL_COUNT Then err.Raise 999, , tempFile & " - Unusual column size detected. (Default : " & NORMAL_COL_COUNT & ")"
+
+    'get style & season
+    tempStyleSeason = GetSeasonStyle(tempWS)
+
+    If tempStyleSeason = "" Then err.Raise 0, , tempFile & " - Error:Unable to get Season/Style"
+
+    season = Left$(tempStyleSeason, InStr(tempStyleSeason, "|") - 1)
+    style = Right$(tempStyleSeason, Len(tempStyleSeason) - InStrRev(tempStyleSeason, "|"))
+
+    For i = 1 To tempMaxRow
+        seq = ""
+        supplier = ""
+        item = ""
+        desc = ""
+        cw = ""
+        color = ""
+
+        If tempWS.Cells(i, S_COL_UOM).Value = S_UOM_VALUE Then cwRow = i
+
+        If Len(Trim(tempWS.Cells(i, S_COL_SEQ).Value)) And IsNumeric(tempWS.Cells(i, S_COL_SEQ).Value) And cwRow > 0 Then
+            seq = tempWS.Cells(i, S_COL_SEQ).Value
+            supplier = GetSupplier(tempWS.Cells(i, S_COL_DESC).Value)
+            item = "'" & GetItem(tempWS.Cells(i, S_COL_DESC).Value)
+            desc = GetDesc(tempWS.Cells(i, S_COL_DESC).Value)
+
+            For j = S_COL_CW To tempMaxCol
+                If Len(Trim(tempWS.Cells(cwRow, j).Value)) > 0 Then
+                    cw = Trim(tempWS.Cells(cwRow, j).Value)
+
+                    color = FormatColor(tempWS.Cells(i, j).Value)
+
+                    If Left(supplier, 3) = "YKK" Then
+                        color = Replace(color, "/", vbCrLf)
+                        color = ProcessZipper(color)
+                    Else
+                        color = Replace(color, "/", " / ")
+                    End If
+
+                    InsertData wsResult, season, style, seq, supplier, item, desc, cw, color
+                    importedRows = importedRows + 1
+                End If
+            Next j
+        End If
+    Next i
+
+    Application.DisplayAlerts = False
+    tempWB.Close savechanges:=False
+    Application.DisplayAlerts = True
+    app.Quit
+
+    WriteLog tempFile & " - End Processing... Total " & importedRows & " inserted."
+
+    Exit Sub
+err:
+    Call WriteLog(tempFile & " - Error : " & err.Description)
+    error = True
+    Application.DisplayAlerts = False
+    tempWB.Close savechanges:=False
+    Application.DisplayAlerts = True
+    app.Quit
+    Exit Sub
+End Sub
+
+Private Sub InsertData(ByRef TargetWS As Worksheet, ByVal season As String, ByVal style As String, ByVal seq As String, _
+                       ByVal supplier As String, ByVal item As String, ByVal desc As String, ByVal cw As String, ByVal color As String)
+
+    Dim vendorCode As String, vendorName As String, vendorMCO As String
+    Call SplitSupplier(supplier, vendorCode, vendorName, vendorMCO)
+
+    resultCount = resultCount + 1
+
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_SEASON).Value = season
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_SEQ).Value = seq
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_STYLE_NUMBER).Value = style
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_STYLE_CW).Value = cw
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_VENDOR_CODE).Value = vendorCode
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_VENDOR_NAME).Value = vendorName
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_VENDOR_MCO).Value = vendorMCO
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_ITEM).Value = item
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_DESC).Value = desc
+    TargetWS.Cells(R_START_ROW + resultCount, R_COL_COLOR_NAME).Value = color
+
+End Sub
+
+Private Sub SplitSupplier(ByVal supplier As String, ByRef vendorCode As String, ByRef vendorName As String, ByRef vendorMCO As String)
+    Dim firstDashPos As Integer
+    Dim secondDashPos As Integer
+    Dim beforeFirstDash As String
+
+    ' --- NEW: normalize and strip the NIKE tag up front ---
+    supplier = NormalizeSupplier(supplier)
+    supplier = StripNikeTag(supplier)
+    ' ------------------------------------------------------
+
+    ' Initialize outputs
+    vendorCode = ""
+    vendorName = ""
+    vendorMCO = ""
+
+    ' Handle empty / "-" supplier
+    If Trim$(supplier) = "" Or Trim$(supplier) = "-" Then Exit Sub
+
+    ' Find the first meaningful dash
+    firstDashPos = FindMeaningfulDash(supplier, 1)
+
+    If firstDashPos = 0 Then
+        ' No dash: whole thing is the name
+        vendorName = Trim$(supplier)
+        Exit Sub
+    End If
+
+    beforeFirstDash = Trim$(Left$(supplier, firstDashPos - 1))
+
+    If Len(beforeFirstDash) < 8 Then
+        ' Treat as VENDOR CODE - VENDOR NAME - MCO
+        vendorCode = beforeFirstDash
+
+        ' Find the second dash
+        secondDashPos = FindMeaningfulDash(supplier, firstDashPos + 1)
+
+        If secondDashPos = 0 Then
+            vendorName = Trim$(Mid$(supplier, firstDashPos + 1))
+        Else
+            vendorName = Trim$(Mid$(supplier, firstDashPos + 1, secondDashPos - firstDashPos - 1))
+            vendorMCO = Trim$(Mid$(supplier, secondDashPos + 1))
+        End If
+    Else
+        ' Treat as VENDOR NAME - MCO
+        vendorName = beforeFirstDash
+        vendorMCO = Trim$(Mid$(supplier, firstDashPos + 1))
+    End If
+
+    ' Final cleanup in case the NIKE tag was in the segments
+    vendorName = StripNikeTag(vendorName)
+    vendorMCO = StripNikeTag(vendorMCO)
+End Sub
+
+Private Function FindMeaningfulDash(ByVal text As String, ByVal startPos As Integer) As Integer
+    Dim i As Integer, char As String, prevChar As String, nextChar As String
+
+    For i = startPos To Len(text)
+        char = Mid$(text, i, 1)
+        If IsDashChar(char) Then
+            If i > 1 Then prevChar = Mid$(text, i - 1, 1) Else prevChar = ""
+            If i < Len(text) Then nextChar = Mid$(text, i + 1, 1) Else nextChar = ""
+
+            ' consider meaningful if bordered by spaces or boundaries
+            If (IsSpaceChar(prevChar) Or i = 1) Or (IsSpaceChar(nextChar) Or i = Len(text)) Then
+                FindMeaningfulDash = i: Exit Function
+            End If
+            ' or not between two alphanumerics
+            If Not (IsAlphaNumeric(prevChar) And IsAlphaNumeric(nextChar)) Then
+                FindMeaningfulDash = i: Exit Function
+            End If
+        End If
+    Next i
+
+    FindMeaningfulDash = 0
+End Function
+
+Private Function IsAlphaNumeric(ByVal char As String) As Boolean
+    If Len(char) <> 1 Then
+        IsAlphaNumeric = False
+        Exit Function
+    End If
+
+    Dim asciiVal As Integer
+    asciiVal = Asc(UCase(char))
+
+    ' Check if character is A-Z or 0-9
+    IsAlphaNumeric = (asciiVal >= 65 And asciiVal <= 90) Or (asciiVal >= 48 And asciiVal <= 57)
+End Function
+
+Private Sub PrintHeader(ByRef TargetWS As Worksheet)
+    Dim HeaderCol As Variant
+    Dim tempRange As Range
+    HeaderCol = Array("DATE RECEIVED", "MAT NO", "SAMPLE TYPE", "MATERIAL OETC", "CATEGORY", _
+                      "SEASON", "SEQ", "STYLE NUMBER", "SYTLE NAME", "STYLE CW", "VENDOR CODE", "VENDOR NAME", "VENDOR MCO", _
+                      "ITEM", "DESCRIPTION", "COLOR CODE", "COLOR NAME", "SIZE", "QUALITY", "SIZE MATRIX/COO", _
+                      "QTY", "UOM", "REMARKS")
+
+    For i = LBound(HeaderCol) To UBound(HeaderCol)
+        TargetWS.Cells(R_START_ROW, R_START_COL + i + 1).Value = HeaderCol(i)
+    Next i
+End Sub
+
+Private Function GetSeasonStyle(ByRef TargetWS As Worksheet) As String
+    Dim maxcol, maxrow As Long
+    Dim cellValue As String
+    Dim season, style, result As String
+    Dim found As Boolean
+
+    found = False
+
+    maxcol = TargetWS.UsedRange.Columns.Count
+    maxrow = TargetWS.UsedRange.Rows.Count
+
+    For i = 1 To maxrow
+        For j = 1 To maxcol
+            cellValue = UCase(Trim(TargetWS.Cells(i, j).Value))
+            cellValue = Replace(cellValue, " ", "")
+
+            If InStr(cellValue, STYLE_LABEL) > 0 And InStr(cellValue, SEASON_LABEL) > 0 Then
+                season = GetSeason(cellValue)
+                style = GetStyle(cellValue)
+                found = True
+                Exit For
+            End If
+        Next j
+
+        If found Then Exit For
+    Next i
+
+    If Trim(season) = "" Or Trim(style) = "" Then
+        GetSeasonStyle = ""
+    Else
+        GetSeasonStyle = season & "|" & style
+    End If
+
+End Function
+
+Private Function ProcessZipper(ByVal source As String) As String
+    Dim x As Variant
+    Dim c() As Variant
+
+    Dim result As String
+    Dim exist As Boolean
+
+    ReDim c(0) As Variant
+    x = Split(source, vbCrLf)
+
+    If UBound(x) >= 4 Then
+        For i = LBound(x) To 4
+            x(i) = Left(x(i), 3)                 '************
+            If Not ExistArray(c, x(i)) Then
+                ReDim Preserve c(UBound(c) + 1) As Variant
+                c(UBound(c)) = x(i)
+            End If
+        Next i
+
+        For i = LBound(c) To UBound(c)
+            exist = False
+            For j = LBound(x) To 4
+                If c(i) = x(j) And Trim(c(i)) <> "NOCOLR" Then
+                    If exist Then result = result & "/"
+                    Select Case j
+                    Case 0
+                        result = result & "TP"
+                    Case 1
+                        result = result & "TH"
+                    Case 2
+                        result = result & "PL"
+                    Case 3
+                        result = result & "SL"
+                    Case 4
+                        result = result & "SP"
+                    End Select
+                    exist = True
+                End If
+            Next j
+            If exist Then
+                If InStr(c(i), " ") > 0 Then
+                    result = result & ":#" & Left(c(i), 3) & " - "
+                Else
+                    result = result & ":#" & c(i) & " - "
+                End If
+            End If
+        Next i
+
+        If UBound(x) >= 5 Then result = result & vbCrLf & x(5)
+    Else
+        result = source
+    End If
+
+    ProcessZipper = result
+End Function
+
+Private Function ExistArray(ByRef a() As Variant, ByVal searchStr As String) As Boolean
+    Dim result As Boolean
+    result = False
+    For i = LBound(a) To UBound(a)
+        If Trim(a(i)) = searchStr Then
+            result = True
+            Exit For
+        End If
+    Next i
+
+    ExistArray = result
+
+End Function
+
+Private Function GetCategory(ByVal source As String) As String
+    Dim maxrow As Long
+    Dim cat As String
+
+    maxrow = wsCategory.UsedRange.Rows.Count
+    cat = "-"
+
+    For i = 1 To maxrow
+        If InStr(source, Trim(wsCategory.Cells(i, 1).Value)) > 0 Then
+            cat = Trim(wsCategory.Cells(i, 2).Value)
+            Exit For
+        End If
+    Next i
+
+    GetCategory = cat
+
+End Function
+
+Private Function GetMOQ(ByVal source As String) As String
+    Dim maxrow As Long
+    Dim moq As String
+
+    maxrow = wsMOQ.UsedRange.Rows.Count
+    cat = "-"
+
+    For i = 1 To maxrow
+        If InStr(source, Trim(wsMOQ.Cells(i, 1).Value)) > 0 Then
+            moq = Trim(wsMOQ.Cells(i, 2).Value)
+            Exit For
+        End If
+    Next i
+
+    GetMOQ = moq
+
+End Function
+
+Private Function GetStyle(ByVal source As String) As String
+    On Error GoTo err
+    Dim position As Integer
+    position = InStr(source, STYLE_LABEL) + Len(STYLE_LABEL)
+    GetStyle = Mid(source, position, STYLE_LENGTH)
+    Exit Function
+err:
+    GetStyle = ""
+    Exit Function
+End Function
+
+Private Function GetSeason(ByVal source As String) As String
+    Dim position As Integer
+    position = InStr(source, SEASON_LABEL) + Len(SEASON_LABEL)
+    GetSeason = Mid(source, position, SEASON_LENGTH)
+    Exit Function
+err:
+    GetSeason = ""
+    Exit Function
+End Function
+
+Private Function GetSupplier(ByVal source As String)
+    Dim x As Variant
+    If InStr(source, "***") <= 0 Or Trim(source) = "" Then
+        GetSupplier = "-"
+    Else
+        x = Split(source, "***")
+        GetSupplier = Trim(UCase(Trim(x(0))))
+    End If
+End Function
+
+Private Function GetItem(ByVal source As String)
+    Dim x As Variant
+    If InStr(source, "***") <= 0 Or Trim(source) = "" Then
+        GetItem = "-"
+    Else
+        x = Split(source, "***")
+        GetItem = Trim(UCase(Mid(Trim(x(1)), 2, ITEM_LENGTH)))
+    End If
+End Function
+
+Private Function GetDesc(ByVal source As String)
+    Dim x As Variant
+    If InStr(source, "***") <= 0 Or Trim(source) = "" Then
+        GetDesc = "-"
+    Else
+        x = Split(source, "***")
+        GetDesc = Trim(UCase(Mid(Trim(x(1)), ITEM_LENGTH + 2)))
+    End If
+
+End Function
+
+Sub test()
+    ActiveCell.Comment.Shape.TextFrame.AutoSize = True
+End Sub
+
+Private Sub AdjustColumns()
+    Dim colWidthRS, colColorRS As Variant
+    Dim tempRange As Range
+    colWidthRS = Array(11, 11, 11, 11, 11, _
+                       7.5, 5, 7.5, 11, 8.5, 8.5, 38, 8.5, _
+                       8.5, 38, 8.5, 27, _
+                       11, 11, 11, 11, 11, 11)
+
+    colColorRS = Array(cGreen, cGreen, cGreen, cGreen, cGreen, _
+                       cWhite, cWhite, cWhite, cWhite, cWhite, cWhite, cWhite, cWhite, _
+                       cWhite, cWhite, cWhite, cWhite, _
+                       cBlue, cBlue, cBlue, cBlue, cBlue, cBlue)
+
+    wsResult.Rows(R_START_ROW).RowHeight = 30
+
+    For i = LBound(colWidthRS) To UBound(colWidthRS)
+        Set tempRange = wsResult.Cells(R_START_ROW, R_START_COL + i + 1)
+        tempRange.ColumnWidth = colWidthRS(i)
+        tempRange.Interior.color = colColorRS(i)
+        tempRange.BorderAround Weight:=xlThin
+    Next i
+End Sub
+
+Private Function FormatColor(ByVal source As String) As String
+    Dim result As String
+
+    result = source
+
+    For i = 1 To Len(source)
+        If Mid(source, i, 1) = " " And i >= 5 Then
+            If Len(Trim(Mid(source, i - 4, 4))) > 3 Then result = WorksheetFunction.Replace(result, i, 1, "/")
+        End If
+    Next i
+
+    FormatColor = result
+
+End Function
+
+Public Function ColLett(ByVal Col As Long) As String
+    Col = Col - 1
+
+    If Col > 25 Then
+        ColLett = ColLett((Col - (Col Mod 26) - 1) / 26) + Chr(Col Mod 26 + 65)
+    Else
+        ColLett = Chr(Col Mod 26 + 65)
+    End If
+
+End Function
+
+Private Sub WriteLog(ByVal MSG As String)
+    logCount = logCount + 1
+    wsLog.Cells(logCount, 1).Value = "[" & Now() & "] " & MSG
+End Sub
+
+Sub ApplyBorder(ByRef xRange As Range)
+    With xRange
+        .Borders(xlDiagonalDown).LineStyle = xlNone
+        .Borders(xlDiagonalUp).LineStyle = xlNone
+        With .Borders(xlEdgeLeft)
+            .LineStyle = xlContinuous
+            .ColorIndex = 0
+            .TintAndShade = 0
+            .Weight = xlThin
+        End With
+        With .Borders(xlEdgeTop)
+            .LineStyle = xlContinuous
+            .ColorIndex = 0
+            .TintAndShade = 0
+            .Weight = xlThin
+        End With
+        With .Borders(xlEdgeBottom)
+            .LineStyle = xlContinuous
+            .ColorIndex = 0
+            .TintAndShade = 0
+            .Weight = xlThin
+        End With
+        With .Borders(xlEdgeRight)
+            .LineStyle = xlContinuous
+            .ColorIndex = 0
+            .TintAndShade = 0
+            .Weight = xlThin
+        End With
+        With .Borders(xlInsideVertical)
+            .LineStyle = xlContinuous
+            .ColorIndex = 0
+            .TintAndShade = 0
+            .Weight = xlThin
+        End With
+        With .Borders(xlInsideHorizontal)
+            .LineStyle = xlContinuous
+            .ColorIndex = 0
+            .TintAndShade = 0
+            .Weight = xlThin
+        End With
+    End With
+End Sub
+
+Private Sub SortRecord(ByRef TargetSheet As Worksheet)
+    Dim mRow, mCol As Long
+    mRow = TargetSheet.UsedRange.Rows.Count
+    mCol = TargetSheet.UsedRange.Columns.Count
+
+    If mRow <= 1 Then Exit Sub
+
+    TargetSheet.Sort.SortFields.Clear
+    TargetSheet.Sort.SortFields.Add Key:=Range(ColLett(R_COL_STYLE_NUMBER) & "2:" & ColLett(R_COL_STYLE_NUMBER) & mRow), _
+                                    SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal 'style
+    TargetSheet.Sort.SortFields.Add Key:=Range(ColLett(R_COL_SEASON) & "2:" & ColLett(R_COL_SEASON) & mRow), _
+                                    SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal 'season
+    TargetSheet.Sort.SortFields.Add Key:=Range(ColLett(R_COL_ITEM) & "2:" & ColLett(R_COL_ITEM) & mRow), _
+                                    SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal 'item
+
+    With TargetSheet.Sort
+        .SetRange Range("A2:" & ColLett(mCol) & mRow)
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .SortMethod = xlPinYin
+        .Apply
+    End With
+End Sub
+
+' Make common dash/space variants consistent
+Private Function NormalizeSupplier(ByVal s As String) As String
+    ' Dashes
+    s = Replace(s, ChrW(8211), "-")              ' en dash –
+    s = Replace(s, ChrW(8212), "-")              ' em dash —
+    s = Replace(s, ChrW(8213), "-")              ' horizontal bar -
+    s = Replace(s, ChrW(8208), "-")              ' hyphen -
+    s = Replace(s, ChrW(8210), "-")              ' figure dash -
+    s = Replace(s, ChrW(8722), "-")              ' minus -
+    s = Replace(s, ChrW(173), "-")               ' soft hyphen ­
+
+    ' Spaces
+    s = Replace(s, ChrW(160), " ")               ' NBSP
+    s = Replace(s, ChrW(8239), " ")              ' narrow NBSP
+    s = Replace(s, ChrW(8201), " ")              ' thin space
+    s = Replace(s, ChrW(8194), " ")              ' en space
+    s = Replace(s, ChrW(8195), " ")              ' em space
+
+    ' Collapse multiple spaces
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormalizeSupplier = Trim$(s)
+End Function
+
+' Remove the NIKE tag (and the clutter around it)
+Private Function StripNikeTag(ByVal s As String) As String
+    Dim before As String
+    ' remove the tag wherever it shows up
+    s = Replace(s, "NIKE-APPROVED VENDOR", "")
+    s = Replace(s, ", ,", ",")
+    s = Replace(s, " -  - ", " - ")
+
+    ' clean leftover separators and spaces at the end
+    s = Trim$(s)
+    Do While Len(s) > 0 And (Right$(s, 1) = "-" Or Right$(s, 1) = "," Or Right$(s, 1) = " ")
+        s = Left$(s, Len(s) - 1)
+        s = Trim$(s)
+    Loop
+
+    StripNikeTag = s
+End Function
+
+Private Function IsDashChar(ByVal ch As String) As Boolean
+    Dim u As Long: If ch = "" Then IsDashChar = False: Exit Function
+    u = AscW(ch)
+    IsDashChar = (ch = "-") Or (u = 8211) Or (u = 8212) Or (u = 8213) Or (u = 8208) Or (u = 8210) Or (u = 8722) Or (u = 173)
+End Function
+
+Private Function IsSpaceChar(ByVal ch As String) As Boolean
+    Dim u As Long: If ch = "" Then IsSpaceChar = False: Exit Function
+    u = AscW(ch)
+    IsSpaceChar = (ch = " ") Or (u = 160) Or (u = 8239) Or (u = 8201) Or (u = 8194) Or (u = 8195)
+End Function
+
+Private Sub ApplyLayoutShrink(ByVal ws As Worksheet)
+    Dim lastRow As Long
+    lastRow = ws.UsedRange.Rows.Count
+    If lastRow < 2 Then Exit Sub
+
+    ' Make sure wrapping is OFF (you already do this in ChangeFormatting)
+    ws.Cells.WrapText = False
+
+    ' Shrink long-text columns so they stay on one line
+    ws.Columns(ColLett(R_COL_VENDOR_NAME)).ShrinkToFit = True
+    ws.Columns(ColLett(R_COL_DESC)).ShrinkToFit = True
+    ws.Columns(ColLett(R_COL_COLOR_NAME)).ShrinkToFit = True
+    On Error Resume Next
+    ws.Columns(ColLett(R_COL_STYLE_NAME)).ShrinkToFit = True ' optional
+    On Error GoTo 0
+
+    ' Keep rows a single line high and center vertically (readable + compact)
+    ws.Rows("2:" & lastRow).RowHeight = 18
+    ws.Rows("2:" & lastRow).VerticalAlignment = xlCenter
+
+    ' Left-align the text columns so truncated text is readable from the start
+    ws.Columns(ColLett(R_COL_VENDOR_NAME)).HorizontalAlignment = xlLeft
+    ws.Columns(ColLett(R_COL_DESC)).HorizontalAlignment = xlLeft
+    ws.Columns(ColLett(R_COL_COLOR_NAME)).HorizontalAlignment = xlLeft
+End Sub
+
+Private Sub AutoFitSelectedColumns(ByVal ws As Worksheet)
+    Dim cols As Variant, k As Long, colL As String
+
+    ' Columns to AutoFit (exclude DESCRIPTION / R_COL_DESC)
+    cols = Array( _
+           1, 3, 4, 20, _
+           R_COL_SEASON, _
+           R_COL_SEQ, _
+           R_COL_STYLE_NUMBER, _
+           R_COL_STYLE_NAME, _
+           R_COL_STYLE_CW, _
+           R_COL_VENDOR_CODE, _
+           R_COL_VENDOR_NAME, _
+           R_COL_VENDOR_MCO, _
+           R_COL_ITEM, _
+           R_COL_COLOR_CODE, _
+           R_COL_COLOR_NAME _
+           )
+
+    For k = LBound(cols) To UBound(cols)
+        On Error Resume Next                     ' STYLE NAME may not always exist
+        colL = ColLett(cols(k))
+        ws.Columns(colL).AutoFit
+        ' (Optional) cap max width so names don't explode the layout
+        If ws.Columns(colL).ColumnWidth > 45 Then
+            ws.Columns(colL).ColumnWidth = 45
+        End If
+        On Error GoTo 0
+    Next k
+End Sub
