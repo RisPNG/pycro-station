@@ -177,6 +177,12 @@ class Window(MSFluentWindow):
         except Exception:
             return
         self._show_macro_page(routeKey)
+        # When a tab is active, deselect sidebar items so the tab highlight is clear
+        try:
+            self._deselect_navigation()
+            self.titleBar.setTabsSelectionHighlightEnabled(True)
+        except Exception:
+            pass
 
     def onTabClicked(self, index: int):
         """Handle clicks on the current tab to re-activate its content when Hub is active."""
@@ -197,6 +203,11 @@ class Window(MSFluentWindow):
             except Exception:
                 return
         self._show_macro_page(routeKey)
+        try:
+            self._deselect_navigation()
+            self.titleBar.setTabsSelectionHighlightEnabled(True)
+        except Exception:
+            pass
 
     def _show_macro_page(self, routeKey: str):
         """Ensure the macro page is in the stack and visible."""
@@ -496,14 +507,14 @@ class Window(MSFluentWindow):
     def onContentChanged(self, index: int):
         """Ensure Hub and tabs aren't selected simultaneously."""
         w = self.stackedWidget.widget(index)
-        if w is self.homeInterface or w is self.settingsInterface or w is getattr(self, 'packagesPage', object()):
-            # Hub active -> just hide tab highlight (keep selection state)
+        # If homeInterface is showing the hub grid, treat it as Hub; otherwise treat as macro content
+        is_hub = (w is self.homeInterface and getattr(self.homeInterface, 'currentWidget', lambda: None)() is self.hubGrid)
+        if is_hub or w is self.settingsInterface or w is getattr(self, 'packagesPage', object()):
             try:
                 self.titleBar.setTabsSelectionHighlightEnabled(False)
             except Exception:
                 pass
         else:
-            # Some macro/settings active -> deselect Hub highlight
             self._deselect_navigation()
             try:
                 self.titleBar.setTabsSelectionHighlightEnabled(True)

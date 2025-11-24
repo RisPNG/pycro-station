@@ -1,14 +1,7 @@
 from PySide6.QtWidgets import QHBoxLayout, QApplication
-from PySide6.QtGui import QCursor
 from PySide6.QtCore import *
-#from PyQt6.QtGui import QIcon
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import *
-try:
-    from qfluentwidgets.components.widgets.menu import ActionPosition
-except Exception:
-    ActionPosition = None
-# from TextWidget import TWidget  # Removed: no editor actions in burger menu
 
 
 class CustomTitleBar(MSFluentTitleBar):
@@ -86,70 +79,48 @@ class CustomTitleBar(MSFluentTitleBar):
         # self.hBoxLayout.insertWidget(7, self.saveButton, 0, Qt.AlignmentFlag.AlignLeft)
         # self.hBoxLayout.insertWidget(7, self.openButton, 0, Qt.AlignmentFlag.AlignLeft)
         # self.hBoxLayout.insertWidget(7, self.newButton, 0, Qt.AlignmentFlag.AlignLeft)
-        # self.hBoxLayout.insertSpacing(8, 20)
+        # Build a simple dropdown with tab operations
+        self.menu = RoundMenu("Menu", self)
+        self.menu.setStyleSheet("QMenu{color : red;}")
 
-        # Remove all dropdown options for now; keep button but show nothing
+        close_current_action = Action(FIF.CLOSE, 'Close selected tab')
+        close_all_action = Action(FIF.DELETE, 'Close all tabs')
 
-        # Create the menuButton
-        # self.menuButton = TransparentToolButton(FIF.MENU, self)
-        self.menuButton.clicked.connect(self.showMenu)
-
-    def showMenu(self):
-        # Ensure we pass parent via keyword to avoid being treated as a title
-        menu = RoundMenu(parent=self)
-
-        close_current = Action(FIF.CLOSE, 'Close selected tab')
-        close_all = Action(FIF.DELETE, 'Close all tabs')
-
-        def _close_current():
+        def _close_current_tab():
             try:
                 idx = self.tabBar.currentIndex()
                 if idx >= 0:
-                    self.parent().onTabCloseRequested(idx)
+                    parent.onTabCloseRequested(idx)
             except Exception:
                 pass
 
-        def _close_all():
+        def _close_all_tabs():
             try:
-                self.parent().closeAllTabs()
+                parent.closeAllTabs()
             except Exception:
-                # Fallback: iterate and close
+                # fallback: remove directly
                 try:
                     cnt = self.tabBar.count()
                 except Exception:
                     cnt = 0
                 for i in reversed(range(cnt)):
                     try:
-                        self.parent().onTabCloseRequested(i)
+                        parent.onTabCloseRequested(i)
                     except Exception:
                         pass
 
-        close_current.triggered.connect(_close_current)
-        close_all.triggered.connect(_close_all)
+        close_current_action.triggered.connect(_close_current_tab)
+        close_all_action.triggered.connect(_close_all_tabs)
 
-        try:
-            if ActionPosition is not None:
-                menu.addAction(close_current, ActionPosition.AT_TOP)
-            else:
-                menu.addAction(close_current)
-            menu.addAction(close_all)
-        except Exception:
-            menu.addAction(close_current)
-            menu.addAction(close_all)
+        self.menu.addAction(close_current_action)
+        self.menu.addAction(close_all_action)
 
-        # Width API differs across qfluentwidgets versions; fall back to standard QWidget sizing
-        try:
-            menu.setFixedWidth(180)
-        except Exception:
-            try:
-                menu.setMinimumWidth(180)
-            except Exception:
-                pass
-        # Default positioning: popup from the bottom-left of the button
-        try:
-            menu.exec(self.menuButton.mapToGlobal(self.menuButton.rect().bottomLeft()))
-        except Exception:
-            menu.exec(QCursor.pos())
+        # Create the menuButton
+        self.menuButton.clicked.connect(self.showMenu)
+
+    def showMenu(self):
+        # Show the prebuilt menu at the bottom-left of the button
+        self.menu.exec(self.menuButton.mapToGlobal(self.menuButton.rect().bottomLeft()))
 
     # --- Helpers for Window to control tab selection highlight ---
     def setTabsSelectionHighlightEnabled(self, enabled: bool):
