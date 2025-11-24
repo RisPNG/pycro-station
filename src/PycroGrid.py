@@ -1,32 +1,27 @@
 import os
 import sys
 import re
+import html
 import importlib.util
 from importlib import metadata
 
-from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, Signal, QProcess
+from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, Signal, QProcess, QEvent
 from PySide6.QtWidgets import *
-from PySide6.QtGui import QIcon
-from qfluentwidgets import PrimaryPushButton, isDarkTheme
+from PySide6.QtGui import QIcon, QCursor
+from qfluentwidgets import PrimaryPushButton, TransparentToolButton, isDarkTheme, FluentIcon as FIF
 
 
 class PycroGrid(QScrollArea):
-    """Scrollable grid container for listing Pycros.
-
-    This replaces the text editor area with a frame suitable
-    for displaying macro entries in a grid-like layout.
-    """
+    """Scrollable grid container for listing Pycros."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
-        # Make the grid area visually match Settings by being transparent
         self.setStyleSheet("QScrollArea{background: transparent; border: none;}")
         self.viewport().setStyleSheet("background: transparent;")
 
-        # Content widget with a grid layout
         self._content = QWidget(self)
         self._content.setStyleSheet("background: transparent;")
         self._grid = QGridLayout(self._content)
@@ -34,7 +29,6 @@ class PycroGrid(QScrollArea):
         self._grid.setSpacing(12)
         self.setWidget(self._content)
 
-        # State
         self._cards: list[PycroCard] = []
         self._watcher = QFileSystemWatcher(self)
         self._watcher.directoryChanged.connect(self._on_dir_changed)
@@ -44,8 +38,12 @@ class PycroGrid(QScrollArea):
         self._debounce_timer.setInterval(250)
         self._debounce_timer.timeout.connect(self.refresh)
         self._last_changed_path = None
+        self._info_popup: QLabel | None = None
+        self._info_hover_timer = QTimer(self)
+        self._info_hover_timer.setSingleShot(True)
+        self._info_hover_timer.timeout.connect(self._show_pending_hover_popup)
+        self._pending_callout: tuple[QWidget, str] | None = None
 
-        # Initial content
         self._empty_label = QLabel("Pycros will appear here", self._content)
         self._empty_label.setAlignment(Qt.AlignCenter)
         self._empty_label.setStyleSheet("color: #aaa; font-size: 14px;")
@@ -53,22 +51,30 @@ class PycroGrid(QScrollArea):
         self._grid.setRowStretch(0, 1)
         self._grid.setColumnStretch(0, 1)
 
-        # Root folder for pycros
         self._root = os.path.join(os.getcwd(), 'pycros')
         if os.path.isdir(self._root):
             self._watcher.addPath(self._root)
-        # Build initially
+
+        try:
+            QToolTip.setStyleSheet(
+                "QToolTip {"
+                " color: #f5f5f5;"
+                " background-color: rgba(44,44,44,0.95);"
+                " border: 1px solid rgba(85,85,85,0.9);"
+                " border-radius: 8px;"
+                " padding: 10px;"
+                " }"
+            )
+        except Exception:
+            pass
+
         QTimer.singleShot(0, self.refresh)
 
-
-    # --- Public API ---
     def refresh(self):
-        """Rescan pycros folder and rebuild cards."""
         infos = self._scan_pycros()
         self._rebuild(infos)
         self._reload_open_tabs(infos)
 
-    # --- Internal helpers ---
     def _scan_pycros(self):
         root = self._root
         infos = []
@@ -79,7 +85,6 @@ class PycroGrid(QScrollArea):
         except Exception:
             subdirs = []
 
-        # Reset watcher to follow files within subdirs
         try:
             dirs = self._watcher.directories()
             files = self._watcher.files()
@@ -96,7 +101,6 @@ class PycroGrid(QScrollArea):
             main_py = os.path.join(folder, 'main.py')
             req_txt = os.path.join(folder, 'requirements.txt')
             desc_md = os.path.join(folder, 'description.md')
-            # determine if folder contains any .py file
             has_python = False
             try:
                 for fn in os.listdir(folder):
@@ -106,7 +110,7 @@ class PycroGrid(QScrollArea):
             except Exception:
                 has_python = False
 
-            short_desc, long_desc = self._parse_description(desc_md)
+            short_desc, long_desc, info_lines = self._parse_description(desc_md)
             display_name = d.replace('--', ' ')
 
             info = PycroInfo(
@@ -118,12 +122,12 @@ class PycroGrid(QScrollArea):
                 description=desc_md if os.path.isfile(desc_md) else None,
                 short_desc=short_desc,
                 long_desc=long_desc,
+                info_lines=info_lines,
                 has_python=has_python
             )
 
             infos.append(info)
 
-            # Watch description and requirements for changes
             if os.path.isfile(desc_md):
                 self._watcher.addPath(desc_md)
             if os.path.isfile(req_txt):
@@ -136,27 +140,38 @@ class PycroGrid(QScrollArea):
         return infos
 
     def _parse_description(self, path):
-        short_lines = []
-        long_desc_lines = []
+        short_lines: list[str] = []
+        info_lines: list[str] = []
+        long_desc_lines: list[str] = []
         if not os.path.isfile(path):
-            return '', ''
+            return '', '', []
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-            for line in lines:
-                s = line.strip('\n')
+            info_mode = False
+            for raw in lines:
+                s = raw.rstrip('\n')
+                if s.strip().lower().startswith('> [!info]'):
+                    info_mode = True
+                    continue
+                if info_mode and s.strip() == "":
+                    info_lines.append("")
+                    continue
                 if s.startswith('>'):
-                    short_lines.append(s.lstrip('> ').strip())
+                    content = s.lstrip('> ').strip()
+                    if info_mode:
+                        info_lines.append(content)
+                    else:
+                        short_lines.append(content)
                 else:
                     long_desc_lines.append(s)
         except Exception:
             pass
-        short_desc = '\n'.join(short_lines).strip()
+        short_desc = '\n'.join([ln for ln in short_lines if ln]).strip()
         long_desc = '\n'.join(long_desc_lines).strip()
-        return short_desc, long_desc
+        return short_desc, long_desc, info_lines
 
     def _rebuild(self, infos):
-        # clear existing
         for card in self._cards:
             self._grid.removeWidget(card)
             card.deleteLater()
@@ -170,7 +185,6 @@ class PycroGrid(QScrollArea):
         else:
             self._empty_label.hide()
 
-        # Fixed column count for simplicity
         columns = 3
         row = 0
         col = 0
@@ -183,7 +197,6 @@ class PycroGrid(QScrollArea):
                 col = 0
                 row += 1
 
-        # Stretch last row/col
         for r in range(row + 1):
             self._grid.setRowStretch(r, 0)
         self._grid.setRowStretch(row + 1, 1)
@@ -191,8 +204,15 @@ class PycroGrid(QScrollArea):
             self._grid.setColumnStretch(c, 0)
         self._grid.setColumnStretch(columns, 1)
 
+    def _on_dir_changed(self, path):
+        self._last_changed_path = path
+        self._debounce_timer.start()
+
+    def _on_file_changed(self, path):
+        self._last_changed_path = path
+        self._debounce_timer.start()
+
     def _reload_open_tabs(self, infos):
-        """If a watched file changed, reload any open tab for that pycro."""
         if not self._last_changed_path:
             return
         window = self.window()
@@ -236,7 +256,7 @@ class PycroGrid(QScrollArea):
         if info.long_desc:
             desc = QTextBrowser()
             desc.setOpenExternalLinks(True)
-            desc.setPlainText(info.long_desc)
+            desc.setHtml(self._format_desc_html(info.long_desc))
             desc.setStyleSheet('QTextBrowser{background:transparent; color:#ddd; border:none;}')
             desc.setFixedHeight(120)
             v.addWidget(desc)
@@ -244,17 +264,122 @@ class PycroGrid(QScrollArea):
         v.addWidget(widget, 1)
         return page
 
-    def _on_dir_changed(self, path):
-        self._last_changed_path = path
-        self._debounce_timer.start()
+    @staticmethod
+    def _format_info_tooltip(lines: list[str]) -> str:
+        if not lines:
+            lines = ["No additional info"]
+        html_lines = []
+        for ln in lines:
+            if ln:
+                html_lines.append(f"<div style='margin:0; padding:0 0 6px 0'>{PycroGrid._render_colored_text(ln)}</div>")
+            else:
+                html_lines.append("<div style='margin:0; padding:8px 0'>&nbsp;</div>")
+        body = "".join(html_lines)
+        return (
+            "<div style='color:#f5f5f5; padding:6px 6px 2px 6px;'>"
+            f"{body}"
+            "</div>"
+        )
 
-    def _on_file_changed(self, path):
-        self._last_changed_path = path
-        self._debounce_timer.start()
+    @staticmethod
+    def _render_colored_text(text: str) -> str:
+        """Render [text](#RRGGBB[AA]) into colored spans, escaping other content."""
+        if not text:
+            return ""
+        pattern = re.compile(r"\[([^\]]+)\]\(#([0-9A-Fa-f]{6})([0-9A-Fa-f]{2})?\)")
+        parts = []
+        last = 0
+        for m in pattern.finditer(text):
+            parts.append(html.escape(text[last:m.start()]))
+            label = html.escape(m.group(1))
+            hex_part = m.group(2)
+            alpha_part = m.group(3)
+            r = int(hex_part[0:2], 16)
+            g = int(hex_part[2:4], 16)
+            b = int(hex_part[4:6], 16)
+            if alpha_part:
+                a = int(alpha_part, 16) / 255.0
+                color_css = f"rgba({r},{g},{b},{a:.2f})"
+            else:
+                color_css = f"rgb({r},{g},{b})"
+            parts.append(f"<span style='color:{color_css};'>{label}</span>")
+            last = m.end()
+        parts.append(html.escape(text[last:]))
+        return "".join(parts)
+
+    def _format_desc_html(self, text: str) -> str:
+        if not text:
+            return "(no description)"
+        lines = text.splitlines() or [text]
+        rendered = []
+        for ln in lines:
+            rendered.append(self._render_colored_text(ln) or "&nbsp;")
+        return "<br>".join(rendered)
+
+    def _show_info_popup(self, html_text: str, anchor: QWidget | None, duration: int = 3500):
+        """Show a custom popup for info text to avoid native tooltip styling issues."""
+        try:
+            if self._info_popup is not None:
+                self._info_popup.close()
+        except Exception:
+            pass
+        self._info_popup = QLabel()
+        self._info_popup.setWindowFlags(Qt.ToolTip)
+        self._info_popup.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._info_popup.setStyleSheet(
+            "QLabel{"
+            "color:#f5f5f5;"
+            "background-color: rgba(44,44,44,0.95);"
+            "border:1px solid rgba(85,85,85,0.9);"
+            "border-radius:8px;"
+            "padding:10px;"
+            "}"
+        )
+        self._info_popup.setText(html_text)
+        self._info_popup.setTextFormat(Qt.RichText)
+        self._info_popup.adjustSize()
+
+        pos = QCursor.pos()
+        try:
+            if anchor is not None:
+                pos = anchor.mapToGlobal(anchor.rect().bottomRight())
+        except Exception:
+            pass
+
+        self._info_popup.move(pos)
+        self._info_popup.show()
+        if duration > 0:
+            QTimer.singleShot(duration, lambda: self._hide_info_popup())
+
+    def _hide_info_popup(self):
+        try:
+            if self._info_popup is not None:
+                self._info_popup.close()
+        except Exception:
+            pass
+        self._info_popup = None
+
+    def _show_pending_hover_popup(self):
+        if self._pending_callout is None:
+            return
+        anchor, txt = self._pending_callout
+        self._show_info_popup(txt, anchor, duration=0)
+
+    def eventFilter(self, obj, event):
+        # Handle hover over info buttons to show popup quickly
+        if isinstance(obj, QWidget) and obj.property("callout_text") is not None:
+            if event.type() == QEvent.Enter:
+                self._pending_callout = (obj, obj.property("callout_text"))
+                self._info_hover_timer.start(200)  # shorter delay
+            elif event.type() in (QEvent.Leave, QEvent.HoverLeave):
+                self._info_hover_timer.stop()
+                self._pending_callout = None
+                self._hide_info_popup()
+        return super().eventFilter(obj, event)
 
 
 class PycroInfo:
-    def __init__(self, name, display_name, folder, main_py, requirements, description, short_desc, long_desc, has_python: bool):
+    def __init__(self, name, display_name, folder, main_py, requirements, description, short_desc, long_desc, info_lines, has_python: bool):
         self.name = name
         self.display_name = display_name
         self.folder = folder
@@ -263,6 +388,7 @@ class PycroInfo:
         self.description = description
         self.short_desc = short_desc
         self.long_desc = long_desc
+        self.info_lines = info_lines
         self.has_python = has_python
 
 
@@ -281,12 +407,10 @@ def _load_pycro_widget(info: 'PycroInfo') -> QWidget | None:
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)  # type: ignore
-        # Prefer get_widget()
         if hasattr(module, 'get_widget') and callable(module.get_widget):
             w = module.get_widget()
             if isinstance(w, QWidget):
                 return w
-        # Else try MainWidget class
         if hasattr(module, 'MainWidget'):
             cls = getattr(module, 'MainWidget')
             try:
@@ -306,7 +430,6 @@ class PycroCard(QWidget):
         self.info = info
         self._grid: PycroGrid = parent
 
-        # sanitize object name for stylesheet id selector
         safe_name = re.sub(r'[^A-Za-z0-9_]', '_', info.name)
         self.setObjectName(f"card__{safe_name}")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -314,7 +437,6 @@ class PycroCard(QWidget):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setMinimumSize(280, 210)
         self.setMaximumSize(320, 250)
-        # Background color similar to sidebar; target only this widget to avoid affecting children
         bg = "#242424" if isDarkTheme() else "#F2F2F2"
         border = "rgba(255,255,255,0.08)" if isDarkTheme() else "rgba(0,0,0,0.08)"
         self.setStyleSheet(
@@ -325,35 +447,50 @@ class PycroCard(QWidget):
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(8)
 
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
+
         title = QLabel(info.display_name, self)
         title.setWordWrap(True)
         title.setStyleSheet(
             f"background: transparent; border: none; color: {'#fff' if isDarkTheme() else '#111'}; font-size:16px; font-weight:600;"
         )
+        title_row.addWidget(title, 1)
+
+        if info.info_lines:
+            info_btn = TransparentToolButton(FIF.INFO, self)
+            info_btn.setFixedSize(24, 24)
+            info_btn.setCursor(Qt.PointingHandCursor)
+            info_btn.setStyleSheet("QToolButton{border:none;}")
+            tooltip_html = self._grid._format_info_tooltip(info.info_lines)
+            info_btn.setProperty("callout_text", tooltip_html)
+            info_btn.installEventFilter(self._grid)
+            info_btn.clicked.connect(lambda _, txt=tooltip_html: self._grid._show_info_popup(txt, info_btn, duration=3500))
+            title_row.addWidget(info_btn, 0, Qt.AlignVCenter | Qt.AlignRight)
+
+        title_row.addStretch(0)
 
         desc = QTextBrowser(self)
         desc.setReadOnly(True)
         desc.setOpenExternalLinks(False)
         desc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         desc.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        desc.setText(info.short_desc or '(no description)')
+        desc.setHtml(self._grid._format_desc_html(info.short_desc))
         desc.setMaximumHeight(90)
         desc.setFrameStyle(QFrame.NoFrame)
         desc.setStyleSheet(
             f"QTextBrowser{{background: transparent; border: none; color: {'#bbb' if isDarkTheme() else '#444'}; font-size:12px;}}"
         )
 
-        v.addWidget(title)
+        v.addLayout(title_row)
         v.addWidget(desc)
         v.addStretch(1)
 
-        # Buttons row
         h = QHBoxLayout()
         self.launch_btn = PrimaryPushButton('Launch', self)
-        # Keep Launch button a constant size across states/cards
         self.launch_btn.setFixedHeight(28)
         self.launch_btn.setFixedWidth(90)
-        # Make install button same style as Launch (primary) when clickable
         self.install_btn = PrimaryPushButton('Install Requirements', self)
         self.install_btn.setFixedHeight(28)
         self.install_btn.setCursor(Qt.PointingHandCursor)
@@ -381,7 +518,6 @@ class PycroCard(QWidget):
                     s = line.strip()
                     if not s or s.startswith('#'):
                         continue
-                    # very simple name parse (before version specifiers / extras)
                     m = re.match(r"^[A-Za-z0-9_.\-]+", s)
                     if m:
                         names.append(m.group(0))
@@ -399,7 +535,6 @@ class PycroCard(QWidget):
             except metadata.PackageNotFoundError:
                 return False
             except Exception:
-                # if metadata lookup fails, attempt import as fallback
                 try:
                     __import__(name.replace('-', '_'))
                 except Exception:
@@ -409,14 +544,12 @@ class PycroCard(QWidget):
     def _update_requirements_state(self, installing: bool = False):
         ok = self._are_requirements_satisfied()
         if installing:
-            # Keep Primary style; just disable and change text
             self.install_btn.setEnabled(False)
             self.install_btn.setText('Installing...')
             self.launch_btn.setEnabled(False)
             return
 
         if ok:
-            # Green, non-clickable
             self.install_btn.setEnabled(False)
             self.install_btn.setText('Requirements OK')
             self.install_btn.setStyleSheet(
@@ -424,7 +557,6 @@ class PycroCard(QWidget):
             )
             self.launch_btn.setEnabled(True)
         else:
-            # Blue, clickable (same Primary style as Launch)
             self.install_btn.setEnabled(True)
             self.install_btn.setText('Install Requirements')
             self.launch_btn.setEnabled(False)
@@ -434,7 +566,6 @@ class PycroCard(QWidget):
             return
         self._update_requirements_state(installing=True)
 
-        # Run pip install in background
         self._proc = QProcess(self)
         self._proc.setProgram(sys.executable)
         self._proc.setArguments(['-m', 'pip', 'install', '-r', self.info.requirements])
@@ -443,9 +574,7 @@ class PycroCard(QWidget):
 
     def _on_install_finished(self):
         self._proc = None
-        # Re-evaluate requirements and update buttons
         self._update_requirements_state(installing=False)
-        # Notify packages page to refresh immediately and let Hub revalidate
         try:
             window = self.window()
             packages_page = getattr(window, 'packagesPage', None)
@@ -462,7 +591,6 @@ class PycroCard(QWidget):
             pass
 
     def _on_launch(self):
-        # Call parent window to add a macro tab
         window = self.window()
         page = self._grid._build_page(self.info)
         if page is None:
@@ -471,7 +599,6 @@ class PycroCard(QWidget):
         try:
             window.addMacroTab(self.info.name, self.info.display_name, QIcon(), page, replace_existing=True)
         except Exception:
-            # Fallback: show as separate window
             widget = _load_pycro_widget(self.info)
             if widget is not None:
                 widget.setWindowTitle(self.info.display_name)
