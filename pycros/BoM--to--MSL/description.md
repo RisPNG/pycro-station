@@ -1,5 +1,7 @@
 > Reformat Extracted PDF BoM to MSL
 > [!info]
+> [Version 2.0.0](#bae1ffff)
+>
 > [Author](#bae1ffff)
 > ZTPONG
 >
