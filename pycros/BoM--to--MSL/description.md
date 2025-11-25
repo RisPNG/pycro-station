@@ -1,4 +1,4 @@
-> Reformat Extracted PDF BoM to MSL
+> Reformat Extracted PDF T-BoM to MSL
 > [!info]
 > [Version 2.0.0](#bae1ffff)
 >
@@ -13,4 +13,4 @@
 >
 > [Last updated date](#bae1ffff)
 > 2025/11/24
-This pycro reformats the Extracted PDF BoM to SIGPortal MSL compliant format.
+This pycro reformats the Extracted PDF T-BoM to SIGPortal MSL compliant format.

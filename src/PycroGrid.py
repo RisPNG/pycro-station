@@ -54,6 +54,7 @@ class PycroGrid(QScrollArea):
         self._root = os.path.join(os.getcwd(), 'pycros')
         if os.path.isdir(self._root):
             self._watcher.addPath(self._root)
+        self._invalid_pycros: set[str] = set()
 
         try:
             QToolTip.setStyleSheet(
@@ -236,7 +237,38 @@ class PycroGrid(QScrollArea):
                     continue
                 page = self._build_page(info)
                 if page is None:
+                    self._invalid_pycros.add(info.name)
+                    try:
+                        for card in self._cards:
+                            if card.info.name == info.name:
+                                card.set_invalid(True)
+                                break
+                    except Exception:
+                        pass
+                    try:
+                        tab_bar = getattr(window, 'tabBar', None)
+                        macro_labels = getattr(window, 'macro_labels', {})
+                        label = macro_labels.get(info.name)
+                        if tab_bar is not None and label is not None:
+                            count = tab_bar.count()
+                            for i in range(count):
+                                try:
+                                    if tab_bar.tabText(i) == label:
+                                        window.onTabCloseRequested(i)
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
                     continue
+                self._invalid_pycros.discard(info.name)
+                try:
+                    for card in self._cards:
+                        if card.info.name == info.name:
+                            card.set_invalid(False)
+                            break
+                except Exception:
+                    pass
                 window.addMacroTab(info.name, info.display_name, QIcon(), page, replace_existing=True)
             except Exception:
                 continue
@@ -429,6 +461,7 @@ class PycroCard(QWidget):
         super().__init__(parent)
         self.info = info
         self._grid: PycroGrid = parent
+        self._invalid = False
 
         safe_name = re.sub(r'[^A-Za-z0-9_]', '_', info.name)
         self.setObjectName(f"card__{safe_name}")
@@ -491,6 +524,7 @@ class PycroCard(QWidget):
         self.launch_btn = PrimaryPushButton('Launch', self)
         self.launch_btn.setFixedHeight(28)
         self.launch_btn.setFixedWidth(90)
+        self._launch_btn_default_style = self.launch_btn.styleSheet()
         self.install_btn = PrimaryPushButton('Install Requirements', self)
         self.install_btn.setFixedHeight(28)
         self.install_btn.setCursor(Qt.PointingHandCursor)
@@ -590,12 +624,32 @@ class PycroCard(QWidget):
         except Exception:
             pass
 
+    def set_invalid(self, invalid: bool):
+        self._invalid = invalid
+        if invalid:
+            self.launch_btn.setStyleSheet(
+                "QPushButton{background-color:#D13438; color:white; border:none; padding:6px 12px; border-radius:6px;}"
+                "QPushButton:hover{background-color:#B91C1C;}"
+            )
+            self.launch_btn.setToolTip('Last launch failed – click to retry after fixing main.py')
+        else:
+            self.launch_btn.setStyleSheet(self._launch_btn_default_style)
+            self.launch_btn.setToolTip('')
+
     def _on_launch(self):
         window = self.window()
         page = self._grid._build_page(self.info)
         if page is None:
+            try:
+                self.set_invalid(True)
+            except Exception:
+                pass
             QMessageBox.warning(self, 'Launch failed', 'Could not load macro widget (missing MainWidget/get_widget)')
             return
+        try:
+            self.set_invalid(False)
+        except Exception:
+            pass
         try:
             window.addMacroTab(self.info.name, self.info.display_name, QIcon(), page, replace_existing=True)
         except Exception:
