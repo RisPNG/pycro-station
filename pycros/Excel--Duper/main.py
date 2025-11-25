@@ -1,5 +1,6 @@
 import os
 import threading
+import warnings
 from datetime import datetime
 from typing import List, Tuple, Any, Optional
 
@@ -183,3 +184,126 @@ def get_widget():
     return MainWidget()
 
 # Pycro Main Process
+
+def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
+    """
+    Duplicate each selected workbook, trimming trailing empty rows/columns
+    on every worksheet while preserving data, formulas, and styles.
+
+    Returns (out_path_for_ui, success_count, fail_count).
+    out_path_for_ui is only populated when exactly one file is processed
+    successfully so the UI message stays meaningful.
+    """
+    if log_emit is None:
+        def _noop(_msg: str):
+            pass
+        log_emit = _noop
+
+    total = len(file_paths)
+    success = 0
+    fail = 0
+    last_output_path = ""
+
+    log_emit("Process Begin...")
+
+    for index, path in enumerate(file_paths, start=1):
+        label = f"({index}/{total}) {os.path.basename(path)}"
+        try:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"File not found: {path}")
+
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".xls":
+                raise ValueError("Legacy .xls files are not supported. Please convert to .xlsx before using this pycro.")
+
+            size_bytes = os.path.getsize(path)
+            keep_vba = ext in (".xlsm", ".xltm", ".xlam")
+            log_emit(
+                f"{label} - Opening workbook (size={size_bytes} bytes, ext={ext}, keep_vba={keep_vba})..."
+            )
+
+            open_started = datetime.now()
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="wmf image format is not supported so the image is being dropped",
+                    category=UserWarning,
+                    module="openpyxl.reader.drawings",
+                )
+                wb = load_workbook(path, data_only=False, keep_vba=keep_vba)
+            open_elapsed = (datetime.now() - open_started).total_seconds()
+            log_emit(
+                f"{label} - Workbook opened in {open_elapsed:.2f}s with {len(wb.worksheets)} sheet(s)."
+            )
+
+            sheet_total = len(wb.worksheets)
+            for sheet_idx, ws in enumerate(wb.worksheets, start=1):
+                log_emit(f"{label} - Scanning sheet {sheet_idx}/{sheet_total}: {ws.title}")
+                max_used_row = 0
+                max_used_col = 0
+
+                # Scan for cells that actually contain a value or formula.
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.value is not None:
+                            if cell.row > max_used_row:
+                                max_used_row = cell.row
+                            if cell.column > max_used_col:
+                                max_used_col = cell.column
+
+                # Ensure merged ranges containing a value are fully kept.
+                if ws.merged_cells.ranges and (max_used_row or max_used_col):
+                    for cell_range in ws.merged_cells.ranges:
+                        top_left = ws.cell(row=cell_range.min_row, column=cell_range.min_col)
+                        if top_left.value is not None:
+                            if cell_range.max_row > max_used_row:
+                                max_used_row = cell_range.max_row
+                            if cell_range.max_col > max_used_col:
+                                max_used_col = cell_range.max_col
+
+                # If the sheet is completely empty, leave it as-is.
+                if max_used_row == 0 and max_used_col == 0:
+                    log_emit(f"{label} - Sheet '{ws.title}' is empty, skipping trim.")
+                    continue
+
+                # Remove trailing completely empty rows/columns.
+                if ws.max_row > max_used_row:
+                    ws.delete_rows(max_used_row + 1, ws.max_row - max_used_row)
+                if ws.max_column > max_used_col:
+                    ws.delete_cols(max_used_col + 1, ws.max_column - max_used_col)
+
+                log_emit(
+                    f"{label} - Sheet '{ws.title}' trimmed to max_row={max_used_row}, max_col={max_used_col}."
+                )
+
+            # Build output path: YYYYMMDD_HHMMSS_duped_originalfilename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_dir = os.path.dirname(path) or os.getcwd()
+            base_name = os.path.basename(path)
+            out_name = f"{timestamp}_duped_{base_name}"
+            out_path = os.path.join(base_dir, out_name)
+
+            # Avoid accidental overwrite if a file with the same name already exists.
+            if os.path.exists(out_path):
+                counter = 1
+                name, ext_out = os.path.splitext(out_name)
+                while True:
+                    candidate = os.path.join(base_dir, f"{name} ({counter}){ext_out}")
+                    if not os.path.exists(candidate):
+                        out_path = candidate
+                        break
+                    counter += 1
+
+            wb.save(out_path)
+
+            success += 1
+            last_output_path = out_path
+            log_emit(f"{label} - Output workbook saved to: {out_path}")
+        except Exception as exc:
+            fail += 1
+            log_emit(f"{label} - Error: {exc}")
+
+    log_emit("Process Completed")
+
+    ui_out_path = last_output_path if success == 1 else ""
+    return ui_out_path, success, fail
