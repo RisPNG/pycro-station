@@ -38,7 +38,7 @@ class MainWidget(QWidget):
     def _build_ui(self):
         # DEFINE WIDGETS
 
-        # Description label
+        # Description
         self.desc_label = QLabel("", self)
         self.desc_label.setWordWrap(True)
         self.desc_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -54,16 +54,23 @@ class MainWidget(QWidget):
         self.select_btn = PrimaryPushButton("Select BoM files...", self)
         self.run_btn = PrimaryPushButton("Run", self)
 
-        # Files text box
+        # Labels
+        self.files_label = QLabel("Selected files", self)
+        self.files_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.files_label.setStyleSheet("color: #dcdcdc; background: transparent; padding-left: 2px;")
+        self.logs_label = QLabel("Process logs", self)
+        self.logs_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.logs_label.setStyleSheet("color: #dcdcdc; background: transparent; padding-left: 2px;")
+
+        # TextBoxes
         self.files_box = QTextEdit(self)
         self.files_box.setReadOnly(True)
         self.files_box.setPlaceholderText("Selected files will appear here")
         self.files_box.setStyleSheet(
-            "QTextEdit{background: #2a2a2a; color: white; "
+            "QTextEdit{background: #1f1f1f; color: #d0d0d0; "
             "border: 1px solid #3a3a3a; border-radius: 6px;}"
         )
 
-        # Log text box
         self.log_box = QTextEdit(self)
         self.log_box.setReadOnly(True)
         self.log_box.setPlaceholderText("Live process log will appear here")
@@ -96,11 +103,17 @@ class MainWidget(QWidget):
         row2_layout.addStretch(1)  # Right spacer
         main_layout.addLayout(row2_layout, 0)      # Row 2: fixed height
 
-        # Row 3: Files and logs layout
+        # Row 3: Labels for files and logs
         row3_layout = QHBoxLayout()
-        row3_layout.addWidget(self.files_box, 1)
-        row3_layout.addWidget(self.log_box, 1)
-        main_layout.addLayout(row3_layout, 4)      # Row 3: grows to fill space
+        row3_layout.addWidget(self.files_label, 1)
+        row3_layout.addWidget(self.logs_label, 1)
+        main_layout.addLayout(row3_layout, 0)
+
+        # Row 4: Files and logs layout
+        row4_layout = QHBoxLayout()
+        row4_layout.addWidget(self.files_box, 1)
+        row4_layout.addWidget(self.log_box, 1)
+        main_layout.addLayout(row4_layout, 4)      # Row 4: grows to fill space
 
 
     # For displaying long description from description.md
