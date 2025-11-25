@@ -1,0 +1,1715 @@
+'**************************************************************
+'Title        : DPOM Sorting
+'Created Date : 2022-03-30
+'Created By   : Ady
+'**************************************************************
+'
+'****************** Version Log *******************************
+'v1.0
+'Release Date  : 2022-04-14
+'Release By    : Ady
+'Release Reason: First Release
+'**************************************************************
+'v1.1
+'Release Date  : 2022-05-17
+'Release By    : Ady
+'Release Reason: 1. Add 'AFS Category' sorting
+'                2. Change all date format to text format
+'**************************************************************
+'v1.3
+'Release Date  : 2024-03-06
+'Release By    : Kai Jian
+'Release Reason: 1. Correct the OGAC Date formatting process
+'**************************************************************
+
+
+'Define RGB/Long Colour Chart
+Const cDMagenta As Long = 8388736
+Const cCyan As Long = 16776960
+Const cPink As Long = 12830955
+Const cGreen As Long = 8252325
+Const cYellow As Long = 12123902
+Const cDGreen As Long = 5287936
+Const cDarkBlue As Long = 16737792
+Const cOrange As Long = 3368703
+
+Dim maxRow, maxCol, start, sizeColStart As Long
+Dim colStyle, colOGAC, colSeasonCode, colSeasonYear, colPO, colPOLine, colCountry, colSizeDesc, colSizeQty, _
+colFOB, colShipToCusNo, colShipToCusName, colTotalSizeQty, colPtr, val, colInventorySegmentCode, colSubCategoryDesc, _
+colVendor, colTransportation, colTradingCoPO, colDocTypeCode
+    
+Dim inputbyuser As UserDefined
+Dim blindBuyCol As Collection
+Const blindbuysheet As String = "Blind Buy"
+Const sizesheet As String = "Size"
+
+Sub ProcessSS()
+    
+    'Default column
+    colVendor = 1                                'A
+    colSeasonCode = 2                            'B
+    colSeasonYear = 3                            'C
+    colStyle = 4                                 'D
+    colPO = 7                                    'G
+    colTradingCoPO = 8                           'H
+    colPOLine = 9                                'I
+    colOGAC = 11                                 'K
+    colDocTypeCode = 15                          'N
+    colTransportation = 17                       'P
+    colShipToCusNo = 18                          'Q
+    colShipToCusName = 19                        'R
+    colCountry = 20                              'S
+    colInventorySegmentCode = 21                 'T
+    colSubCategoryDesc = 23                      'V
+    colSizeDesc = 24                             'W
+    colSizeQty = 25                              'X
+    colTotalSizeQty = 26                         'Y
+    colFOB = 27                                  'Z
+
+    Dim fileDPOM, fileDPOMname
+    Dim wbDPOM As Workbook
+    Dim wsDPOM As Worksheet
+    Dim wsRESULT As Worksheet
+    Dim wsTEMP As Worksheet
+
+    'Get files
+    MsgBox "Please select File DPOM.", vbOKOnly, "Choose File"
+    fileDPOM = Application.GetOpenFilename(, , "Choose File DPOM", , False)
+    If fileDPOM = False Then
+        Exit Sub
+    End If
+    
+    fileDPOMname = Right$(fileDPOM, Len(fileDPOM) - InStrRev(fileDPOM, "\"))
+
+    'End get files
+    If MsgBox("File selected : " & vbCrLf & _
+              "File DPOM    : " & fileDPOMname & vbCrLf & _
+              "Start Process?", vbYesNo + vbQuestion, "Start Process?") <> vbYes Then
+        Exit Sub
+    End If
+    
+    Set wbDPOM = Workbooks.Open(fileDPOM)
+    If wbDPOM Is Nothing Then Err.Raise 9999, "", "Error opening File DPOM."
+    Set wsDPOM = wbDPOM.Worksheets(1)
+    
+    'Check File DPOM format and Processed
+    If Not CheckfileDPOM(wsDPOM) Then
+        wbDPOM.Close
+        Exit Sub
+    End If
+    
+    wsDPOM.Copy after:=wsDPOM
+    Set wsRESULT = wbDPOM.Worksheets(2)
+    wsRESULT.Name = wsDPOM.Name & "-copy"
+    
+    Set wsTEMP = wbDPOM.Worksheets.Add(after:=wsRESULT)
+    wsTEMP.Name = "Temp"
+    
+    wbDPOM.Windows(1).Visible = False
+    
+    ' Turn off screen updating, calculations, and events to speed up the process
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    frmProgress.Show vbModeless
+
+    'Perform function
+    SortRecord wsRESULT
+    RearrangeSizeCol wsRESULT, wsTEMP
+    FirstPass wsRESULT
+    SecondPass wsRESULT
+    AddNewColumn wsRESULT
+    RemoveColumn wsRESULT
+    RevertToOBS wsRESULT
+    
+    'Print processed mark when finish
+    wsDPOM.Cells(1, "AA").Value = "PROCESSED"
+    wsDPOM.Cells(1, "AA").Font.Color = vbWhite
+    wsRESULT.Cells(1, "A").Value = "PROCESSED"
+    
+    '    maxCol = wsRESULT.UsedRange.Columns.count
+    maxCol = wsRESULT.Cells(3, wsRESULT.Columns.Count).End(xlToLeft).Column
+    wsRESULT.Columns("A:" & ColLett(maxCol)).AutoFit
+    
+    Application.DisplayAlerts = False
+    wsTEMP.Delete
+    Application.DisplayAlerts = True
+    frmProgress.Hide
+    wbDPOM.Windows(1).Visible = True
+    
+    Module2.SeparateDataGroups
+    
+    ' Turn on screen updating, calculations, and events
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    
+    MsgBox "Process Complete. Please save your file.", vbInformation
+    
+End Sub
+
+Function CheckfileDPOM(ByVal wsDPOM As Worksheet)
+    
+    CheckfileDPOM = True
+    
+    If wsDPOM.Cells(1, "AA").Value = "PROCESSED" Then
+        MsgBox "This File DPOM has already been processed." & vbCrLf & "Process canceled.", vbInformation
+        CheckfileDPOM = False
+        Exit Function
+    End If
+    
+    If Trim(wsDPOM.Cells(1, colVendor).Value) <> "Vendor Code" _
+       Or Trim(wsDPOM.Cells(1, colSeasonCode).Value) <> "Planning Season Code" _
+       Or Trim(wsDPOM.Cells(1, colSeasonYear).Value) <> "Planning Season Year" _
+       Or Trim(wsDPOM.Cells(1, colStyle).Value) <> "Product Code" _
+       Or Trim(wsDPOM.Cells(1, colPO).Value) <> "Purchase Order Number" _
+       Or Trim(wsDPOM.Cells(1, colTradingCoPO).Value) <> "Trading Co PO Number" _
+       Or Trim(wsDPOM.Cells(1, colPOLine).Value) <> "PO Line Item Number" _
+       Or Trim(wsDPOM.Cells(1, colOGAC).Value) <> "OGAC" _
+       Or Trim(wsDPOM.Cells(1, colDocTypeCode).Value) <> "Doc Type Code" _
+       Or Trim(wsDPOM.Cells(1, colTransportation).Value) <> "Mode of Transportation Code" _
+       Or Trim(wsDPOM.Cells(1, colShipToCusNo).Value) <> "Ship To Customer Number" _
+       Or Trim(wsDPOM.Cells(1, colShipToCusName).Value) <> "Ship To Customer Name" _
+       Or Trim(wsDPOM.Cells(1, colCountry).Value) <> "Destination Country" _
+       Or Trim(wsDPOM.Cells(1, colInventorySegmentCode).Value) <> "Inventory Segment Code" _
+       Or Trim(wsDPOM.Cells(1, colSubCategoryDesc).Value) <> "Sub Category Description" _
+       Or Trim(wsDPOM.Cells(1, colSizeDesc).Value) <> "Size Description" _
+       Or Trim(wsDPOM.Cells(1, colSizeQty).Value) <> "Size Quantity" _
+       Or Trim(wsDPOM.Cells(1, colTotalSizeQty).Value) <> "Total Item Quantity" _
+       Or Trim(wsDPOM.Cells(1, colFOB).Value) <> "Gross Price/FOB" _
+       Then
+        MsgBox "This File FR is not in a correct format." & vbCrLf & "Process canceled.", vbInformation
+        CheckfileDPOM = False
+        Exit Function
+    End If
+    
+End Function
+
+Sub SortRecord(ByRef wsRESULT As Worksheet)
+
+    ' Get bounds
+    maxCol = wsRESULT.Cells(1, wsRESULT.Columns.Count).End(xlToLeft).Column
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    start = 2
+    If maxRow < start Then Exit Sub
+
+    Dim r As Long, nRows As Long
+    nRows = maxRow - start + 1
+
+    ' Read required source columns into memory (1-based 2D arrays)
+    Dim arrStyle As Variant, arrOGAC As Variant, arrSeason As Variant
+    arrStyle = wsRESULT.Range(wsRESULT.Cells(start, colStyle), wsRESULT.Cells(maxRow, colStyle)).Value
+    arrOGAC = wsRESULT.Range(wsRESULT.Cells(start, colOGAC), wsRESULT.Cells(maxRow, colOGAC)).Value
+    arrSeason = wsRESULT.Range(wsRESULT.Cells(start, colSeasonCode), wsRESULT.Cells(maxRow, colSeasonCode)).Value
+
+    ' Prepare output buffer for four temp columns:
+    '   (1) Style head (first 6 chars)
+    '   (2) OGAC sort key as yyyymmdd
+    '   (3) Style colorway (last 3 chars)
+    '   (4) Season code rank (SP/SU/FA/HO -> 1..4)
+    Dim outArr As Variant
+    ReDim outArr(1 To nRows, 1 To 4)
+
+    Dim sStyle As String, sOG As String, sc As String
+    Dim mm As String, dd As String, yy As String
+    Dim parts() As String
+
+    ' Build temp data in memory
+    For r = 1 To nRows
+        ' Progress (kept per-row to preserve UX)
+        frmProgress.ShowProgress start + r - 1, maxRow, "1. Sort Record"
+
+        ' ---------- Style head (first 6) ----------
+        sStyle = Trim$(CStr(arrStyle(r, 1)))
+        If Len(sStyle) >= 6 Then
+            outArr(r, 1) = Left$(sStyle, 6)
+        Else
+            outArr(r, 1) = sStyle
+        End If
+
+        ' ---------- OGAC yyyymmdd ----------
+        sOG = Trim$(CStr(arrOGAC(r, 1)))
+        If InStr(1, sOG, "/", vbTextCompare) > 0 Then
+            parts = Split(sOG, "/") ' expected mm/dd/yyyy (m/d/yyyy allowed)
+            If UBound(parts) >= 2 Then
+                yy = Right$(parts(2), 4)
+                mm = Format$(VBA.val(parts(0)), "00")
+                dd = Format$(VBA.val(parts(1)), "00")
+                outArr(r, 2) = yy & mm & dd
+            Else
+                ' Fallback (shouldn't happen with valid mm/dd/yyyy)
+                outArr(r, 2) = Right$(sOG, 4)
+            End If
+        Else
+            ' Fallback if no slashes found
+            outArr(r, 2) = Right$(sOG, 4)
+        End If
+
+        ' ---------- Style colorway (last 3) ----------
+        If Len(sStyle) >= 3 Then
+            outArr(r, 3) = Right$(sStyle, 3)
+        Else
+            outArr(r, 3) = sStyle
+        End If
+
+        ' ---------- Season code rank ----------
+        sc = UCase$(Trim$(CStr(arrSeason(r, 1))))
+        Select Case sc
+            Case "SP": outArr(r, 4) = "1"
+            Case "SU": outArr(r, 4) = "2"
+            Case "FA": outArr(r, 4) = "3"
+            Case "HO": outArr(r, 4) = "4"
+            Case Else: outArr(r, 4) = ""
+        End Select
+    Next r
+
+    ' Write the four temporary helper columns in one shot
+    With wsRESULT
+        .Range(.Cells(start, maxCol + 2), .Cells(maxRow, maxCol + 5)).Value = outArr
+        ' Force text for colorway temp col once (instead of per-cell)
+        .Range(.Cells(start, maxCol + 4), .Cells(maxRow, maxCol + 4)).NumberFormat = "@"
+    End With
+
+    ' Build sort fields using Range(Cells, Cells)
+    With wsRESULT.Sort
+        .SortFields.Clear
+
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, maxCol + 2), wsRESULT.Cells(maxRow, maxCol + 2)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortTextAsNumbers   ' Style head
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, colSeasonYear), wsRESULT.Cells(maxRow, colSeasonYear)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortTextAsNumbers   ' Season Year
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, maxCol + 5), wsRESULT.Cells(maxRow, maxCol + 5)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortTextAsNumbers   ' Season Code rank
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, maxCol + 3), wsRESULT.Cells(maxRow, maxCol + 3)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal          ' OGAC (yyyymmdd)
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, colPO), wsRESULT.Cells(maxRow, colPO)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortTextAsNumbers   ' PO
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, maxCol + 4), wsRESULT.Cells(maxRow, maxCol + 4)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal          ' Style colorway
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, colPOLine), wsRESULT.Cells(maxRow, colPOLine)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortTextAsNumbers   ' PO Line
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, colCountry), wsRESULT.Cells(maxRow, colCountry)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal          ' Country
+        .SortFields.Add key:=wsRESULT.Range(wsRESULT.Cells(start, colShipToCusNo), wsRESULT.Cells(maxRow, colShipToCusNo)), _
+                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal          ' Ship to customer
+
+        .SetRange wsRESULT.Range(wsRESULT.Cells(start, 1), wsRESULT.Cells(maxRow, maxCol + 5))
+        .Header = xlGuess
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .SortMethod = xlPinYin
+        .Apply
+    End With
+
+    ' Clear any fill on the sorted area
+    With wsRESULT.Range(wsRESULT.Cells(start, 1), wsRESULT.Cells(maxRow, maxCol + 5)).Interior
+        .Pattern = xlNone
+        .TintAndShade = 0
+        .PatternTintAndShade = 0
+    End With
+
+    ' Clear temp columns in one operation (Season rank, Colorway, OGAC key, Style head)
+    wsRESULT.Columns(maxCol + 2).Resize(, 4).EntireColumn.Delete
+
+End Sub
+
+'********************************************************************************
+'** REPLACEMENT for RearrangeSizeCol                                          **
+'********************************************************************************
+Sub RearrangeSizeCol(ByRef wsRESULT As Worksheet, ByRef wsTEMP As Worksheet)
+    '    maxCol = wsRESULT.UsedRange.Columns.count
+    maxCol = wsRESULT.Cells(1, wsRESULT.Columns.Count).End(xlToLeft).Column
+    sizeColStart = maxCol + 1
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    start = 2
+
+    'Remove duplicate of size desc
+    wsRESULT.Range(ColLett(colSizeDesc) & start & ":" & ColLett(colSizeDesc) & maxRow).Copy (wsTEMP.Columns("A"))
+    wsTEMP.Range("A:A").RemoveDuplicates Columns:=1
+
+    'Sort sizes
+    Dim sizeRow, sizeStart, tempStart
+    sizeRow = ThisWorkbook.Sheets(sizesheet).UsedRange.Rows.Count
+    sizeStart = 2
+    start = 1
+    tempStart = 1
+    maxRow = wsTEMP.UsedRange.Rows.Count
+
+    Do While sizeStart <= sizeRow
+
+        Do While start <= maxRow
+
+            ' *** CHANGED LINE ***
+            ' Use the NormalizeSize function to compare the master list with the data.
+            ' This handles "2XL" vs "XXL", "2XS-T" vs "2XST", etc.
+            If NormalizeSize(ThisWorkbook.Sheets(sizesheet).Cells(sizeStart, 1).Value) = NormalizeSize(wsTEMP.Cells(start, 1).Value) Then
+                wsTEMP.Range("A" & start).Cut wsTEMP.Range("B" & tempStart)
+                tempStart = tempStart + 1
+                Exit Do
+            End If
+
+            start = start + 1
+
+        Loop
+
+        sizeStart = sizeStart + 1
+        start = 1
+
+    Loop
+
+    start = 1
+
+    Do While start <= maxRow
+
+        If Trim(wsTEMP.Cells(start, 1).Value) <> "" Then
+            wsTEMP.Range("A" & start).Cut wsTEMP.Range("B" & tempStart)
+            tempStart = tempStart + 1
+        End If
+
+        start = start + 1
+
+    Loop
+
+
+    'Populate unique size desc at columns
+    start = 1
+    Do While start <= maxRow
+
+        frmProgress.ShowProgress start, maxRow, "2. Rearrange Size Col"
+
+        wsRESULT.Cells(1, maxCol + start).Value = Trim(wsTEMP.Cells(start, 2).Value)
+
+        start = start + 1
+
+    Loop
+End Sub
+
+'********************************************************************************
+'** REPLACEMENT for FirstPass                                                 **
+'********************************************************************************
+Sub FirstPass(ByRef wsRESULT As Worksheet)
+    Dim startPtr, sizeColPtr, endPtr As Long
+    '    maxCol = wsRESULT.UsedRange.Columns.count
+    maxCol = wsRESULT.Cells(1, wsRESULT.Columns.Count).End(xlToLeft).Column
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    start = 2
+    startPtr = start
+
+    'Insert overall result column
+    wsRESULT.Cells(1, maxCol + 1).Value = "Overall Result"
+    wsRESULT.Cells(maxRow + 1, 1).Value = "Overall Result"
+    wsRESULT.Cells(maxRow + 1, maxCol + 2).Value = "Total Item Qty"
+
+    ' --- *** MODIFIED SECTION *** ---
+    ' Build a map of NORMALIZED size description -> target column once.
+    ' This fixes issues with numeric sizes, dashes, and synonyms (XXL vs 2XL).
+    Dim sizeMap As Object: Set sizeMap = CreateObject("Scripting.Dictionary")
+    Dim hdrRange As Range, hdrVals As Variant, idx As Long, key As String
+    Set hdrRange = wsRESULT.Range(wsRESULT.Cells(1, sizeColStart), wsRESULT.Cells(1, maxCol))
+    hdrVals = hdrRange.Value ' 1 x N
+    For idx = 1 To UBound(hdrVals, 2)
+        ' Normalize the header before adding it as a key to the map
+        key = NormalizeSize(hdrVals(1, idx))
+        If Len(key) > 0 Then
+            ' The key is the NORMALIZED size, the value is the column index
+            If Not sizeMap.Exists(key) Then sizeMap.Add key, (sizeColStart + idx - 1)
+        End If
+    Next idx
+    ' ------------------------------------------------------------------------------
+
+    Dim sc0 As String, sc1 As String
+    Dim sy0 As String, sy1 As String
+    Dim style0 As String, style1 As String
+    Dim po0 As String, po1 As String
+    Dim pol0 As String, pol1 As String
+    Dim ship0 As String, ship1 As String
+    Dim shipname0 As String, shipname1 As String
+    Dim qty0 As String, qty1 As String
+
+    Dim sizeKey As String, tgtCol As Long
+    Dim tmpFOB As Variant
+
+    With wsRESULT
+        Do While start <= maxRow
+
+            frmProgress.ShowProgress start, maxRow, "3. Grouping"
+
+            ' Cache current/next row keys (avoid repeated Cells/Trim calls)
+            sc0 = Trim$(CStr(.Cells(start, colSeasonCode).Value))
+            sy0 = Trim$(CStr(.Cells(start, colSeasonYear).Value))
+            style0 = Trim$(CStr(.Cells(start, colStyle).Value))
+            po0 = Trim$(CStr(.Cells(start, colPO).Value))
+            pol0 = Trim$(CStr(.Cells(start, colPOLine).Value))
+            ship0 = Trim$(CStr(.Cells(start, colShipToCusNo).Value))
+            shipname0 = Trim$(CStr(.Cells(start, colShipToCusName).Value))
+            qty0 = Trim$(CStr(.Cells(start, colTotalSizeQty).Value))
+
+            sc1 = Trim$(CStr(.Cells(start + 1, colSeasonCode).Value))
+            sy1 = Trim$(CStr(.Cells(start + 1, colSeasonYear).Value))
+            style1 = Trim$(CStr(.Cells(start + 1, colStyle).Value))
+            po1 = Trim$(CStr(.Cells(start + 1, colPO).Value))
+            pol1 = Trim$(CStr(.Cells(start + 1, colPOLine).Value))
+            ship1 = Trim$(CStr(.Cells(start + 1, colShipToCusNo).Value))
+            shipname1 = Trim$(CStr(.Cells(start + 1, colShipToCusName).Value))
+            qty1 = Trim$(CStr(.Cells(start + 1, colTotalSizeQty).Value))
+
+            'Not match between row and row + 1
+            If (sc0 <> sc1) Or (sy0 <> sy1) Or (style0 <> style1) Or (po0 <> po1) Or _
+               (pol0 <> pol1) Or (ship0 <> ship1) Or (shipname0 <> shipname1) Or (qty0 <> qty1) Then
+
+                endPtr = start
+
+                'Insert 2 new rows (replicating original copy/insert behavior)
+                .Cells(endPtr, maxCol + 2).Value = "Total Item Qty"
+                .Rows(endPtr).Copy
+                .Rows(endPtr + 1).Insert
+                .Cells(endPtr + 1, maxCol + 2).Value = "Trading Co Net Unit Price"
+                .Rows(endPtr).Copy
+                .Rows(endPtr + 1).Insert
+                .Cells(endPtr + 1, maxCol + 2).Value = "Net Unit Price"
+
+                'Grouping
+                Do While startPtr <= endPtr
+                    ' *** CHANGED LINE ***
+                    ' Normalize the size from the data before looking it up in the map.
+                    sizeKey = NormalizeSize(.Cells(startPtr, colSizeDesc).Value)
+
+                    ' Fast path: direct lookup of target column using the normalized key
+                    If sizeMap.Exists(sizeKey) Then
+                        tgtCol = CLng(sizeMap(sizeKey))
+                        .Cells(endPtr, tgtCol).Value = Trim$(CStr(.Cells(startPtr, colSizeQty).Value))
+                        tmpFOB = .Cells(startPtr, colFOB).Value
+                        .Cells(endPtr + 1, tgtCol).Value = Trim$(CStr(tmpFOB))
+                        .Cells(endPtr + 2, tgtCol).Value = Trim$(CStr(tmpFOB))
+                    Else
+                        ' Fallback (keeps behavior identical if header map misses a key, though less likely now)
+                        sizeColPtr = sizeColStart
+                        Do While sizeColPtr <= maxCol
+                            ' *** CHANGED LINE ***
+                            ' Normalize the header during fallback comparison as well.
+                            If NormalizeSize(.Cells(1, sizeColPtr).Value) = sizeKey Then
+                                .Cells(endPtr, sizeColPtr).Value = Trim$(CStr(.Cells(startPtr, colSizeQty).Value))
+                                tmpFOB = .Cells(startPtr, colFOB).Value
+                                .Cells(endPtr + 1, sizeColPtr).Value = Trim$(CStr(tmpFOB))
+                                .Cells(endPtr + 2, sizeColPtr).Value = Trim$(CStr(tmpFOB))
+                                Exit Do
+                            End If
+                            sizeColPtr = sizeColPtr + 1
+                        Loop
+                    End If
+
+                    startPtr = startPtr + 1
+                Loop
+
+                'Set total size qty in row
+                .Cells(endPtr, maxCol + 1).Value = Application.WorksheetFunction.sum( _
+                    .Range(ColLett(sizeColStart) & endPtr & ":" & ColLett(maxCol) & endPtr) _
+                )
+
+                startPtr = endPtr + 3
+                start = start + 2
+                maxRow = maxRow + 2
+            End If
+
+            start = start + 1
+        Loop
+    End With
+
+    'Set total size qty in col
+    sizeColPtr = sizeColStart
+    Do While sizeColPtr <= maxCol + 1
+        wsRESULT.Cells(maxRow + 1, sizeColPtr).Value = Application.WorksheetFunction.SumIf( _
+            wsRESULT.Range(ColLett(maxCol + 2) & "2:" & ColLett(maxCol + 2) & maxRow), _
+            "Total Item Qty", _
+            wsRESULT.Range(ColLett(sizeColPtr) & "2:" & ColLett(sizeColPtr) & maxRow) _
+        )
+        sizeColPtr = sizeColPtr + 1
+    Loop
+
+    'Clean up
+    start = 2
+    Do While start <= maxRow
+
+        frmProgress.ShowProgress start, maxRow, "4. Clean up"
+
+        If wsRESULT.Cells(start, maxCol + 2).Value = "" Then
+            wsRESULT.Rows(start).Delete
+            start = start - 1
+            maxRow = maxRow - 1
+        End If
+
+        start = start + 1
+
+    Loop
+
+    'Move column
+    wsRESULT.Columns(maxCol + 2).Cut
+    wsRESULT.Columns(colShipToCusNo).Insert
+
+    'Delete column
+    colSizeDesc = colSizeDesc + 1                '24 'X
+    colSizeQty = colSizeQty + 1                  '25 'Y
+    colTotalSizeQty = colTotalSizeQty + 1        '26 'Z
+    colFOB = colFOB + 1                          '27 'AA
+
+    wsRESULT.Columns(ColLett(colSizeDesc) & ":" & ColLett(colFOB)).EntireColumn.Delete
+
+    'Column changes
+    colPtr = colShipToCusNo                      '17 'Q
+    colShipToCusNo = colShipToCusNo + 1          '18 'R
+    colShipToCusName = colShipToCusName + 1      '19 'S
+    colCountry = colCountry + 1                  '20 'T
+    colInventorySegmentCode = colInventorySegmentCode + 1 'U
+    colSubCategoryDesc = colSubCategoryDesc + 1  'W
+    sizeColStart = sizeColStart - 3
+End Sub
+
+Sub SecondPass(ByRef wsRESULT As Worksheet)
+    
+    Dim startPtr, endPtr, currRow, point, sum, money_1, money_2, total_sum1, total_sum2, innerStartPtr, innerEndPtr
+    '    maxCol = wsRESULT.UsedRange.Columns.count
+    maxCol = wsRESULT.Cells(1, wsRESULT.Columns.Count).End(xlToLeft).Column
+    
+    '============================start style================================
+    Dim curr_st, prev_st
+    Dim labelArr As Variant, sizeArr As Variant
+    Dim rowsCount As Long, colsCount As Long
+    Dim i As Long, j As Long, pointIdx As Long
+    Dim qtyRowArr As Variant, m1RowArr As Variant, m2RowArr As Variant
+    Dim v As Variant, v1 As Variant, v2 As Variant
+
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    start = 2
+    startPtr = start
+
+    curr_st = UCase(Trim(wsRESULT.Cells(start, colStyle).Value))
+    If curr_st <> "" Then
+        curr_st = Left(curr_st, Application.WorksheetFunction.Find("-", curr_st) - 1)
+    End If
+
+    prev_st = curr_st
+
+    Do While start <= maxRow
+
+        frmProgress.ShowProgress start, maxRow, "5. Style grouping"
+
+        'If current and previous style not match
+        If curr_st <> prev_st Then
+
+            endPtr = start - 1
+
+            '=== Vectorized read of the block once (labels + all size columns) ===
+            labelArr = wsRESULT.Range(ColLett(colPtr) & startPtr & ":" & ColLett(colPtr) & endPtr).Value
+            sizeArr = wsRESULT.Range(ColLett(sizeColStart) & startPtr & ":" & ColLett(maxCol - 1) & (endPtr + 2)).Value
+            rowsCount = UBound(labelArr, 1)
+            colsCount = (maxCol - 1) - sizeColStart + 1
+
+            'Find the last "Total Item Qty" row (same logic as original loop)
+            pointIdx = 0
+            For i = 1 To rowsCount
+                If labelArr(i, 1) = "Total Item Qty" Then pointIdx = i
+            Next i
+            If pointIdx = 0 Then pointIdx = rowsCount 'fallback; matches original overwrite behavior
+            point = startPtr + pointIdx - 1
+
+            'Preallocate output row buffers (1 x number of size columns)
+            ReDim qtyRowArr(1 To 1, 1 To colsCount)
+            ReDim m1RowArr(1 To 1, 1 To colsCount)
+            ReDim m2RowArr(1 To 1, 1 To colsCount)
+
+            total_sum1 = 0
+            total_sum2 = 0
+
+            'Compute per-size totals and carry-forward money rows using arrays
+            For j = 1 To colsCount
+                sum = 0
+                money_1 = 0
+                money_2 = 0
+
+                For i = 1 To rowsCount
+                    If labelArr(i, 1) = "Total Item Qty" Then
+                        v = sizeArr(i, j)
+                        If IsNumeric(v) And Not IsEmpty(v) Then sum = sum + v
+
+                        v1 = sizeArr(i + 1, j)
+                        If Not IsEmpty(v1) And v1 <> "" Then money_1 = v1
+
+                        v2 = sizeArr(i + 2, j)
+                        If Not IsEmpty(v2) And v2 <> "" Then money_2 = v2
+                    End If
+                Next i
+
+                'Write blanks for 0 to preserve original ClearContents behavior
+                If sum = 0 Then
+                    qtyRowArr(1, j) = ""
+                Else
+                    qtyRowArr(1, j) = sum
+                End If
+
+                If (money_1 = 0 Or money_1 = "") Then
+                    m1RowArr(1, j) = ""
+                Else
+                    m1RowArr(1, j) = money_1
+                End If
+
+                If (money_2 = 0 Or money_2 = "") Then
+                    m2RowArr(1, j) = ""
+                Else
+                    m2RowArr(1, j) = money_2
+                End If
+
+                total_sum1 = total_sum1 + (sum * IIf(money_1 = "" Or IsEmpty(money_1), 0, money_1))
+                total_sum2 = total_sum2 + (sum * IIf(money_2 = "" Or IsEmpty(money_2), 0, money_2))
+            Next j
+
+            'Insert 4 rows
+            wsRESULT.Range("A" & start & ":" & "A" & start + 3).EntireRow.Insert
+
+            'Copy static left-side metadata from the last item block ("point")
+            wsRESULT.Range("A" & point + 1 & ":" & ColLett(sizeColStart) & point + 1).Copy _
+                wsRESULT.Range("A" & start + 1 & ":" & ColLett(sizeColStart) & start + 1)
+            wsRESULT.Range("A" & start + 1 & ":" & ColLett(maxCol) & start + 1).Interior.Color = cGreen
+            wsRESULT.Range("A" & start + 1, ColLett(maxCol) & start + 1).Font.Bold = True
+
+            wsRESULT.Range("A" & point + 2 & ":" & ColLett(sizeColStart) & point + 2).Copy _
+                wsRESULT.Range("A" & start + 2 & ":" & ColLett(sizeColStart) & start + 2)
+            wsRESULT.Range("A" & start + 2 & ":" & ColLett(maxCol) & start + 2).Interior.Color = cGreen
+            wsRESULT.Range("A" & start + 2, ColLett(maxCol) & start + 2).Font.Bold = True
+
+            wsRESULT.Range("A" & point & ":" & ColLett(colPtr) & point).Copy _
+                wsRESULT.Range("A" & start & ":" & ColLett(colPtr) & start)
+            wsRESULT.Cells(start, colPtr).Value = "Total Style Qty"
+
+            'Write calculated rows to sheet in one shot and format once
+            With wsRESULT.Range(ColLett(sizeColStart) & start & ":" & ColLett(maxCol - 1) & (start + 2))
+                .NumberFormat = "General"
+            End With
+            wsRESULT.Range(ColLett(sizeColStart) & start & ":" & ColLett(maxCol - 1) & start).Value = qtyRowArr
+            wsRESULT.Range(ColLett(sizeColStart) & (start + 1) & ":" & ColLett(maxCol - 1) & (start + 1)).Value = m1RowArr
+            wsRESULT.Range(ColLett(sizeColStart) & (start + 2) & ":" & ColLett(maxCol - 1) & (start + 2)).Value = m2RowArr
+
+            'Style row formatting and totals
+            wsRESULT.Range("A" & start & ":" & ColLett(maxCol) & start).Interior.Color = cGreen
+            wsRESULT.Range("A" & start, ColLett(maxCol) & start).Font.Bold = True
+
+            wsRESULT.Range("A" & start + 3 & ":" & ColLett(maxCol) & start + 3).Interior.Color = cDGreen
+            wsRESULT.Rows(start + 3).EntireRow.RowHeight = 5
+
+            wsRESULT.Cells(start + 1, maxCol + 1).Value = total_sum1
+            wsRESULT.Cells(start + 1, maxCol + 1).Interior.Color = cGreen
+            wsRESULT.Cells(start + 1, maxCol + 1).Font.Bold = True
+
+            wsRESULT.Cells(start + 2, maxCol + 1).Value = total_sum2
+            wsRESULT.Cells(start + 2, maxCol + 1).Interior.Color = cGreen
+            wsRESULT.Cells(start + 2, maxCol + 1).Font.Bold = True
+
+            wsRESULT.Cells(start, maxCol).Value = Application.WorksheetFunction.SumIf( _
+                wsRESULT.Range(ColLett(colPtr) & startPtr & ":" & ColLett(colPtr) & endPtr), "Total Item Qty", _
+                wsRESULT.Range(ColLett(maxCol) & startPtr & ":" & ColLett(maxCol) & endPtr) _
+            )
+
+            maxRow = wsRESULT.UsedRange.Rows.Count
+            start = start + 4
+            startPtr = start
+            prev_st = curr_st
+
+        End If
+
+        start = start + 1
+        curr_st = UCase(Trim(wsRESULT.Cells(start, colStyle).Value))
+        If curr_st <> "" Then
+            curr_st = Left(curr_st, Application.WorksheetFunction.Find("-", curr_st) - 1)
+        End If
+
+    Loop
+
+    '============================end style====================================
+
+   '============================start ogac==================================
+    Dim curr_ogac, prev_ogac
+    Dim labelColLett As String, maxColLett As String
+    Dim sizeColLetters() As String
+    Dim scp As Long
+    
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    start = 2
+    startPtr = start
+
+    ' Precompute letters once (columns are stable during this phase)
+    labelColLett = ColLett(colPtr)
+    maxColLett = ColLett(maxCol)
+    ReDim sizeColLetters(sizeColStart To maxCol - 1)
+    For scp = sizeColStart To maxCol - 1
+        sizeColLetters(scp) = ColLett(scp)
+    Next scp
+
+    With wsRESULT
+        Do While start <= maxRow
+
+            frmProgress.ShowProgress start, maxRow, "6. OGAC grouping"
+
+            If .Cells(start, colPtr).Value2 = "Total Style Qty" Then
+
+                innerStartPtr = startPtr
+                endPtr = start
+                curr_ogac = UCase$(Trim$(.Cells(startPtr, colOGAC).Value2))
+                prev_ogac = curr_ogac
+
+                Do While startPtr <= endPtr
+
+                    If curr_ogac <> prev_ogac Then
+
+                        ' Find end point: last "Total Item Qty" between innerStartPtr and startPtr-1 (scan backwards, faster)
+                        currRow = startPtr - 1
+                        Do While currRow >= innerStartPtr
+                            If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                point = currRow
+                                Exit Do
+                            End If
+                            currRow = currRow - 1
+                        Loop
+
+                        .Range("A" & startPtr & ":" & "A" & startPtr + 1).EntireRow.Insert
+                        .Range("A" & point & ":" & ColLett(colPtr) & point).Copy .Range("A" & startPtr & ":" & ColLett(colPtr) & startPtr)
+                        .Cells(startPtr, colPtr).Value2 = "Total OGAC Qty"
+
+                        ' Format the entire output row once
+                        .Range(sizeColLetters(sizeColStart) & startPtr & ":" & sizeColLetters(maxCol - 1) & startPtr).NumberFormat = "General"
+
+                        ' Sum per size via SumIf (faster than nested loops)
+                        For sizeColPtr = sizeColStart To maxCol - 1
+                            sum = Application.WorksheetFunction.SumIf( _
+                                      .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                      "Total Item Qty", _
+                                      .Range(sizeColLetters(sizeColPtr) & innerStartPtr & ":" & sizeColLetters(sizeColPtr) & startPtr - 1))
+                            .Cells(startPtr, sizeColPtr).Value2 = sum
+                            If sum = 0 Then .Cells(startPtr, sizeColPtr).ClearContents
+                        Next sizeColPtr
+
+                        .Range("A" & startPtr & ":" & maxColLett & startPtr).Interior.Color = cPink
+                        .Range("A" & startPtr, maxColLett & startPtr).Font.Bold = True
+
+                        .Cells(startPtr, maxCol).Value2 = Application.WorksheetFunction.SumIf( _
+                                                            .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                                            "Total Item Qty", _
+                                                            .Range(maxColLett & innerStartPtr & ":" & maxColLett & startPtr - 1))
+
+                        .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1).Interior.Color = cPink
+                        .Rows(startPtr + 1).RowHeight = 5
+
+                        maxRow = .UsedRange.Rows.Count
+
+                        start = start + 2
+                        endPtr = endPtr + 2
+                        innerStartPtr = startPtr + 2
+                        startPtr = startPtr + 1
+
+                        prev_ogac = UCase$(Trim$(.Cells(innerStartPtr, colOGAC).Value2))
+
+                    End If
+
+                    If .Cells(startPtr, colPtr).Value2 = "Total Style Qty" Then
+
+                        ' Find end point: last "Total Item Qty"
+                        currRow = startPtr - 1
+                        Do While currRow >= innerStartPtr
+                            If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                point = currRow
+                                Exit Do
+                            End If
+                            currRow = currRow - 1
+                        Loop
+
+                        .Range("A" & startPtr & ":" & "A" & startPtr + 1).EntireRow.Insert
+                        .Range("A" & point & ":" & ColLett(colPtr) & point).Copy .Range("A" & startPtr & ":" & ColLett(colPtr) & startPtr)
+                        .Cells(startPtr, colPtr).Value2 = "Total OGAC Qty"
+
+                        .Range(sizeColLetters(sizeColStart) & startPtr & ":" & sizeColLetters(maxCol - 1) & startPtr).NumberFormat = "General"
+
+                        For sizeColPtr = sizeColStart To maxCol - 1
+                            sum = Application.WorksheetFunction.SumIf( _
+                                      .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                      "Total Item Qty", _
+                                      .Range(sizeColLetters(sizeColPtr) & innerStartPtr & ":" & sizeColLetters(sizeColPtr) & startPtr - 1))
+                            .Cells(startPtr, sizeColPtr).Value2 = sum
+                            If sum = 0 Then .Cells(startPtr, sizeColPtr).ClearContents
+                        Next sizeColPtr
+
+                        .Range("A" & startPtr & ":" & maxColLett & startPtr).Interior.Color = cPink
+                        .Range("A" & startPtr, maxColLett & startPtr).Font.Bold = True
+
+                        .Cells(startPtr, maxCol).Value2 = Application.WorksheetFunction.SumIf( _
+                                                            .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                                            "Total Item Qty", _
+                                                            .Range(maxColLett & innerStartPtr & ":" & maxColLett & startPtr - 1))
+
+                        .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1).Interior.Color = cPink
+                        .Rows(startPtr + 1).RowHeight = 5
+
+                        maxRow = .UsedRange.Rows.Count
+                        start = start + 2
+
+                    End If
+
+                    startPtr = startPtr + 1
+                    curr_ogac = UCase$(Trim$(.Cells(startPtr, colOGAC).Value2))
+                Loop
+
+                start = start + 3
+                startPtr = start + 1
+
+            End If
+
+            start = start + 1
+
+        Loop
+    End With
+    '============================end ogac==================================
+    '==========================start style-colorway/Country/PO/AFS=========================
+
+    'v1.2
+    Dim curr_po, prev_po, curr_coun, prev_coun, curr_afs, prev_afs, curr_shipToCusNo, prev_shipToCusNo
+
+    Set blindBuyCol = New Collection
+
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    start = 2
+    startPtr = start
+
+    If ThisWorkbook.Sheets(blindbuysheet).Range("A2").Value <> "" Then
+
+        Dim blindBuyRow, blindBuyStart
+
+        blindBuyStart = 2
+
+        blindBuyRow = ThisWorkbook.Sheets(blindbuysheet).UsedRange.Rows.Count
+
+        Do While blindBuyStart <= blindBuyRow
+
+            Set inputbyuser = New UserDefined
+            With inputbyuser
+                .sc = UCase$(Trim$(ThisWorkbook.Sheets(blindbuysheet).Cells(blindBuyStart, "A").Value2))
+                .bbj = Trim$(ThisWorkbook.Sheets(blindbuysheet).Cells(blindBuyStart, "B").Value2)
+            End With
+
+            blindBuyCol.Add item:=inputbyuser
+
+            blindBuyStart = blindBuyStart + 1
+
+        Loop
+
+    End If
+
+    With wsRESULT
+        Do While start <= maxRow
+
+            frmProgress.ShowProgress start, maxRow, "7. Style/Country/PO/AFS grouping"
+
+            If .Cells(start, colPtr).Value2 = "Total OGAC Qty" Then
+
+                innerStartPtr = startPtr
+                endPtr = start - 1
+                curr_coun = UCase$(Trim$(.Cells(startPtr, colCountry).Value2))
+                prev_coun = curr_coun
+                curr_po = UCase$(Trim$(.Cells(startPtr, colPO).Value2))
+                prev_po = curr_po
+                curr_afs = UCase$(Trim$(.Cells(startPtr, colInventorySegmentCode).Value2))
+                prev_afs = curr_afs
+
+                'v1.2
+                curr_shipToCusNo = UCase$(Trim$(.Cells(startPtr, colShipToCusNo).Value2))
+                prev_shipToCusNo = curr_shipToCusNo
+
+                Do While startPtr <= endPtr
+
+                    'v1.2
+                    If curr_coun <> prev_coun Or curr_po <> prev_po Or BlindBuyCollectionContains(blindBuyCol, UCase$(Trim$(.Cells(startPtr, colStyle).Value2))) Or curr_afs <> prev_afs Or curr_shipToCusNo <> prev_shipToCusNo Then
+
+                        If BlindBuyCollectionContains(blindBuyCol, UCase$(Trim$(.Cells(startPtr, colStyle).Value2))) Then
+
+                            If Not (BlindBuyCollectionContains(blindBuyCol, UCase$(Trim$(.Cells(startPtr - 1, colStyle).Value2)))) And startPtr <> 2 And .Cells(startPtr - 1, colPtr).Value2 <> "" Then
+
+                                ' last "Total Item Qty" in [innerStartPtr .. startPtr-1]
+                                currRow = startPtr - 1
+                                Do While currRow >= innerStartPtr
+                                    If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                        point = currRow
+                                        Exit Do
+                                    End If
+                                    currRow = currRow - 1
+                                Loop
+
+                                .Range("A" & startPtr & ":" & "A" & startPtr + 3).EntireRow.Insert
+
+                                .Range("A" & point + 1 & ":" & maxColLett & point + 1).Copy .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1)
+                                .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1).Interior.Color = cYellow
+                                .Range("A" & startPtr + 1, maxColLett & startPtr + 1).Font.Bold = True
+
+                                .Range("A" & point + 2 & ":" & maxColLett & point + 2).Copy .Range("A" & startPtr + 2 & ":" & maxColLett & startPtr + 2)
+                                .Range("A" & startPtr + 2 & ":" & maxColLett & startPtr + 2).Interior.Color = cYellow
+                                .Range("A" & startPtr + 2, maxColLett & startPtr + 2).Font.Bold = True
+
+                                .Range("A" & point & ":" & ColLett(colPtr) & point).Copy .Range("A" & startPtr & ":" & ColLett(colPtr) & startPtr)
+                                .Cells(startPtr, colPtr).Value2 = "Total PO Qty"
+
+                                total_sum1 = 0
+                                total_sum2 = 0
+
+                                ' NumberFormat for the 3 outgoing rows
+                                .Range(sizeColLetters(sizeColStart) & startPtr & ":" & sizeColLetters(maxCol - 1) & (startPtr + 2)).NumberFormat = "General"
+
+                                For sizeColPtr = sizeColStart To maxCol - 1
+                                    ' Faster sum via SumIf
+                                    sum = Application.WorksheetFunction.SumIf( _
+                                              .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                              "Total Item Qty", _
+                                              .Range(sizeColLetters(sizeColPtr) & innerStartPtr & ":" & sizeColLetters(sizeColPtr) & startPtr - 1))
+
+                                    ' money_1 / money_2: scan backwards until found (first from bottom)
+                                    money_1 = 0: money_2 = 0
+                                    currRow = startPtr - 1
+                                    Do While currRow >= innerStartPtr
+                                        If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                            If .Cells(currRow + 1, sizeColPtr).Value2 <> "" And money_1 = 0 Then money_1 = .Cells(currRow + 1, sizeColPtr).Value2
+                                            If .Cells(currRow + 2, sizeColPtr).Value2 <> "" And money_2 = 0 Then money_2 = .Cells(currRow + 2, sizeColPtr).Value2
+                                            If money_1 <> 0 And money_2 <> 0 Then Exit Do
+                                        End If
+                                        currRow = currRow - 1
+                                    Loop
+
+                                    .Cells(startPtr, sizeColPtr).Value2 = sum
+                                    .Cells(startPtr + 1, sizeColPtr).Value2 = money_1
+                                    .Cells(startPtr + 2, sizeColPtr).Value2 = money_2
+
+                                    If sum = 0 Then .Cells(startPtr, sizeColPtr).ClearContents
+                                    If money_1 = 0 Then .Cells(startPtr + 1, sizeColPtr).ClearContents
+                                    If money_2 = 0 Then .Cells(startPtr + 2, sizeColPtr).ClearContents
+
+                                    total_sum1 = total_sum1 + (sum * money_1)
+                                    total_sum2 = total_sum2 + (sum * money_2)
+                                Next sizeColPtr
+
+                                .Range("A" & startPtr & ":" & maxColLett & startPtr).Interior.Color = cYellow
+                                .Range("A" & startPtr, maxColLett & startPtr).Font.Bold = True
+
+                                .Cells(startPtr, maxCol).Value2 = Application.WorksheetFunction.SumIf( _
+                                                                    .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                                                    "Total Item Qty", _
+                                                                    .Range(maxColLett & innerStartPtr & ":" & maxColLett & startPtr - 1))
+
+                                .Range("A" & startPtr + 3 & ":" & maxColLett & startPtr + 3).Interior.Color = vbBlack
+                                .Rows(startPtr + 3).RowHeight = 5
+
+                                .Cells(startPtr + 1, maxCol + 1).Value2 = total_sum1
+                                .Cells(startPtr + 1, maxCol + 1).Interior.Color = cYellow
+                                .Cells(startPtr + 1, maxCol + 1).Font.Bold = True
+
+                                .Cells(startPtr + 2, maxCol + 1).Value2 = total_sum2
+                                .Cells(startPtr + 2, maxCol + 1).Interior.Color = cYellow
+                                .Cells(startPtr + 2, maxCol + 1).Font.Bold = True
+
+                                maxRow = .UsedRange.Rows.Count
+                                start = start + 4
+                                endPtr = endPtr + 4
+                                startPtr = startPtr + 4
+                                innerStartPtr = startPtr
+
+                            End If
+
+                            .Range("A" & startPtr + 3 & ":" & "A" & startPtr + 6).EntireRow.Insert
+
+                            .Range("A" & startPtr & ":" & ColLett(colPtr) & startPtr).Copy .Range("A" & startPtr + 3 & ":" & ColLett(colPtr) & startPtr + 3)
+                            .Cells(startPtr + 3, colPtr).Value2 = "Total PO Qty"
+
+                            .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1).Copy .Range("A" & startPtr + 4 & ":" & maxColLett & startPtr + 4)
+                            .Range("A" & startPtr + 4 & ":" & maxColLett & startPtr + 4).Interior.Color = cYellow
+                            .Range("A" & startPtr + 4, maxColLett & startPtr + 4).Font.Bold = True
+
+                            .Range("A" & startPtr + 2 & ":" & maxColLett & startPtr + 2).Copy .Range("A" & startPtr + 5 & ":" & maxColLett & startPtr + 5)
+                            .Range("A" & startPtr + 5 & ":" & maxColLett & startPtr + 5).Interior.Color = cYellow
+                            .Range("A" & startPtr + 5, maxColLett & startPtr + 5).Font.Bold = True
+
+                            total_sum1 = 0
+                            total_sum2 = 0
+
+                            ' NumberFormat for the 3 outgoing rows
+                            .Range(sizeColLetters(sizeColStart) & (startPtr + 3) & ":" & sizeColLetters(maxCol - 1) & (startPtr + 5)).NumberFormat = "General"
+
+                            For sizeColPtr = sizeColStart To maxCol - 1
+
+                                sum = Application.WorksheetFunction.SumIf( _
+                                          .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr + 2), _
+                                          "Total Item Qty", _
+                                          .Range(sizeColLetters(sizeColPtr) & innerStartPtr & ":" & sizeColLetters(sizeColPtr) & startPtr + 2))
+
+                                money_1 = 0: money_2 = 0
+                                currRow = startPtr + 2
+                                Do While currRow >= innerStartPtr
+                                    If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                        If .Cells(currRow + 1, sizeColPtr).Value2 <> "" And money_1 = 0 Then money_1 = .Cells(currRow + 1, sizeColPtr).Value2
+                                        If .Cells(currRow + 2, sizeColPtr).Value2 <> "" And money_2 = 0 Then money_2 = .Cells(currRow + 2, sizeColPtr).Value2
+                                        If money_1 <> 0 And money_2 <> 0 Then Exit Do
+                                    End If
+                                    currRow = currRow - 1
+                                Loop
+
+                                .Cells(startPtr + 3, sizeColPtr).Value2 = sum
+                                .Cells(startPtr + 4, sizeColPtr).Value2 = money_1
+                                .Cells(startPtr + 5, sizeColPtr).Value2 = money_2
+
+                                If sum = 0 Then .Cells(startPtr + 3, sizeColPtr).ClearContents
+                                If money_1 = 0 Then .Cells(startPtr + 4, sizeColPtr).ClearContents
+                                If money_2 = 0 Then .Cells(startPtr + 5, sizeColPtr).ClearContents
+
+                                total_sum1 = total_sum1 + (sum * money_1)
+                                total_sum2 = total_sum2 + (sum * money_2)
+                            Next sizeColPtr
+
+                            .Range("A" & startPtr + 3 & ":" & maxColLett & startPtr + 3).Interior.Color = cYellow
+                            .Range("A" & startPtr + 3, maxColLett & startPtr + 3).Font.Bold = True
+
+                            .Cells(startPtr + 3, maxCol).Value2 = Application.WorksheetFunction.SumIf( _
+                                                                     .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr + 2), _
+                                                                     "Total Item Qty", _
+                                                                     .Range(maxColLett & innerStartPtr & ":" & maxColLett & startPtr + 2))
+
+                            .Range("A" & startPtr + 6 & ":" & maxColLett & startPtr + 6).Interior.Color = vbBlack
+                            .Rows(startPtr + 6).RowHeight = 5
+
+                            .Cells(startPtr + 4, maxCol + 1).Value2 = total_sum1
+                            .Cells(startPtr + 4, maxCol + 1).Interior.Color = cYellow
+                            .Cells(startPtr + 4, maxCol + 1).Font.Bold = True
+
+                            .Cells(startPtr + 5, maxCol + 1).Value2 = total_sum2
+                            .Cells(startPtr + 5, maxCol + 1).Interior.Color = cYellow
+                            .Cells(startPtr + 5, maxCol + 1).Font.Bold = True
+
+                            maxRow = .UsedRange.Rows.Count
+                            endPtr = endPtr + 4
+                            start = start + 4
+                            startPtr = startPtr + 6
+                            innerStartPtr = startPtr + 1
+
+                            prev_coun = UCase$(Trim$(.Cells(startPtr + 1, colCountry).Value2))
+                            prev_po = UCase$(Trim$(.Cells(startPtr + 1, colPO).Value2))
+                            prev_afs = UCase$(Trim$(.Cells(startPtr + 1, colInventorySegmentCode).Value2))
+
+                        Else
+                            ' Non-Blind-Buy branch
+
+                            currRow = startPtr - 1
+                            Do While currRow >= innerStartPtr
+                                If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                    point = currRow
+                                    Exit Do
+                                End If
+                                currRow = currRow - 1
+                            Loop
+
+                            .Range("A" & startPtr & ":" & "A" & startPtr + 3).EntireRow.Insert
+
+                            .Range("A" & point + 1 & ":" & maxColLett & point + 1).Copy .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1)
+                            .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1).Interior.Color = cYellow
+                            .Range("A" & startPtr + 1, maxColLett & startPtr + 1).Font.Bold = True
+
+                            .Range("A" & point + 2 & ":" & maxColLett & point + 2).Copy .Range("A" & startPtr + 2 & ":" & maxColLett & startPtr + 2)
+                            .Range("A" & startPtr + 2 & ":" & maxColLett & startPtr + 2).Interior.Color = cYellow
+                            .Range("A" & startPtr + 2, maxColLett & startPtr + 2).Font.Bold = True
+
+                            .Range("A" & point & ":" & ColLett(colPtr) & point).Copy .Range("A" & startPtr & ":" & ColLett(colPtr) & startPtr)
+                            .Cells(startPtr, colPtr).Value2 = "Total PO Qty"
+
+                            total_sum1 = 0
+                            total_sum2 = 0
+
+                            .Range(sizeColLetters(sizeColStart) & startPtr & ":" & sizeColLetters(maxCol - 1) & (startPtr + 2)).NumberFormat = "General"
+
+                            For sizeColPtr = sizeColStart To maxCol - 1
+                                sum = Application.WorksheetFunction.SumIf( _
+                                          .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                          "Total Item Qty", _
+                                          .Range(sizeColLetters(sizeColPtr) & innerStartPtr & ":" & sizeColLetters(sizeColPtr) & startPtr - 1))
+
+                                money_1 = 0: money_2 = 0
+                                currRow = startPtr - 1
+                                Do While currRow >= innerStartPtr
+                                    If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                        If .Cells(currRow + 1, sizeColPtr).Value2 <> "" And money_1 = 0 Then money_1 = .Cells(currRow + 1, sizeColPtr).Value2
+                                        If .Cells(currRow + 2, sizeColPtr).Value2 <> "" And money_2 = 0 Then money_2 = .Cells(currRow + 2, sizeColPtr).Value2
+                                        If money_1 <> 0 And money_2 <> 0 Then Exit Do
+                                    End If
+                                    currRow = currRow - 1
+                                Loop
+
+                                .Cells(startPtr, sizeColPtr).Value2 = sum
+                                .Cells(startPtr + 1, sizeColPtr).Value2 = money_1
+                                .Cells(startPtr + 2, sizeColPtr).Value2 = money_2
+
+                                If sum = 0 Then .Cells(startPtr, sizeColPtr).ClearContents
+                                If money_1 = 0 Then .Cells(startPtr + 1, sizeColPtr).ClearContents
+                                If money_2 = 0 Then .Cells(startPtr + 2, sizeColPtr).ClearContents
+
+                                total_sum1 = total_sum1 + (sum * money_1)
+                                total_sum2 = total_sum2 + (sum * money_2)
+                            Next sizeColPtr
+
+                            .Range("A" & startPtr & ":" & maxColLett & startPtr).Interior.Color = cYellow
+                            .Range("A" & startPtr, maxColLett & startPtr).Font.Bold = True
+
+                            .Cells(startPtr, maxCol).Value2 = Application.WorksheetFunction.SumIf( _
+                                                                .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                                                "Total Item Qty", _
+                                                                .Range(maxColLett & innerStartPtr & ":" & maxColLett & startPtr - 1))
+
+                            .Range("A" & startPtr + 3 & ":" & maxColLett & startPtr + 3).Interior.Color = vbBlack
+                            .Rows(startPtr + 3).RowHeight = 5
+
+                            .Cells(startPtr + 1, maxCol + 1).Value2 = total_sum1
+                            .Cells(startPtr + 1, maxCol + 1).Interior.Color = cYellow
+                            .Cells(startPtr + 1, maxCol + 1).Font.Bold = True
+
+                            .Cells(startPtr + 2, maxCol + 1).Value2 = total_sum2
+                            .Cells(startPtr + 2, maxCol + 1).Interior.Color = cYellow
+                            .Cells(startPtr + 2, maxCol + 1).Font.Bold = True
+
+                            maxRow = .UsedRange.Rows.Count
+                            endPtr = endPtr + 4
+                            start = start + 4
+                            startPtr = startPtr + 3
+                            innerStartPtr = startPtr + 1
+
+                            prev_po = curr_po
+                            prev_coun = curr_coun
+                            prev_afs = curr_afs
+                            'v1.2
+                            prev_shipToCusNo = curr_shipToCusNo
+
+                        End If
+
+                    End If
+
+                    startPtr = startPtr + 1
+                    curr_coun = UCase$(Trim$(.Cells(startPtr, colCountry).Value2))
+                    curr_po = UCase$(Trim$(.Cells(startPtr, colPO).Value2))
+                    curr_afs = UCase$(Trim$(.Cells(startPtr, colInventorySegmentCode).Value2))
+                    'v1.2
+                    curr_shipToCusNo = UCase$(Trim$(.Cells(startPtr, colShipToCusNo).Value2))
+
+                    If .Cells(startPtr, colPtr).Value2 = "Total OGAC Qty" And Not (BlindBuyCollectionContains(blindBuyCol, UCase$(Trim$(.Cells(startPtr, colStyle).Value2)))) Then
+
+                        ' last "Total Item Qty" in [innerStartPtr .. startPtr-1]
+                        currRow = startPtr - 1
+                        Do While currRow >= innerStartPtr
+                            If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                point = currRow
+                                Exit Do
+                            End If
+                            currRow = currRow - 1
+                        Loop
+
+                        .Range("A" & startPtr & ":" & "A" & startPtr + 3).EntireRow.Insert
+
+                        .Range("A" & point + 1 & ":" & maxColLett & point + 1).Copy .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1)
+                        .Range("A" & startPtr + 1 & ":" & maxColLett & startPtr + 1).Interior.Color = cYellow
+                        .Range("A" & startPtr + 1, maxColLett & startPtr + 1).Font.Bold = True
+
+                        .Range("A" & point + 2 & ":" & maxColLett & point + 2).Copy .Range("A" & startPtr + 2 & ":" & maxColLett & startPtr + 2)
+                        .Range("A" & startPtr + 2 & ":" & maxColLett & startPtr + 2).Interior.Color = cYellow
+                        .Range("A" & startPtr + 2, maxColLett & startPtr + 2).Font.Bold = True
+
+                        .Range("A" & point & ":" & ColLett(colPtr) & point).Copy .Range("A" & startPtr & ":" & ColLett(colPtr) & startPtr)
+                        .Cells(startPtr, colPtr).Value2 = "Total PO Qty"
+
+                        total_sum1 = 0
+                        total_sum2 = 0
+
+                        .Range(sizeColLetters(sizeColStart) & startPtr & ":" & sizeColLetters(maxCol - 1) & (startPtr + 2)).NumberFormat = "General"
+
+                        For sizeColPtr = sizeColStart To maxCol - 1
+                            sum = Application.WorksheetFunction.SumIf( _
+                                      .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                      "Total Item Qty", _
+                                      .Range(sizeColLetters(sizeColPtr) & innerStartPtr & ":" & sizeColLetters(sizeColPtr) & startPtr - 1))
+
+                            money_1 = 0: money_2 = 0
+                            currRow = startPtr - 1
+                            Do While currRow >= innerStartPtr
+                                If .Cells(currRow, colPtr).Value2 = "Total Item Qty" Then
+                                    If .Cells(currRow + 1, sizeColPtr).Value2 <> "" And money_1 = 0 Then money_1 = .Cells(currRow + 1, sizeColPtr).Value2
+                                    If .Cells(currRow + 2, sizeColPtr).Value2 <> "" And money_2 = 0 Then money_2 = .Cells(currRow + 2, sizeColPtr).Value2
+                                    If money_1 <> 0 And money_2 <> 0 Then Exit Do
+                                End If
+                                currRow = currRow - 1
+                            Loop
+
+                            .Cells(startPtr, sizeColPtr).Value2 = sum
+                            .Cells(startPtr + 1, sizeColPtr).Value2 = money_1
+                            .Cells(startPtr + 2, sizeColPtr).Value2 = money_2
+
+                            If sum = 0 Then .Cells(startPtr, sizeColPtr).ClearContents
+                            If money_1 = 0 Then .Cells(startPtr + 1, sizeColPtr).ClearContents
+                            If money_2 = 0 Then .Cells(startPtr + 2, sizeColPtr).ClearContents
+
+                            total_sum1 = total_sum1 + (sum * money_1)
+                            total_sum2 = total_sum2 + (sum * money_2)
+                        Next sizeColPtr
+
+                        .Range("A" & startPtr & ":" & maxColLett & startPtr).Interior.Color = cYellow
+                        .Range("A" & startPtr, maxColLett & startPtr).Font.Bold = True
+
+                        .Cells(startPtr, maxCol).Value2 = Application.WorksheetFunction.SumIf( _
+                                                            .Range(labelColLett & innerStartPtr & ":" & labelColLett & startPtr - 1), _
+                                                            "Total Item Qty", _
+                                                            .Range(maxColLett & innerStartPtr & ":" & maxColLett & startPtr - 1))
+
+                        .Range("A" & startPtr + 3 & ":" & maxColLett & startPtr + 3).Interior.Color = vbBlack
+                        .Rows(startPtr + 3).RowHeight = 5
+
+                        .Cells(startPtr + 1, maxCol + 1).Value2 = total_sum1
+                        .Cells(startPtr + 1, maxCol + 1).Interior.Color = cYellow
+                        .Cells(startPtr + 1, maxCol + 1).Font.Bold = True
+
+                        .Cells(startPtr + 2, maxCol + 1).Value2 = total_sum2
+                        .Cells(startPtr + 2, maxCol + 1).Interior.Color = cYellow
+                        .Cells(startPtr + 2, maxCol + 1).Font.Bold = True
+
+                        maxRow = .UsedRange.Rows.Count
+
+                        startPtr = startPtr + 4
+                        start = start + 4
+
+                    End If
+
+                Loop
+
+            End If
+
+            start = start + 1
+
+            If .Cells(start, colPtr).Value2 = "" Then
+                start = start + 1
+                startPtr = start
+            End If
+
+            If .Cells(start, colPtr).Value2 = "Total Style Qty" Then
+                start = start + 4
+                startPtr = start
+            End If
+
+        Loop
+    End With
+
+    '==========================end style-colorway/Country/PO/AFS===========================
+
+    '================================colorway==================================
+
+    Dim curr_cw, prev_cw, cwCount
+
+    'Count for same colorway (must be 2 and above)
+    cwCount = 0
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    start = 2
+    startPtr = start
+
+    curr_cw = UCase(Trim(wsRESULT.Cells(start, colStyle).Value))
+
+    If curr_cw <> "" Then
+        curr_cw = Right(curr_cw, Len(curr_cw) - Application.WorksheetFunction.Find("-", curr_cw))
+    End If
+
+    prev_cw = curr_cw
+
+    Do While start <= maxRow
+
+        frmProgress.ShowProgress start, maxRow, "8. Colorway grouping"
+
+        If curr_cw = prev_cw And wsRESULT.Cells(start, colPtr).Value <> "Total PO Qty" Then
+
+            If wsRESULT.Cells(start, colPtr).Value = "Total Item Qty" Then
+                cwCount = cwCount + 1
+            End If
+
+            start = start + 1
+            curr_cw = UCase(Trim(wsRESULT.Cells(start, colStyle).Value))
+            If curr_cw <> "" Then
+                curr_cw = Right(curr_cw, Len(curr_cw) - Application.WorksheetFunction.Find("-", curr_cw))
+            End If
+
+        Else
+            'If cwCount is 2 and above
+            If cwCount >= 2 Then
+
+                'Check from starting point to ending point
+                For currRow = startPtr To start - 1
+
+                    If wsRESULT.Cells(currRow, colPtr).Value = "Total Item Qty" Then
+                        'Identify the latest row to copy from multiple result
+                        point = currRow
+
+                    End If
+
+                Next currRow
+
+
+                'Insert a row as divider
+                wsRESULT.Rows(start).EntireRow.Insert
+                maxRow = wsRESULT.UsedRange.Rows.Count
+                wsRESULT.Range("A" & point & ":" & ColLett(colPtr) & point).Copy wsRESULT.Range("A" & start & ":" & ColLett(colPtr) & start)
+                wsRESULT.Cells(start, colPtr).Value = "Total Colorway Qty"
+
+                'Perform sum
+                For sizeColPtr = sizeColStart To maxCol - 1
+
+                    sum = 0
+
+                    For currRow = startPtr To start - 1
+
+                        If (wsRESULT.Cells(currRow, colPtr).Value = "Total Item Qty") Then
+                            sum = sum + wsRESULT.Cells(currRow, sizeColPtr).Value
+                        End If
+
+                    Next currRow
+
+                    wsRESULT.Cells(start, sizeColPtr).NumberFormat = "General"
+                    wsRESULT.Cells(start, sizeColPtr).Value = sum
+
+                    If (wsRESULT.Cells(start, sizeColPtr).Value = 0) Then
+                        wsRESULT.Cells(start, sizeColPtr).ClearContents
+                    End If
+
+                Next sizeColPtr
+
+                wsRESULT.Range("A" & start & ":" & ColLett(maxCol) & start).Interior.Color = vbCyan
+                wsRESULT.Range("A" & start, ColLett(maxCol) & start).Font.Bold = True
+
+                wsRESULT.Cells(start, maxCol).Value = Application.WorksheetFunction.SumIf(wsRESULT.Range(ColLett(colPtr) & startPtr & ":" & ColLett(colPtr) & start - 1), "Total Item Qty", _
+                                                                                          wsRESULT.Range(ColLett(maxCol) & startPtr & ":" & ColLett(maxCol) & start - 1))
+
+                start = start + 1
+                startPtr = start
+                cwCount = 0
+
+                curr_cw = UCase(Trim(wsRESULT.Cells(start, colStyle).Value))
+                If curr_cw <> "" Then
+                    curr_cw = Right(curr_cw, Len(curr_cw) - Application.WorksheetFunction.Find("-", curr_cw))
+                End If
+                prev_cw = curr_cw
+
+            End If
+
+            If Trim(wsRESULT.Cells(start, colPtr).Value) = "Total PO Qty" Then
+
+                start = start + 4
+                curr_cw = UCase(Trim(wsRESULT.Cells(start, colStyle).Value))
+                If curr_cw <> "" Then
+                    curr_cw = Right(curr_cw, Len(curr_cw) - Application.WorksheetFunction.Find("-", curr_cw))
+                End If
+
+            End If
+
+            prev_cw = curr_cw
+            startPtr = start
+            cwCount = 0
+
+            curr_cw = UCase(Trim(wsRESULT.Cells(start, colStyle).Value))
+            If curr_cw <> "" Then
+                curr_cw = Right(curr_cw, Len(curr_cw) - Application.WorksheetFunction.Find("-", curr_cw))
+            End If
+
+        End If
+
+    Loop
+
+    '==============================end colorway================================
+
+End Sub
+
+Sub AddNewColumn(ByRef wsRESULT As Worksheet)
+
+    Dim CalcBusWeek As Variant
+    Dim FtyGIPT As Long
+    Dim CalBusWeekDate, BusWeekDate
+    
+    wsRESULT.Range(ColLett(5) & ":" & ColLett(9)).EntireColumn.Insert
+    wsRESULT.Cells(1, "E").Value = "Job Number"
+    wsRESULT.Cells(1, "F").Value = "Product Type"
+    wsRESULT.Cells(1, "G").Value = "VNFOB"
+    wsRESULT.Cells(1, "H").Value = "Destination"
+    wsRESULT.Cells(1, "I").Value = "Blind Buy Job #"
+    
+    wsRESULT.Range(ColLett(16) & ":" & ColLett(16)).EntireColumn.Insert
+    wsRESULT.Cells(1, "P").Value = "Estimate BusWeekDate"
+    
+    maxCol = maxCol + 6
+    start = 2
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    
+    FtyGIPT = 10                                 '10 days
+    
+    'Column changes
+    colPO = colPO + 5
+    colTradingCoPO = colTradingCoPO + 5
+    colPOLine = colPOLine + 5
+    colOGAC = colOGAC + 6
+    colDocTypeCode = colDocTypeCode + 6
+    colTransportation = colTransportation + 6
+    colPtr = colPtr + 6
+    colShipToCusNo = colShipToCusNo + 6
+    colShipToCusName = colShipToCusName + 6
+    colCountry = colCountry + 6
+    colInventorySegmentCode = colInventorySegmentCode + 6
+    colSubCategoryDesc = colSubCategoryDesc + 6
+    
+    'Default VNFOB as "N"
+    Do While start <= maxRow
+        
+        frmProgress.ShowProgress start, maxRow, "9. Add new column"
+        
+        'To skip the blank row lines
+        If UCase(Trim(wsRESULT.Cells(start, colStyle))) <> "" Then
+            wsRESULT.Cells(start, "G").Value = "N"
+        End If
+        
+        'To skip the blank row lines
+        If Trim(wsRESULT.Cells(start, colOGAC).Value) <> "" Then
+            CalBusWeekDate = DateSerial(Left(Format(wsRESULT.Cells(start, colOGAC).Value, "yyyymmdd"), 4), Mid(Format(wsRESULT.Cells(start, colOGAC).Value, "yyyymmdd"), 5, 2), Right(Format(wsRESULT.Cells(start, colOGAC).Value, "yyyymmdd"), 2))
+            CalcBusWeek = CalBusWeekDate - FtyGIPT
+            BusWeekDate = CalcBusWeek - (Weekday(CalcBusWeek, vbMonday) - 1)
+            wsRESULT.Cells(start, "P").Value = BusWeekDate
+            wsRESULT.Cells(start, "P").NumberFormat = "mm\/dd\/yyyy"
+        End If
+        
+        If wsRESULT.Cells(start, colPtr).Value = "Total PO Qty" And BlindBuyCollectionContains(blindBuyCol, UCase(Trim(wsRESULT.Cells(start, colStyle).Value))) Then
+            
+            wsRESULT.Cells(start, "I").Value = val
+            wsRESULT.Cells(start + 1, "I").Value = val
+            wsRESULT.Cells(start + 2, "I").Value = val
+        
+        End If
+    
+        start = start + 1
+        
+    Loop
+
+End Sub
+
+Sub RemoveColumn(ByRef wsRESULT As Worksheet)
+    
+    start = 2
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    
+    Do While start <= maxRow
+    
+        frmProgress.ShowProgress start, maxRow, "10. Remove column"
+    
+        If wsRESULT.Cells(start, colPtr).Value = "Total Item Qty" Then
+    
+            wsRESULT.Rows(start + 1 & ":" & start + 2).Delete
+            maxRow = wsRESULT.UsedRange.Rows.Count
+    
+        End If
+        
+        If wsRESULT.Cells(start, maxCol + 1).Value = "" Then
+        
+            wsRESULT.Cells(start, maxCol + 1).Interior.Color = vbWhite
+            wsRESULT.Cells(start, maxCol + 1).BorderAround LineStyle:=xlContinuous, Color:=RGB(217, 217, 217), Weight:=xlThin
+        
+        Else
+        
+            wsRESULT.Cells(start, maxCol + 1).BorderAround LineStyle:=xlContinuous, Color:=0, Weight:=xlThin
+        
+        End If
+        
+        If wsRESULT.Cells(start, colPtr).Value = "Total Style Qty" Or wsRESULT.Cells(start, colPtr).Value = "Total PO Qty" Then
+        
+            wsRESULT.Cells(start, colStyle).Value = Left(wsRESULT.Cells(start, colStyle).Value, Application.WorksheetFunction.Find("-", wsRESULT.Cells(start, colStyle).Value) - 1)
+            wsRESULT.Cells(start + 1, colStyle).Value = Left(wsRESULT.Cells(start + 1, colStyle).Value, Application.WorksheetFunction.Find("-", wsRESULT.Cells(start + 1, colStyle).Value) - 1)
+            wsRESULT.Cells(start + 2, colStyle).Value = Left(wsRESULT.Cells(start + 2, colStyle).Value, Application.WorksheetFunction.Find("-", wsRESULT.Cells(start + 2, colStyle).Value) - 1)
+        
+        End If
+        
+        If wsRESULT.Cells(start, colPtr).Value = "Total OGAC Qty" Then
+        
+            wsRESULT.Cells(start, colStyle).Value = Left(wsRESULT.Cells(start, colStyle).Value, Application.WorksheetFunction.Find("-", wsRESULT.Cells(start, colStyle).Value) - 1)
+        
+        End If
+        
+        start = start + 1
+        
+    Loop
+    
+End Sub
+
+Sub RevertToOBS(ByRef wsRESULT As Worksheet)
+
+    start = 2
+    maxRow = wsRESULT.UsedRange.Rows.Count
+    Dim tempDate
+    
+    Do While start <= maxRow - 1
+    
+        frmProgress.ShowProgress start, maxRow, "11. Revert To OBS format"
+        
+        'Put '#' in blank cell on customer number and name column
+        'Not 'Total PO Qty', 'Total OGAC Qty', 'Total Colorway Qty', 'Total Style Qty', ''
+        If Trim(wsRESULT.Cells(start, colShipToCusNo).Value) = "" And Trim(wsRESULT.Cells(start, colShipToCusName).Value) = "" _
+           And Trim(wsRESULT.Cells(start, colPtr).Value) <> "Total PO Qty" _
+           And Trim(wsRESULT.Cells(start, colPtr).Value) <> "Total OGAC Qty" _
+           And Trim(wsRESULT.Cells(start, colPtr).Value) <> "Total Colorway Qty" _
+           And Trim(wsRESULT.Cells(start, colPtr).Value) <> "Total Style Qty" _
+           And Trim(wsRESULT.Cells(start, colPtr).Value) <> "" _
+           Then
+            wsRESULT.Cells(start, colShipToCusNo).Value = "#"
+            wsRESULT.Cells(start, colShipToCusName).Value = "#"
+        End If
+        
+        If Trim(wsRESULT.Cells(start, colTradingCoPO).Value) = "" And Trim(wsRESULT.Cells(start, colStyle).Value) <> "" Then
+            wsRESULT.Cells(start, colTradingCoPO).Value = "-"
+        End If
+        
+        'Change date format to text format
+        If wsRESULT.Cells(start, "O").Value <> "" Then
+            tempDate = Format(wsRESULT.Cells(start, "O").Value, "MM/dd/yyyy")
+            wsRESULT.Cells(start, "O").NumberFormat = "@"
+            wsRESULT.Cells(start, "O").Value = tempDate
+        Else
+            wsRESULT.Cells(start, "O").NumberFormat = "General"
+        End If
+        If wsRESULT.Cells(start, "P").Value <> "" Then
+            tempDate = Format(wsRESULT.Cells(start, "P").Value, "MM/dd/yyyy")
+            wsRESULT.Cells(start, "P").NumberFormat = "@"
+            wsRESULT.Cells(start, "P").Value = tempDate
+        Else
+            wsRESULT.Cells(start, "P").NumberFormat = "General"
+        End If
+        If wsRESULT.Cells(start, colOGAC).Value <> "" Then
+            tempDate = Format(wsRESULT.Cells(start, colOGAC).Value, "MM/dd/yyyy")
+            wsRESULT.Cells(start, colOGAC).NumberFormat = "@"
+            wsRESULT.Cells(start, colOGAC).Value = tempDate
+        Else
+            wsRESULT.Cells(start, colOGAC).NumberFormat = "General"
+        End If
+        
+        start = start + 1
+        
+    Loop
+    
+    'Change naming for second MACRO validation purpose
+    'Product Code -> Material
+    wsRESULT.Cells(1, colStyle).Value = "Material"
+    'Ship To Customer Name -> Customer Name
+    wsRESULT.Cells(1, colShipToCusName).Value = "Customer Name"
+    'Inventory Segment Code -> AFS Category
+    wsRESULT.Cells(1, colInventorySegmentCode).Value = "AFS Category"
+    'Sub Category Description -> Sub Category Size Value
+    wsRESULT.Cells(1, colSubCategoryDesc).Value = "Sub Category Size Value"
+    'Doc Type Code -> Buy Group
+    wsRESULT.Cells(1, colDocTypeCode).Value = "Buy Group"
+    
+    'Change naming for third MACRO validation purpose
+    'Vendor Code -> Vendor
+    wsRESULT.Cells(1, colVendor).Value = "Vendor"
+    'Planning Season Code -> Planning Season
+    wsRESULT.Cells(1, colSeasonCode).Value = "Planning Season"
+    'Planning Season Year -> Year
+    wsRESULT.Cells(1, colSeasonYear).Value = "Year"
+    'Purchase Order Number -> PO Number
+    wsRESULT.Cells(1, colPO).Value = "PO Number"
+    'OGAC -> OGAC Date
+    wsRESULT.Cells(1, colOGAC).Value = "OGAC Date"
+    'Mode of Transportation Code -> Mode
+    wsRESULT.Cells(1, colTransportation).Value = "Mode"
+    
+    'Insert 2 row at top
+    wsRESULT.Range("A1:A2").EntireRow.Insert
+    
+    'Put 'Overall Result' on row 2 and 'TOTAL' on row 3
+    wsRESULT.Cells(2, maxCol).Value = "Overall Result"
+    wsRESULT.Cells(3, maxCol).Value = "TOTAL"
+    
+    'Insert column after customer number
+    wsRESULT.Range(ColLett(colShipToCusName) & ":" & ColLett(colShipToCusName)).EntireColumn.Insert
+
+End Sub
+
+Public Function ColLett(ByVal col As Long) As String
+    col = col - 1
+    
+    If col > 25 Then
+        ColLett = ColLett((col - (col Mod 26) - 1) / 26) + Chr(col Mod 26 + 65)
+    Else
+        ColLett = Chr(col Mod 26 + 65)
+    End If
+End Function
+
+Public Function ExistInArray(ByVal key As String, ByRef TargetArray As Variant) As Boolean
+    Dim found As Boolean
+    
+    found = False
+    For Each w In TargetArray
+        If w = key Then
+            found = True
+            Exit For
+        End If
+    Next
+    
+    ExistInArray = found
+End Function
+
+Public Function CollectionExists(key As String, coll As Collection) As Boolean
+
+    On Error GoTo EH
+
+    IsObject (coll.item(key))
+    
+    CollectionExists = True
+EH:
+End Function
+
+Public Function BlindBuyCollectionContains(blindBuyCol As Collection, checkVal As String) As Boolean
+    On Error Resume Next
+    BlindBuyCollectionContains = False
+    Dim it As UserDefined
+    For Each it In blindBuyCol
+        If it.sc = checkVal Then
+            BlindBuyCollectionContains = True
+            val = it.bbj
+            Exit Function
+        End If
+    Next
+End Function
+
+'********************************************************************************
+'** NEW HELPER FUNCTION - Place this at the end of the module                 **
+'********************************************************************************
+Public Function NormalizeSize(ByVal size As Variant) As String
+    ' This helper function standardizes a size string for reliable comparison.
+    ' 1. Converts the input to a string, trims it, and converts to uppercase.
+    ' 2. Removes any dash ("-") characters.
+    ' 3. Converts "XXL", "XXXL", "XXXXL" format to "2XL", "3XL", "4XL" format.
+
+    Dim tempSize As String
+
+    ' Step 1: Initial cleanup and type conversion (handles numeric sizes correctly)
+    tempSize = UCase(Trim(CStr(size)))
+
+    ' Step 2: Remove dashes (e.g., "2XS-T" becomes "2XST")
+    tempSize = Replace(tempSize, "-", "")
+
+    ' Step 3: Standardize "X" sizing (e.g., "XXL" becomes "2XL")
+    ' Replace from most specific to least to avoid errors (e.g., XXXXL before XXXL)
+    tempSize = Replace(tempSize, "XXXXXL", "6XL")
+    tempSize = Replace(tempSize, "XXXXL", "5XL")
+    tempSize = Replace(tempSize, "XXXXL", "4XL")
+    tempSize = Replace(tempSize, "XXXL", "3XL")
+    tempSize = Replace(tempSize, "XXL", "2XL")
+
+    tempSize = Replace(tempSize, "XXXXXS", "6XS")
+    tempSize = Replace(tempSize, "XXXXS", "5XS")
+    tempSize = Replace(tempSize, "XXXS", "4XS")
+    tempSize = Replace(tempSize, "XXXS", "3XS")
+    tempSize = Replace(tempSize, "XXS", "2XS")
+
+    NormalizeSize = tempSize
+End Function
