@@ -3,78 +3,25 @@ import threading
 from datetime import datetime
 from typing import List, Tuple, Any, Optional
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QTextEdit, QFileDialog
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QVBoxLayout,
+    QLabel,
+    QTextEdit,
+    QWidget,
+    QSizePolicy
+)
 from qfluentwidgets import PrimaryPushButton, MessageBox
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
 from openpyxl.utils import get_column_letter
 
 try:
-    import xlrd  # optional, for legacy .xls input
+    import xlrd  # for legacy excel
 except Exception:
     xlrd = None
-
-# -----------------------------
-# Constants (mirroring the VBA)
-# -----------------------------
-NORMAL_COL_COUNT = 12
-
-STYLE_LABEL = "STYLE#:"
-SEASON_LABEL = "SEASON:"
-
-STYLE_LENGTH = 6
-SEASON_LENGTH = 4
-ITEM_LENGTH = 7
-
-S_COL_SEQ = 1
-S_COL_DESC = 4
-S_COL_UOM = 8
-S_COL_CW = 9
-
-S_UOM_VALUE = "UOM"
-
-R_START_ROW = 1
-R_START_COL = 0
-
-R_COL_SEASON = 7
-R_COL_SEQ = 8
-R_COL_STYLE_NUMBER = 9
-R_COL_STYLE_NAME = 10
-R_COL_STYLE_CW = 11
-R_COL_VENDOR_CODE = 12
-R_COL_VENDOR_NAME = 13
-R_COL_VENDOR_MCO = 14
-R_COL_ITEM = 15
-R_COL_DESC = 16
-R_COL_COLOR_CODE = 17
-R_COL_COLOR_NAME = 18
-R_COL_REMARKS = 24
-R_COL_END = 25
-
-HEADER_COLOR_1 = "FF333333"
-HEADER_COLOR_2 = "FF729FCF"
-HEADER_COLOR_3 = "FFFF4000"
-HEADER_COLOR_4 = "FFFF7B59"
-
-
-def _clone_alignment(align: Optional[Alignment], **updates) -> Alignment:
-    """Copy an Alignment, ignoring fields that may not exist in older openpyxl versions."""
-    base = align or Alignment()
-    data = {
-        "horizontal": getattr(base, "horizontal", None),
-        "vertical": getattr(base, "vertical", None),
-        "text_rotation": getattr(base, "text_rotation", None),
-        "wrap_text": getattr(base, "wrap_text", None),
-        "shrink_to_fit": getattr(base, "shrink_to_fit", None),
-        "indent": getattr(base, "indent", None),
-        "justify_last_line": getattr(base, "justify_last_line", None),
-        "reading_order": getattr(base, "reading_order", None),
-    }
-    data.update(updates)
-    clean = {k: v for k, v in data.items() if v is not None}
-    return Alignment(**clean)
-
 
 class MainWidget(QWidget):
     log_message = Signal(str)
@@ -84,34 +31,96 @@ class MainWidget(QWidget):
         super().__init__()
         self.setObjectName("bom_to_msl_widget")
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        self._build_ui()
+        self._connect_signals()
 
+    # UI
+    def _build_ui(self):
+        # DEFINE WIDGETS
+
+        # Description label
+        self.desc_label = QLabel("", self)
+        self.desc_label.setWordWrap(True)
+        self.desc_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.desc_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.desc_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.desc_label.setStyleSheet(
+            "color: #dcdcdc; background: transparent; padding: 6px; "
+            "border: 1px solid #3a3a3a; border-radius: 6px;"
+        )
+        self.set_long_description("")
+
+        # Buttons
         self.select_btn = PrimaryPushButton("Select BoM files...", self)
-        self.select_btn.clicked.connect(self.select_files)
+        self.run_btn = PrimaryPushButton("Run", self)
 
+        # Files text box
         self.files_box = QTextEdit(self)
         self.files_box.setReadOnly(True)
         self.files_box.setPlaceholderText("Selected files will appear here")
-        self.files_box.setStyleSheet("QTextEdit{background: #2a2a2a; color: white; border: 1px solid #3a3a3a; border-radius: 6px;}")
+        self.files_box.setStyleSheet(
+            "QTextEdit{background: #2a2a2a; color: white; "
+            "border: 1px solid #3a3a3a; border-radius: 6px;}"
+        )
 
+        # Log text box
         self.log_box = QTextEdit(self)
         self.log_box.setReadOnly(True)
         self.log_box.setPlaceholderText("Live process log will appear here")
-        self.log_box.setStyleSheet("QTextEdit{background: #1f1f1f; color: #d0d0d0; border: 1px solid #3a3a3a; border-radius: 6px;}")
+        self.log_box.setStyleSheet(
+            "QTextEdit{background: #1f1f1f; color: #d0d0d0; "
+            "border: 1px solid #3a3a3a; border-radius: 6px;}"
+        )
 
-        self.run_btn = PrimaryPushButton("Run", self)
+        # CONSTRUCT LAYOUTS
+
+        # Main vertical layout
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+
+        # Row 0
+        main_layout.addWidget(self.desc_label, 1)  # Row 0: fixed height
+
+        # Row 1: Select button layout (3 columns with button in middle)
+        row1_layout = QHBoxLayout()
+        row1_layout.addStretch(1)  # Left spacer
+        row1_layout.addWidget(self.select_btn, 1)  # Button in middle
+        row1_layout.addStretch(1)  # Right spacer
+        main_layout.addLayout(row1_layout, 0)      # Row 1: fixed height
+
+        # Row 2: Run button layout (3 columns with button in middle)
+        row2_layout = QHBoxLayout()
+        row2_layout.addStretch(1)  # Left spacer
+        row2_layout.addWidget(self.run_btn, 1)  # Button in middle
+        row2_layout.addStretch(1)  # Right spacer
+        main_layout.addLayout(row2_layout, 0)      # Row 2: fixed height
+
+        # Row 3: Files and logs layout
+        row3_layout = QHBoxLayout()
+        row3_layout.addWidget(self.files_box, 1)
+        row3_layout.addWidget(self.log_box, 1)
+        main_layout.addLayout(row3_layout, 4)      # Row 3: grows to fill space
+
+
+    # For displaying long description from description.md
+    def set_long_description(self, text: str):
+        clean = (text or "").strip()
+        if clean:
+            self.desc_label.setText(clean)
+            self.desc_label.show()
+        else:
+            self.desc_label.clear()
+            self.desc_label.hide()
+
+    # Middleman from UI to Functions
+    def _connect_signals(self):
+        self.select_btn.clicked.connect(self.select_files)
         self.run_btn.clicked.connect(self.run_process)
-
-        layout.addWidget(self.select_btn)
-        layout.addWidget(self.files_box, 1)
-        layout.addWidget(self.log_box, 1)
-        layout.addWidget(self.run_btn)
-
         self.log_message.connect(self.append_log)
         self.processing_done.connect(self.on_processing_done)
 
+    # Functions
     def select_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Select BoM files")
         if files:
@@ -157,20 +166,70 @@ class MainWidget(QWidget):
         self.run_btn.setEnabled(True)
         self.select_btn.setEnabled(True)
 
-
 def get_widget():
     return MainWidget()
 
+# Pycro Main Process
+NORMAL_COL_COUNT = 12
 
-# -----------------------------
-# Processing implementation
-# -----------------------------
+STYLE_LABEL = "STYLE#:"
+SEASON_LABEL = "SEASON:"
+
+STYLE_LENGTH = 6
+SEASON_LENGTH = 4
+ITEM_LENGTH = 7
+
+S_COL_SEQ = 1
+S_COL_DESC = 4
+S_COL_UOM = 8
+S_COL_CW = 9
+
+S_UOM_VALUE = "UOM"
+
+R_START_ROW = 1
+R_START_COL = 0
+
+R_COL_SEASON = 7
+R_COL_SEQ = 8
+R_COL_STYLE_NUMBER = 9
+R_COL_STYLE_NAME = 10
+R_COL_STYLE_CW = 11
+R_COL_VENDOR_CODE = 12
+R_COL_VENDOR_NAME = 13
+R_COL_VENDOR_MCO = 14
+R_COL_ITEM = 15
+R_COL_DESC = 16
+R_COL_COLOR_CODE = 17
+R_COL_COLOR_NAME = 18
+R_COL_REMARKS = 24
+R_COL_END = 25
+
+HEADER_COLOR_1 = "FF333333"
+HEADER_COLOR_2 = "FF729FCF"
+HEADER_COLOR_3 = "FFFF4000"
+HEADER_COLOR_4 = "FFFF7B59"
+
+def _clone_alignment(align: Optional[Alignment], **updates) -> Alignment:
+    """Copy an Alignment, ignoring fields that may not exist in older openpyxl versions."""
+    base = align or Alignment()
+    data = {
+        "horizontal": getattr(base, "horizontal", None),
+        "vertical": getattr(base, "vertical", None),
+        "text_rotation": getattr(base, "text_rotation", None),
+        "wrap_text": getattr(base, "wrap_text", None),
+        "shrink_to_fit": getattr(base, "shrink_to_fit", None),
+        "indent": getattr(base, "indent", None),
+        "justify_last_line": getattr(base, "justify_last_line", None),
+        "reading_order": getattr(base, "reading_order", None),
+    }
+    data.update(updates)
+    clean = {k: v for k, v in data.items() if v is not None}
+    return Alignment(**clean)
 
 def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
     processor = BoMToMSLProcessor(log_emit)
     output_path = processor.process(file_paths)
     return output_path, processor.success_files, processor.fail_files
-
 
 class BoMToMSLProcessor:
     def __init__(self, log_emit):
@@ -189,7 +248,6 @@ class BoMToMSLProcessor:
         self._print_header()
         self._adjust_columns()
 
-    # ---- helpers mirroring VBA ----
     def log(self, msg: str):
         stamp = f"[{datetime.now()}] {msg}"
         self.log_count += 1

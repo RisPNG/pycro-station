@@ -253,13 +253,13 @@ class PycroGrid(QScrollArea):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(12)
 
-        if info.long_desc:
-            desc = QTextBrowser()
-            desc.setOpenExternalLinks(True)
-            desc.setHtml(self._format_desc_html(info.long_desc))
-            desc.setStyleSheet('QTextBrowser{background:transparent; color:#ddd; border:none;}')
-            desc.setFixedHeight(120)
-            v.addWidget(desc)
+        try:
+            if hasattr(widget, "set_long_description"):
+                widget.set_long_description(info.long_desc)
+            elif info.long_desc:
+                widget.setProperty("pycro_long_desc", info.long_desc)
+        except Exception:
+            pass
 
         v.addWidget(widget, 1)
         return page
