@@ -13,4 +13,5 @@
 >
 > [Last updated date](#bae1ffff)
 > 2025/11/24
-This pycro reformats the Extracted PDF T-BoM to SIGPortal MSL compliant format.
+
+Reformats Extracted PDF T-BoM to SIGPortal MSL compliant format.

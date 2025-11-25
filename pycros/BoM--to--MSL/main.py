@@ -51,7 +51,7 @@ class MainWidget(QWidget):
         self.set_long_description("")
 
         # Buttons
-        self.select_btn = PrimaryPushButton("Select BoM files...", self)
+        self.select_btn = PrimaryPushButton("Select T-BoM Excel Files", self)
         self.run_btn = PrimaryPushButton("Run", self)
 
         # Labels
@@ -135,7 +135,7 @@ class MainWidget(QWidget):
 
     # Functions
     def select_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select BoM files")
+        files, _ = QFileDialog.getOpenFileNames(self, "Select")
         if files:
             self.files_box.setPlainText("\n".join(files))
         else:
@@ -150,11 +150,11 @@ class MainWidget(QWidget):
     def run_process(self):
         files = self._selected_files()
         if not files:
-            MessageBox("No files", "Please select one or more Excel files first.", self).exec()
+            MessageBox("Warning", "Nothing to process.", self).exec()
             return
 
         self.log_box.clear()
-        self.log_message.emit(f"Starting processing of {len(files)} file(s)...")
+        self.log_message.emit(f"Process starts")
         self.run_btn.setEnabled(False)
         self.select_btn.setEnabled(False)
 
