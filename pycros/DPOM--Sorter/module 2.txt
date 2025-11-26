@@ -1,0 +1,305 @@
+Sub SeparateDataGroups()
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim currentRow As Long
+    Dim startRow As Long
+    Dim endRow As Long
+    
+    ' First Pass
+    ' Find the last row in column A (assuming data starts from column A)
+    lastRow = ActiveSheet.UsedRange.Rows.Count
+    lastCol = ActiveSheet.UsedRange.Columns.Count
+    
+    ' Initialize startRow and currentRow
+    startRow = 4
+    currentRow = 4
+    
+    ' Loop through each row
+    Do While currentRow <= lastRow
+        ' Check if row is empty
+        If IsEmpty(Cells(currentRow, 19).Value) Then
+            ' If row is empty, it's a data group separator
+            ' Set endRow to the previous row
+            endRow = currentRow - 1
+            
+            ' Process the current data group
+            ' MsgBox ("Starting from " & startRow & " until " & endRow & ".")
+            ProcessDataGroup startRow, endRow, lastCol
+            
+            ' Update lastRow after processing
+            lastRow = ActiveSheet.UsedRange.Rows.Count
+            
+            ' Set startRow to the next row
+            startRow = currentRow + 1
+        ElseIf currentRow = lastRow Then
+            ' If it's the last row, process the last data group
+            ' MsgBox ("Starting from " & startRow & " until " & lastRow & ".")
+            ProcessDataGroup startRow, lastRow, lastCol
+            
+            ' Update lastRow after processing
+            lastRow = ActiveSheet.UsedRange.Rows.Count
+        End If
+        
+        ' Move to the next row
+        currentRow = currentRow + 1
+    Loop
+    
+    ' Second Pass
+    ' Find the last row in column A (assuming data starts from column A)
+    lastRow = ActiveSheet.UsedRange.Rows.Count
+    lastCol = ActiveSheet.UsedRange.Columns.Count
+    
+    ' Initialize startRow and currentRow
+    startRow = 4
+    currentRow = 4
+    
+    ' Loop through each row
+    Do While currentRow <= lastRow
+        If Cells(currentRow, "X").Value = "Total PO Qty" Then
+            Cells(currentRow, "AD").ClearContents
+            Cells(currentRow, "AE").ClearContents
+        End If
+        ' Check if current row is yellow and next row is white
+        If Cells(currentRow, "A").Interior.Color = 12123902 And _
+           Cells(currentRow + 1, "A").Interior.Color = vbWhite Then
+            ' Insert a separator row
+            Rows(currentRow + 1).Insert Shift:=xlDown
+            Range(Cells(currentRow + 1, 1), Cells(currentRow + 1, lastCol)).Interior.Color = vbBlack
+            Rows(currentRow + 1).RowHeight = 5
+            
+            ' Update lastRow since we inserted a row
+            lastRow = lastRow + 1
+            ' Skip the newly inserted separator
+            currentRow = currentRow + 2
+        Else
+            ' Move to the next row
+            currentRow = currentRow + 1
+        End If
+    Loop
+End Sub
+
+Sub ProcessDataGroup(startRow As Long, endRow As Long, endCol As Long)
+    Dim i As Long, j As Long, k As Long
+    Dim whiteRows As Collection
+    Dim yellowRows As Collection
+    Dim whiteCount As Long, yellowCount As Long
+    Dim hasDifference As Boolean
+    Dim cyanFound As Boolean
+    Dim newRow As Long
+    Dim insertCount As Long
+    
+    cyanFound = False
+    whiteCount = 0
+    yellowCount = 0
+    insertCount = 0
+    
+    ' Identify Plant Code differential
+    hasDifference = False
+    For i = startRow + 1 To endRow
+        If Rows(i).Cells(1, 19).Value <> Rows(i - 1).Cells(1, 19).Value Then
+            hasDifference = True
+            Exit For
+        End If
+    Next i
+    
+    ' Identify cyan, white, and yellow rows
+    Set whiteRows = New Collection
+    Set yellowRows = New Collection
+    
+    For i = startRow To endRow
+        Select Case Cells(i, "A").Interior.Color
+            Case vbWhite
+                whiteRows.Add Rows(i)
+                whiteCount = whiteCount + 1
+                ' MsgBox ("White is: " & whiteCount)
+            Case 12123902 ' Yellow
+                yellowRows.Add Rows(i)
+                yellowCount = yellowCount + 1
+                ' MsgBox ("Yellow is: " & yellowCount)
+        End Select
+    Next i
+    
+    For i = startRow To endRow
+        Select Case Cells(i, "A").Interior.Color
+            Case vbCyan
+                cyanFound = True
+                Rows(i).Delete
+                i = i - 1
+                endRow = endRow - 1
+                ' MsgBox (i)
+        End Select
+    Next i
+    
+    ' MsgBox ("Total white row found is " & whiteRows.Count & vbCrLf & "Total yellow row found is " & yellowRows.Count)
+    
+    ' Process if original criteria were met (has plant code differences and cyan rows)
+    If hasDifference And cyanFound Then
+        newRow = startRow
+        
+        ' Process each white row
+        For i = 1 To whiteRows.Count
+            ' Copy the white row
+            whiteRows(i).Copy
+            Rows(newRow).Insert Shift:=xlDown
+            Application.CutCopyMode = False
+            newRow = newRow + 1
+            insertCount = insertCount + 1
+            ' MsgBox ("Inserted white row " & i)
+            
+            ' Copy all yellow rows for each white row
+            For j = 1 To yellowRows.Count
+                yellowRows(j).Copy
+                Rows(newRow).Insert Shift:=xlDown
+                Cells(newRow, 14).Value = whiteRows(i).Cells(1, 14).Value
+                Cells(newRow, 19).Value = whiteRows(i).Cells(1, 19).Value
+                
+                ' If the copied yellow row has a value in column AK, copy values from column AE to AK from whiteRows(i) and replace it.
+                If Not IsEmpty(Cells(newRow, endCol - 1).Value) Then ' Column AK is the 37th column
+                    For k = 31 To endCol - 1 ' Columns AE to AK (31 to 37)
+                        Cells(newRow, k).Value = whiteRows(i).Cells(1, k).Value
+                    Next k
+                End If
+                
+                If j > 1 Then
+                    For k = 31 To endCol - 2
+                        Select Case whiteRows(i).Cells(1, k).Value
+                            Case Empty
+                                Cells(newRow, k).Value = ""
+                        End Select
+                    Next k
+                End If
+                
+                Application.CutCopyMode = False
+                newRow = newRow + 1
+                insertCount = insertCount + 1
+            Next j
+            ' MsgBox ("Inserted yellow rows for " & i)
+            
+            ' Insert separator row
+            If i < whiteRows.Count Then
+                Rows(newRow).Insert Shift:=xlDown
+                Range(Cells(newRow, 1), Cells(newRow, endCol - 1)).Interior.Color = vbBlack
+                Rows(newRow).RowHeight = 5
+                newRow = newRow + 1
+                insertCount = insertCount + 1
+                ' MsgBox ("Inserted separator row for " & i)
+            End If
+        Next i
+        
+        ' Delete original rows
+        Range(Rows(newRow), Rows(endRow + insertCount)).Delete
+    Else
+        ' NEW IMPLEMENTATION: Check for the specific conditions you want to trigger the else splitting
+        shouldUseDifferentSplitLogic = False
+        
+        ' Check if any white row meets your specified conditions
+        For i = 1 To whiteRows.Count
+            ' Check Column AB (28) is Mexico/Indonesia/Canada
+            Dim colABValue As String
+            colABValue = Trim(whiteRows(i).Cells(1, 28).Value)
+            
+            ' Check Column Y (25) is numeric or not
+            Dim colYIsNumeric As Boolean
+            colYIsNumeric = IsNumeric(whiteRows(i).Cells(1, 25).Value)
+            
+            ' Check Column W (23) is VL/TR
+            Dim colWValue As String
+            colWValue = Trim(whiteRows(i).Cells(1, 23).Value)
+            
+            ' Apply the conditions:
+            ' Condition 1: AB is Mexico/Indonesia/Canada AND Y is NOT numeric AND W is VL/TR
+            ' Condition 2: Y is numeric AND W is VL/TR
+            If ((colABValue = "Mexico" Or colABValue = "Indonesia" Or colABValue = "Canada") And _
+                Not colYIsNumeric And (colWValue = "VL" Or colWValue = "TR")) Or _
+               (colYIsNumeric And (colWValue = "VL" Or colWValue = "TR")) Then
+                shouldUseDifferentSplitLogic = True
+                Exit For
+            End If
+        Next i
+        
+        If shouldUseDifferentSplitLogic Then
+            ' NEW IMPLEMENTATION: If original split didn't work, check for different values in column D
+            Dim distinctWhiteColDValues As New Collection
+            Dim whiteDValue As Variant
+            Dim alreadyExists As Boolean
+            
+            ' Check if white rows have different values in column D
+            hasDifference = False
+            
+            ' Collect distinct column D values from white rows
+            On Error Resume Next ' To handle duplicate key errors in collection
+            For i = 1 To whiteRows.Count
+                whiteDValue = whiteRows(i).Cells(1, 4).Value ' Column D is the 4th column
+                distinctWhiteColDValues.Add whiteDValue, CStr(whiteDValue)
+            Next i
+            On Error GoTo 0
+            
+            ' If we have more than one distinct value in column D or we found cyan rows
+            If distinctWhiteColDValues.Count > 1 Or cyanFound Then
+                hasDifference = True
+                newRow = startRow
+                
+                ' Process white rows grouped by column D values
+                For Each whiteDValue In distinctWhiteColDValues
+                    ' Process all white rows with this value in column D
+                    For i = 1 To whiteRows.Count
+                        If whiteRows(i).Cells(1, 4).Value = whiteDValue Then
+                            ' Copy the white row
+                            whiteRows(i).Copy
+                            Rows(newRow).Insert Shift:=xlDown
+                            Application.CutCopyMode = False
+                            newRow = newRow + 1
+                            insertCount = insertCount + 1
+                            
+                            ' Copy all yellow rows for each white row
+                            For j = 1 To yellowRows.Count
+                                yellowRows(j).Copy
+                                Rows(newRow).Insert Shift:=xlDown
+                                Cells(newRow, 14).Value = whiteRows(i).Cells(1, 14).Value
+                                Cells(newRow, 19).Value = whiteRows(i).Cells(1, 19).Value
+                                
+                                ' Same AK column logic as before
+                                If Not IsEmpty(Cells(newRow, endCol - 1).Value) Then
+                                    For k = 31 To endCol - 1
+                                        Cells(newRow, k).Value = whiteRows(i).Cells(1, k).Value
+                                    Next k
+                                End If
+                                
+                                If j > 1 Then
+                                    For k = 31 To endCol - 2
+                                        Select Case whiteRows(i).Cells(1, k).Value
+                                            Case Empty
+                                                Cells(newRow, k).Value = ""
+                                        End Select
+                                    Next k
+                                End If
+                                
+                                Application.CutCopyMode = False
+                                newRow = newRow + 1
+                                insertCount = insertCount + 1
+                            Next j
+                        End If
+                    Next i
+                    
+                    ' Insert separator row after processing all white rows with this D value
+                    ' Only add separator if this is not the last D value
+                    If Not IsLast(distinctWhiteColDValues, whiteDValue) Then
+                        Rows(newRow).Insert Shift:=xlDown
+                        Range(Cells(newRow, 1), Cells(newRow, endCol - 1)).Interior.Color = vbBlack
+                        Rows(newRow).RowHeight = 5
+                        newRow = newRow + 1
+                        insertCount = insertCount + 1
+                    End If
+                Next whiteDValue
+                
+                ' Delete original rows
+                Range(Rows(newRow), Rows(endRow + insertCount)).Delete
+            End If
+        End If
+    End If
+End Sub
+
+' Helper function to check if an item is the last one in a collection
+Function IsLast(col As Collection, item As Variant) As Boolean
+    IsLast = (col.item(col.Count) = item)
+End Function
