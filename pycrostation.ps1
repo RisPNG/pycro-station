@@ -7,7 +7,7 @@ if (-not (Test-Path "src\venv-win")) {
 & src\venv-win\Scripts\Activate.ps1
 
 # Upgrade pip and install requirements
-pip install --upgrade pip
+python.exe -m pip install --upgrade pip
 pip install -r requirements.txt
 
 # Run the script
