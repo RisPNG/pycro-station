@@ -12,6 +12,6 @@
 > Nik Faris Aiman bin Nik Rahiman (faris@sig.com.my)
 >
 > [Last updated date](#bae1ffff)
-> 2025/11/25
+> 2025/12/01
 
 Processes Raw DPOM into separate data groups.
