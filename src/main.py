@@ -4,6 +4,11 @@ The main python file. Run this file to use the app.
 import datetime
 import json
 import os
+import shutil
+import tempfile
+import urllib.error
+import urllib.request
+import zipfile
 from tkinter import filedialog
 
 from PySide6.QtCore import *
@@ -21,6 +26,8 @@ from PackagesPage import PackagesPage
 from TitleBar import CustomTitleBar
 
 class Settings(QWidget):
+    updateFinished = Signal(bool, str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings_file = os.path.join(os.path.dirname(__file__), "settings.json")
@@ -45,6 +52,7 @@ class Settings(QWidget):
 
         self._build_ui()
         self._load_settings()
+        self.updateFinished.connect(self._finish_update)
 
     def _build_ui(self):
         # Main vertical layout
@@ -167,27 +175,119 @@ class Settings(QWidget):
 
     def _on_update_clicked(self):
         """Handle update button click"""
-        # Disable the button and start animations
+        # Prefer values from settings.json (falls back to current field values)
+        repo_url = (self.repo_url_field.text() or "").strip()
+        branch = (self.branch_field.text() or "").strip()
+        repo_dir = (self.directory_field.text() or "").strip()
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                    repo_url = (saved.get("repo_url") or repo_url).strip()
+                    branch = (saved.get("repo_branch") or branch).strip()
+                    repo_dir = (saved.get("repo_directory") or repo_dir).strip()
+        except Exception:
+            pass
+        branch = branch or "main"
+
+        if not repo_url:
+            MessageBox("Missing repo URL", "Please provide a repository URL.", self).exec()
+            return
+
+        # Disable the button and show status
         self.update_btn.setEnabled(False)
+        self.update_btn.setText("Updating...")
 
-        # Simple text-only status (spinner removed)
-        self.update_btn.setText("Updating")
+        dest_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        dest_path = os.path.join(dest_root, "remote_pycros")
 
-        # Schedule popup on the UI thread after a short delay
-        QTimer.singleShot(2000, self._show_success_popup)
+        def worker():
+            temp_dir = tempfile.mkdtemp(prefix="pycro_update_")
+            clone_dir = os.path.join(temp_dir, "repo")
+            dest_tmp = dest_path + ".tmp"
+            try:
+                # Remove any previous synced content before pulling new copy
+                for path in (dest_tmp, dest_path):
+                    if os.path.exists(path):
+                        shutil.rmtree(path)
 
-    def _show_success_popup(self):
-        """Show success popup and re-enable button when OK is pressed"""
-        # Show popup
-        msg = MessageBox("Success", "Update completed successfully!", self)
+                archive_url = self._build_archive_url(repo_url, branch)
+                archive_file = os.path.join(temp_dir, "repo.zip")
+
+                # Download archive (no git dependency)
+                try:
+                    req = urllib.request.Request(archive_url, headers={"User-Agent": "pycro-station"})
+                    with urllib.request.urlopen(req, timeout=60) as resp, open(archive_file, "wb") as out:
+                        shutil.copyfileobj(resp, out)
+                except urllib.error.HTTPError as e:
+                    raise RuntimeError(f"Failed to download archive (HTTP {e.code}).")
+                except urllib.error.URLError as e:
+                    raise RuntimeError(f"Failed to download archive: {e.reason}")
+
+                # Extract safely
+                os.makedirs(clone_dir, exist_ok=True)
+                with zipfile.ZipFile(archive_file, 'r') as zf:
+                    self._safe_extract(zf, clone_dir)
+
+                clone_root = self._find_extract_root(clone_dir)
+                source_path = clone_root if not repo_dir else os.path.abspath(os.path.join(clone_root, repo_dir))
+                if os.path.commonpath([clone_root, source_path]) != clone_root:
+                    raise ValueError("Invalid directory path specified.")
+                if not os.path.isdir(source_path):
+                    raise FileNotFoundError(f"Directory '{repo_dir}' not found in branch '{branch}'.")
+
+                # clean existing targets
+                # copy to temp then atomically replace
+                shutil.copytree(source_path, dest_tmp)
+                os.replace(dest_tmp, dest_path)
+
+                self.updateFinished.emit(True, f"Fetched '{repo_dir or 'entire repo'}' from {branch}.")
+            except Exception as e:
+                self.updateFinished.emit(False, str(e))
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                shutil.rmtree(dest_tmp, ignore_errors=True)
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update(self, success: bool, message: str):
+        # Restore button state
+        self.update_btn.setEnabled(True)
+        self.update_btn.setIcon(QIcon())
+        self.update_btn.setText("Update")
+
+        title = "Success" if success else "Update failed"
+        msg = MessageBox(title, message or "", self)
         msg.yesButton.setText("OK")
         msg.cancelButton.hide()
         msg.exec()
 
-        # Re-enable the button and restore original state
-        self.update_btn.setEnabled(True)
-        self.update_btn.setIcon(QIcon())  # Clear icon
-        self.update_btn.setText("Update")
+    @staticmethod
+    def _build_archive_url(repo_url: str, branch: str) -> str:
+        base = (repo_url or "").strip()
+        if base.endswith(".git"):
+            base = base[:-4]
+        base = base.rstrip("/")
+        return f"{base}/archive/refs/heads/{branch}.zip"
+
+    @staticmethod
+    def _safe_extract(zip_file: zipfile.ZipFile, target_dir: str):
+        target_dir_abs = os.path.abspath(target_dir)
+        for member in zip_file.infolist():
+            member_path = os.path.abspath(os.path.join(target_dir, member.filename))
+            if not member_path.startswith(target_dir_abs + os.sep) and member_path != target_dir_abs:
+                raise ValueError("Archive contains unsafe paths.")
+        zip_file.extractall(target_dir)
+
+    @staticmethod
+    def _find_extract_root(tmp_dir: str) -> str:
+        dirs = [d for d in os.listdir(tmp_dir) if os.path.isdir(os.path.join(tmp_dir, d))]
+        preferred = [d for d in dirs if d != "__MACOSX"]
+        target_list = preferred if preferred else dirs
+        if len(target_list) >= 1:
+            return os.path.join(tmp_dir, sorted(target_list)[0])
+        return tmp_dir
 
 
 
