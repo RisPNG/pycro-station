@@ -1,6 +1,6 @@
 > Reformat Extracted PDF T-BoM to MSL
 > [!info]
-> [Version 2.1.0](#bae1ffff)
+> [Version 2.2.0](#bae1ffff)
 >
 > [Author](#bae1ffff)
 > ZTPONG

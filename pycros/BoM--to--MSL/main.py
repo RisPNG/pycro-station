@@ -1,7 +1,9 @@
 import os
+import csv
 import threading
 from datetime import datetime
-from typing import List, Tuple, Any, Optional
+from typing import List, Tuple, Any, Optional, Dict
+from difflib import get_close_matches
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -257,9 +259,11 @@ class BoMToMSLProcessor:
         self.success_files = 0
         self.fail_files = 0
         self.header_titles: List[str] = []
+        self.suppliers_map: Dict[str, str] = {}
 
         self._print_header()
         self._adjust_columns()
+        self._load_suppliers()
 
     def log(self, msg: str):
         stamp = f"[{datetime.now()}] {msg}"
@@ -286,6 +290,7 @@ class BoMToMSLProcessor:
                 self.log(f"{label} - Error : {exc}")
 
         self._change_formatting()
+        self._fill_missing_vendor_codes()
         self._apply_layout_shrink()
         self._auto_fit_selected_columns()
         self._auto_fit_headers()
@@ -465,6 +470,108 @@ class BoMToMSLProcessor:
                 if not (self._is_alphanumeric(prev_ch) and self._is_alphanumeric(next_ch)):
                     return idx
         return -1
+
+    def _load_suppliers(self):
+        """Load suppliers.csv into a mapping of vendor name -> vendor code."""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            suppliers_path = os.path.join(script_dir, "suppliers.csv")
+
+            if not os.path.exists(suppliers_path):
+                self.log(f"Warning: suppliers.csv not found at {suppliers_path}")
+                return
+
+            with open(suppliers_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader)  # Skip header row
+
+                for row in reader:
+                    if len(row) >= 2:
+                        code = (row[0] or "").strip()
+                        name = (row[1] or "").strip().upper()
+
+                        if code and code.upper() != "NULL" and name:
+                            # Store multiple names mapping to same code
+                            if name not in self.suppliers_map:
+                                self.suppliers_map[name] = code
+
+            self.log(f"Loaded {len(self.suppliers_map)} supplier mappings from suppliers.csv")
+        except Exception as e:
+            self.log(f"Warning: Failed to load suppliers.csv: {e}")
+
+    def _fill_missing_vendor_codes(self):
+        """Fill in missing VENDOR CODE fields using fuzzy matching against suppliers.csv."""
+        if not self.suppliers_map:
+            self.log("No supplier mappings available, skipping vendor code fill")
+            return
+
+        ws = self.ws_result
+        max_row = ws.max_row or 0
+        filled_count = 0
+
+        # Get all supplier names for fuzzy matching
+        supplier_names = list(self.suppliers_map.keys())
+
+        for row in range(2, max_row + 1):
+            vendor_code = self._value_to_str(ws.cell(row=row, column=R_COL_VENDOR_CODE).value)
+            vendor_name = self._value_to_str(ws.cell(row=row, column=R_COL_VENDOR_NAME).value)
+
+            # Only process if VENDOR CODE is blank but VENDOR NAME exists
+            if not vendor_code and vendor_name:
+                vendor_name_upper = vendor_name.upper()
+
+                # First try exact match
+                if vendor_name_upper in self.suppliers_map:
+                    code = self.suppliers_map[vendor_name_upper]
+                    ws.cell(row=row, column=R_COL_VENDOR_CODE, value=code)
+                    filled_count += 1
+                else:
+                    # Try partial word matching (extract key words and find best match)
+                    best_match = self._find_best_supplier_match(vendor_name_upper, supplier_names)
+
+                    if best_match:
+                        code = self.suppliers_map[best_match]
+                        ws.cell(row=row, column=R_COL_VENDOR_CODE, value=code)
+                        filled_count += 1
+                        self.log(f"Fuzzy match: '{vendor_name}' -> '{best_match}' (code: {code})")
+
+        if filled_count > 0:
+            self.log(f"Filled {filled_count} missing vendor codes using suppliers.csv")
+
+    def _find_best_supplier_match(self, vendor_name: str, supplier_names: List[str]) -> Optional[str]:
+        """Find the best matching supplier name using multiple strategies."""
+        # Strategy 1: Standard fuzzy matching
+        matches = get_close_matches(vendor_name, supplier_names, n=1, cutoff=0.6)
+        if matches:
+            return matches[0]
+
+        # Strategy 2: Partial word matching - extract significant words and match
+        # Remove common noise words
+        noise_words = {"CO", "LTD", "LIMITED", "INC", "CORPORATION", "COMPANY", "THE", "AND", "&", ",", "."}
+        vendor_words = set(w.strip(",.") for w in vendor_name.split() if w.strip(",.") not in noise_words and len(w.strip(",.")) > 2)
+
+        best_score = 0
+        best_match = None
+
+        for supplier_name in supplier_names:
+            supplier_words = set(w.strip(",.") for w in supplier_name.split() if w.strip(",.") not in noise_words and len(w.strip(",.")) > 2)
+
+            if not vendor_words or not supplier_words:
+                continue
+
+            # Calculate word overlap score
+            common_words = vendor_words & supplier_words
+            score = len(common_words) / max(len(vendor_words), len(supplier_words))
+
+            # Boost score if vendor name is a subset of supplier name
+            if vendor_words.issubset(supplier_words):
+                score += 0.3
+
+            if score > best_score and score >= 0.5:  # Require at least 50% word match
+                best_score = score
+                best_match = supplier_name
+
+        return best_match
 
     def _change_formatting(self):
         ws = self.ws_result

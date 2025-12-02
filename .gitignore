@@ -216,5 +216,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 # User
-src/MsPy-3_11_14
-src/venv
+src/linux
+src/win
