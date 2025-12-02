@@ -57,9 +57,13 @@ class PycroGrid(QScrollArea):
         self._grid.setRowStretch(0, 1)
         self._grid.setColumnStretch(0, 1)
 
-        self._root = os.path.join(os.getcwd(), 'pycros')
-        if os.path.isdir(self._root):
-            self._watcher.addPath(self._root)
+        self._roots = [
+            os.path.join(os.getcwd(), 'pycros'),
+            os.path.join(os.getcwd(), 'remote_pycros'),
+        ]
+        for root in self._roots:
+            if os.path.isdir(root):
+                self._watcher.addPath(root)
         self._invalid_pycros: set[str] = set()
 
         try:
@@ -83,14 +87,10 @@ class PycroGrid(QScrollArea):
         self._reload_open_tabs(infos)
 
     def _scan_pycros(self):
-        root = self._root
         infos = []
-        if not os.path.isdir(root):
+        roots = [r for r in self._roots if os.path.isdir(r)]
+        if not roots:
             return infos
-        try:
-            subdirs = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
-        except Exception:
-            subdirs = []
 
         try:
             dirs = self._watcher.directories()
@@ -101,46 +101,58 @@ class PycroGrid(QScrollArea):
                 self._watcher.removePaths(files)
         except Exception:
             pass
-        self._watcher.addPath(root)
 
-        for d in subdirs:
-            folder = os.path.join(root, d)
-            main_py = os.path.join(folder, 'main.py')
-            req_txt = os.path.join(folder, 'requirements.txt')
-            desc_md = os.path.join(folder, 'description.md')
-            has_python = False
+        for root in roots:
             try:
-                for fn in os.listdir(folder):
-                    if fn.lower().endswith('.py'):
-                        has_python = True
-                        break
+                self._watcher.addPath(root)
             except Exception:
+                pass
+            try:
+                subdirs = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+            except Exception:
+                subdirs = []
+
+            is_remote = os.path.basename(root) == 'remote_pycros'
+
+            for d in subdirs:
+                folder = os.path.join(root, d)
+                main_py = os.path.join(folder, 'main.py')
+                req_txt = os.path.join(folder, 'requirements.txt')
+                desc_md = os.path.join(folder, 'description.md')
                 has_python = False
+                try:
+                    for fn in os.listdir(folder):
+                        if fn.lower().endswith('.py'):
+                            has_python = True
+                            break
+                except Exception:
+                    has_python = False
 
-            short_desc, long_desc, info_lines = self._parse_description(desc_md)
-            display_name = d.replace('--', ' ')
+                short_desc, long_desc, info_lines = self._parse_description(desc_md)
+                display_name = d.replace('--', ' ')
 
-            info = PycroInfo(
-                name=d,
-                display_name=display_name,
-                folder=folder,
-                main_py=main_py,
-                requirements=req_txt if os.path.isfile(req_txt) else None,
-                description=desc_md if os.path.isfile(desc_md) else None,
-                short_desc=short_desc,
-                long_desc=long_desc,
-                info_lines=info_lines,
-                has_python=has_python
-            )
+                info = PycroInfo(
+                    name=d,
+                    display_name=display_name,
+                    folder=folder,
+                    main_py=main_py,
+                    requirements=req_txt if os.path.isfile(req_txt) else None,
+                    description=desc_md if os.path.isfile(desc_md) else None,
+                    short_desc=short_desc,
+                    long_desc=long_desc,
+                    info_lines=info_lines,
+                    has_python=has_python,
+                    is_remote=is_remote,
+                )
 
-            infos.append(info)
+                infos.append(info)
 
-            if os.path.isfile(desc_md):
-                self._watcher.addPath(desc_md)
-            if os.path.isfile(req_txt):
-                self._watcher.addPath(req_txt)
-            if os.path.isfile(main_py):
-                self._watcher.addPath(main_py)
+                if os.path.isfile(desc_md):
+                    self._watcher.addPath(desc_md)
+                if os.path.isfile(req_txt):
+                    self._watcher.addPath(req_txt)
+                if os.path.isfile(main_py):
+                    self._watcher.addPath(main_py)
 
         return infos
 
@@ -472,7 +484,7 @@ class PycroGrid(QScrollArea):
 
 
 class PycroInfo:
-    def __init__(self, name, display_name, folder, main_py, requirements, description, short_desc, long_desc, info_lines, has_python: bool):
+    def __init__(self, name, display_name, folder, main_py, requirements, description, short_desc, long_desc, info_lines, has_python: bool, is_remote: bool = False):
         self.name = name
         self.display_name = display_name
         self.folder = folder
@@ -483,6 +495,7 @@ class PycroInfo:
         self.long_desc = long_desc
         self.info_lines = info_lines
         self.has_python = has_python
+        self.is_remote = is_remote
 
 
 def _load_pycro_widget(info: 'PycroInfo') -> QWidget | None:
@@ -532,7 +545,7 @@ class PycroCard(QWidget):
         self.setMinimumSize(280, 210)
         self.setMaximumSize(320, 250)
         bg = "#242424" if isDarkTheme() else "#F2F2F2"
-        border = "rgba(255,255,255,0.08)" if isDarkTheme() else "rgba(0,0,0,0.08)"
+        border = "#3a7bd5" if info.is_remote else ("rgba(255,255,255,0.08)" if isDarkTheme() else "rgba(0,0,0,0.08)")
         self.setStyleSheet(
             f"QWidget#{self.objectName()}{{background-color:{bg}; border:1px solid {border}; border-radius:8px;}}"
         )

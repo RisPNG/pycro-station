@@ -57,8 +57,9 @@ class Settings(QWidget):
     def _build_ui(self):
         # Main vertical layout
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setContentsMargins(200, 100, 200, 100)
         main_layout.setSpacing(12)
+        main_layout.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
 
         # Row 1: Repo URL
         row1_layout = QHBoxLayout()
@@ -110,16 +111,12 @@ class Settings(QWidget):
 
         # Row 4: Update button
         row4_layout = QHBoxLayout()
-        row4_layout.addStretch(1)
         self.update_btn = PrimaryPushButton("Update", self)
         self.update_btn.setFixedWidth(150)
         self.update_btn.clicked.connect(self._on_update_clicked)
         row4_layout.addWidget(self.update_btn)
-        row4_layout.addStretch(1)
+        row4_layout.addStretch(2)
         main_layout.addLayout(row4_layout)
-
-        # Add stretch at the end to push everything to the top
-        main_layout.addStretch(1)
 
     def _load_settings(self):
         """Load settings from settings.json"""
@@ -325,6 +322,10 @@ class Window(MSFluentWindow):
 
         self.initNavigation()
         self.initWindow()
+        try:
+            self.settingsInterface.updateFinished.connect(self._on_settings_update)
+        except Exception:
+            pass
         # Keep Hub/tab selection mutually exclusive
         self.stackedWidget.currentChanged.connect(self.onContentChanged)
         # Hub active: keep last tab selection internally; hide its highlight
@@ -403,7 +404,7 @@ class Window(MSFluentWindow):
             ))
             app_icon = QIcon(QPixmap.fromImage(ti_planet))
 
-        self.resize(980, 725)
+        self.resize(980, 727)
         self.setWindowIcon(app_icon)
         self.setWindowTitle('Pycro Station')
 
@@ -798,6 +799,18 @@ class Window(MSFluentWindow):
                 self.titleBar.setTabsSelectionHighlightEnabled(True)
             except Exception:
                 pass
+
+    def _on_settings_update(self, success: bool, _msg: str):
+        """Refresh hub when settings update pulls new remote_pycros."""
+        if success:
+            try:
+                self.hubGrid._last_changed_path = os.path.join(os.getcwd(), "remote_pycros")
+            except Exception:
+                pass
+        try:
+            self.hubGrid.refresh()
+        except Exception:
+            pass
 
     # removed unused text-editor helpers and tab stubs
 
