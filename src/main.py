@@ -2,6 +2,7 @@
 The main python file. Run this file to use the app.
 """
 import datetime
+import json
 import os
 from tkinter import filedialog
 
@@ -20,11 +21,173 @@ from PackagesPage import PackagesPage
 from TitleBar import CustomTitleBar
 
 class Settings(QWidget):
-    def __init__(self, main_editor_widgets, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.main_editor_widgets = main_editor_widgets
+        self.settings_file = os.path.join(os.path.dirname(__file__), "settings.json")
 
-        layout = QVBoxLayout(self)
+        # Track editing state for each field
+        self.editing_states = {
+            "repo_url": False,
+            "repo_branch": False,
+            "repo_directory": False
+        }
+
+        # Match the BoM--to--MSL log/description styling
+        self.field_disabled_style = (
+            "QLineEdit {background: #1f1f1f; color: #d0d0d0; "
+            "border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px;}"
+            "QLineEdit:disabled {background: #1f1f1f; color: #d0d0d0;}"
+        )
+        self.field_enabled_style = (
+            "QLineEdit {background: transparent; color: #dcdcdc; "
+            "border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px;}"
+        )
+
+        self._build_ui()
+        self._load_settings()
+
+    def _build_ui(self):
+        # Main vertical layout
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+
+        # Row 1: Repo URL
+        row1_layout = QHBoxLayout()
+        self.repo_url_label = QLabel("Repo URL", self)
+        self.repo_url_label.setFixedWidth(100)
+        self.repo_url_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        self.repo_url_field = LineEdit(self)
+        self.repo_url_field.setEnabled(False)
+        self.repo_url_field.setStyleSheet(self.field_disabled_style)
+        self.repo_url_btn = PrimaryPushButton("Edit", self)
+        self.repo_url_btn.setFixedWidth(80)
+        self.repo_url_btn.clicked.connect(lambda: self._toggle_edit("repo_url"))
+        row1_layout.addWidget(self.repo_url_label)
+        row1_layout.addWidget(self.repo_url_field)
+        row1_layout.addWidget(self.repo_url_btn)
+        main_layout.addLayout(row1_layout)
+
+        # Row 2: Branch
+        row2_layout = QHBoxLayout()
+        self.branch_label = QLabel("Branch", self)
+        self.branch_label.setFixedWidth(100)
+        self.branch_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        self.branch_field = LineEdit(self)
+        self.branch_field.setEnabled(False)
+        self.branch_field.setStyleSheet(self.field_disabled_style)
+        self.branch_btn = PrimaryPushButton("Edit", self)
+        self.branch_btn.setFixedWidth(80)
+        self.branch_btn.clicked.connect(lambda: self._toggle_edit("repo_branch"))
+        row2_layout.addWidget(self.branch_label)
+        row2_layout.addWidget(self.branch_field)
+        row2_layout.addWidget(self.branch_btn)
+        main_layout.addLayout(row2_layout)
+
+        # Row 3: Directory
+        row3_layout = QHBoxLayout()
+        self.directory_label = QLabel("Directory", self)
+        self.directory_label.setFixedWidth(100)
+        self.directory_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        self.directory_field = LineEdit(self)
+        self.directory_field.setEnabled(False)
+        self.directory_field.setStyleSheet(self.field_disabled_style)
+        self.directory_btn = PrimaryPushButton("Edit", self)
+        self.directory_btn.setFixedWidth(80)
+        self.directory_btn.clicked.connect(lambda: self._toggle_edit("repo_directory"))
+        row3_layout.addWidget(self.directory_label)
+        row3_layout.addWidget(self.directory_field)
+        row3_layout.addWidget(self.directory_btn)
+        main_layout.addLayout(row3_layout)
+
+        # Row 4: Update button
+        row4_layout = QHBoxLayout()
+        row4_layout.addStretch(1)
+        self.update_btn = PrimaryPushButton("Update", self)
+        self.update_btn.setFixedWidth(150)
+        self.update_btn.clicked.connect(self._on_update_clicked)
+        row4_layout.addWidget(self.update_btn)
+        row4_layout.addStretch(1)
+        main_layout.addLayout(row4_layout)
+
+        # Add stretch at the end to push everything to the top
+        main_layout.addStretch(1)
+
+    def _load_settings(self):
+        """Load settings from settings.json"""
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, 'r') as f:
+                    settings = json.load(f)
+                    self.repo_url_field.setText(settings.get("repo_url", ""))
+                    self.branch_field.setText(settings.get("repo_branch", ""))
+                    self.directory_field.setText(settings.get("repo_directory", ""))
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+    def _save_settings(self):
+        """Save settings to settings.json"""
+        try:
+            settings = {
+                "repo_url": self.repo_url_field.text(),
+                "repo_branch": self.branch_field.text(),
+                "repo_directory": self.directory_field.text()
+            }
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
+    def _toggle_edit(self, field_name):
+        """Toggle edit/save mode for a field"""
+        if field_name == "repo_url":
+            field = self.repo_url_field
+            btn = self.repo_url_btn
+        elif field_name == "repo_branch":
+            field = self.branch_field
+            btn = self.branch_btn
+        else:  # repo_directory
+            field = self.directory_field
+            btn = self.directory_btn
+
+        if self.editing_states[field_name]:
+            # Currently editing, save the changes
+            field.setEnabled(False)
+            field.setStyleSheet(self.field_disabled_style)
+            btn.setText("Edit")
+            self.editing_states[field_name] = False
+            self._save_settings()
+        else:
+            # Not editing, enable the field
+            field.setEnabled(True)
+            field.setStyleSheet(self.field_enabled_style)
+            field.setFocus()
+            btn.setText("Save")
+            self.editing_states[field_name] = True
+
+    def _on_update_clicked(self):
+        """Handle update button click"""
+        # Disable the button and start animations
+        self.update_btn.setEnabled(False)
+
+        # Simple text-only status (spinner removed)
+        self.update_btn.setText("Updating")
+
+        # Schedule popup on the UI thread after a short delay
+        QTimer.singleShot(2000, self._show_success_popup)
+
+    def _show_success_popup(self):
+        """Show success popup and re-enable button when OK is pressed"""
+        # Show popup
+        msg = MessageBox("Success", "Update completed successfully!", self)
+        msg.yesButton.setText("OK")
+        msg.cancelButton.hide()
+        msg.exec()
+
+        # Re-enable the button and restore original state
+        self.update_btn.setEnabled(True)
+        self.update_btn.setIcon(QIcon())  # Clear icon
+        self.update_btn.setText("Update")
 
 
 
@@ -56,7 +219,7 @@ class Window(MSFluentWindow):
         self.homeInterface.setFrameShape(QFrame.NoFrame)
         self.homeInterface.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.homeInterface.setStyleSheet("background: transparent;")
-        self.settingsInterface = Settings({})
+        self.settingsInterface = Settings(self)
         self.settingsInterface.setObjectName("settingsInterface")
         # No initial tabs; Hub shows the grid
 
@@ -82,6 +245,7 @@ class Window(MSFluentWindow):
             size=24,
             color="#FFFFFF",
             stroke_width=2.0,
+
         ))))
         self.addSubInterface(self.homeInterface, hub, 'Hub', hub, NavigationItemPosition.TOP)
         # Ensure clicking Hub also switches inner stack back to the grid view

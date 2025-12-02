@@ -5,7 +5,7 @@ import html
 import importlib.util
 from importlib import metadata
 
-from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, Signal, QProcess, QEvent
+from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, QProcess, QEvent
 from PySide6.QtWidgets import *
 from PySide6.QtGui import QIcon, QCursor
 from qfluentwidgets import PrimaryPushButton, TransparentToolButton, isDarkTheme, FluentIcon as FIF
@@ -139,8 +139,6 @@ class PycroGrid(QScrollArea):
                 self._watcher.addPath(desc_md)
             if os.path.isfile(req_txt):
                 self._watcher.addPath(req_txt)
-            if os.path.isfile(main_py):
-                self._watcher.addPath(main_py)
             if os.path.isfile(main_py):
                 self._watcher.addPath(main_py)
 
@@ -721,6 +719,3 @@ class PycroCard(QWidget):
                 widget.setWindowTitle(self.info.display_name)
                 widget.resize(800, 600)
                 widget.show()
-
-    def _load_widget(self) -> QWidget | None:
-        return _load_pycro_widget(self.info)
