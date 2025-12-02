@@ -1,6 +1,6 @@
 > Reformat Extracted PDF T-BoM to MSL
 > [!info]
-> [Version 2.0.0](#bae1ffff)
+> [Version 2.1.0](#bae1ffff)
 >
 > [Author](#bae1ffff)
 > ZTPONG
@@ -12,6 +12,6 @@
 > Nik Faris Aiman bin Nik Rahiman (faris@sig.com.my)
 >
 > [Last updated date](#bae1ffff)
-> 2025/11/24
+> 2025/12/02
 
 Reformats Extracted PDF T-BoM to SIGPortal MSL compliant format.

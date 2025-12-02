@@ -483,6 +483,12 @@ class BoMToMSLProcessor:
                 vendor_val = vendor_val.replace("NIKE-APPROVED VENDOR", "")
                 ws.cell(row=row, column=R_COL_VENDOR_NAME, value=vendor_val.strip())
 
+            # Item cleanup
+            item_val = self._value_to_str(ws.cell(row=row, column=R_COL_ITEM).value)
+            if item_val:
+                stripped_item = item_val.lstrip("0")
+                ws.cell(row=row, column=R_COL_ITEM, value=stripped_item if stripped_item else "0")
+
             # Description cleanup
             desc_val = self._value_to_str(ws.cell(row=row, column=R_COL_DESC).value)
             if desc_val:
