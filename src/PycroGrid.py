@@ -3,12 +3,13 @@ import sys
 import re
 import html
 import importlib.util
+from difflib import SequenceMatcher
 from importlib import metadata
 
 from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, QProcess, QEvent
 from PySide6.QtWidgets import *
 from PySide6.QtGui import QIcon, QCursor
-from qfluentwidgets import PrimaryPushButton, TransparentToolButton, isDarkTheme, FluentIcon as FIF
+from qfluentwidgets import PrimaryPushButton, TransparentToolButton, isDarkTheme, FluentIcon as FIF, LineEdit
 
 
 class PycroGrid(QScrollArea):
@@ -24,9 +25,25 @@ class PycroGrid(QScrollArea):
 
         self._content = QWidget(self)
         self._content.setStyleSheet("background: transparent;")
-        self._grid = QGridLayout(self._content)
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(8)
+
+        # Search bar
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(12, 12, 12, 0)
+        search_row.setSpacing(8)
+        self._search_field = LineEdit(self._content)
+        self._search_field.setPlaceholderText("Search pycros...")
+        search_row.addWidget(self._search_field)
+        self._content_layout.addLayout(search_row)
+
+        # Grid host
+        self._grid_host = QWidget(self._content)
+        self._grid = QGridLayout(self._grid_host)
         self._grid.setContentsMargins(12, 12, 12, 12)
         self._grid.setSpacing(12)
+        self._content_layout.addWidget(self._grid_host, 1)
         self.setWidget(self._content)
 
         self._cards: list[PycroCard] = []
@@ -44,6 +61,7 @@ class PycroGrid(QScrollArea):
         self._info_hover_timer.timeout.connect(self._show_pending_hover_popup)
         self._pending_callout: tuple[QWidget, str] | None = None
         self._last_infos: list['PycroInfo'] = []
+        self._all_infos: list['PycroInfo'] = []
         self._last_column_count: int | None = None
         self._resize_relayout_timer = QTimer(self)
         self._resize_relayout_timer.setSingleShot(True)
@@ -78,12 +96,14 @@ class PycroGrid(QScrollArea):
             )
         except Exception:
             pass
+        self._search_field.textChanged.connect(lambda _: self._apply_filter())
 
         QTimer.singleShot(0, self.refresh)
 
     def refresh(self):
         infos = self._scan_pycros()
-        self._rebuild(infos)
+        self._all_infos = infos
+        self._apply_filter()
         self._reload_open_tabs(infos)
 
     def _scan_pycros(self):
@@ -155,6 +175,25 @@ class PycroGrid(QScrollArea):
                     self._watcher.addPath(main_py)
 
         return infos
+
+    def _apply_filter(self):
+        query = (self._search_field.text() or "").strip()
+        if not query:
+            filtered = list(self._all_infos)
+        else:
+            filtered = [info for info in self._all_infos if self._matches_query(info, query)]
+        self._rebuild(filtered)
+
+    def _matches_query(self, info: 'PycroInfo', query: str) -> bool:
+        q = query.lower()
+        name = info.display_name.lower()
+        desc = (info.short_desc or "").lower()
+        # quick substring match
+        if q in name or q in desc:
+            return True
+        def ratio(a: str, b: str) -> float:
+            return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+        return max(ratio(q, name), ratio(q, desc)) >= 0.8
 
     def _parse_description(self, path):
         short_lines: list[str] = []

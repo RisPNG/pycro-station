@@ -404,7 +404,7 @@ class Window(MSFluentWindow):
             ))
             app_icon = QIcon(QPixmap.fromImage(ti_planet))
 
-        self.resize(980, 727)
+        self.resize(980, 780)
         self.setWindowIcon(app_icon)
         self.setWindowTitle('Pycro Station')
 
