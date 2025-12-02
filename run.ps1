@@ -1,5 +1,3 @@
-param([switch]$Update)
-
 # Use the actual location of the script, even if run from shortcuts or another user account
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location $scriptPath
@@ -81,10 +79,6 @@ if ($venvNewlyCreated) {
     & $venvPy -m pip install -r requirements.txt
 } else {
     Write-Host "Using existing virtual environment (skipping pip install)"
-}
-
-if ($Update -and (Test-Path ".pycro-repo")) {
-    Remove-Item ".pycro-repo" -Recurse -Force
 }
 
 & $venvPy "src\main.py"
