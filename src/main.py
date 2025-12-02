@@ -548,6 +548,27 @@ class Window(MSFluentWindow):
 
 if __name__ == '__main__':
     app = QApplication()
+
+    # Set application metadata for proper Linux integration
+    app.setApplicationName("Pycro Station")
+    app.setApplicationDisplayName("Pycro Station")
+
+    # Set organization for settings persistence
+    app.setOrganizationName("PycroStation")
+    app.setOrganizationDomain("pycrostation")
+
+    # Set application icon for taskbar/alt-tab (important for GNOME/Linux)
+    # Get absolute path to icon file
+    icon_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "pycro-station-icon.png"))
+
+    if os.path.exists(icon_path):
+        icon = QIcon(icon_path)
+        # Set at application level for taskbar/dock
+        app.setWindowIcon(icon)
+        print(f"Icon loaded from: {icon_path}")
+    else:
+        print(f"Warning: Icon not found at {icon_path}")
+
     w = Window()
     w.show()
     app.exec()
