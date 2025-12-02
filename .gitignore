@@ -1,5 +1,3 @@
-src/MsPy-3_11_14-linux
-src/MsPy-3_11_14-win
-src/venv-linux
+src/MsPy-3_11_14
 src/venv-win
 __pycache__/
