@@ -43,6 +43,12 @@ class PycroGrid(QScrollArea):
         self._info_hover_timer.setSingleShot(True)
         self._info_hover_timer.timeout.connect(self._show_pending_hover_popup)
         self._pending_callout: tuple[QWidget, str] | None = None
+        self._last_infos: list['PycroInfo'] = []
+        self._last_column_count: int | None = None
+        self._resize_relayout_timer = QTimer(self)
+        self._resize_relayout_timer.setSingleShot(True)
+        self._resize_relayout_timer.setInterval(120)
+        self._resize_relayout_timer.timeout.connect(self._relayout_on_resize)
 
         self._empty_label = QLabel("Pycros will appear here", self._content)
         self._empty_label.setAlignment(Qt.AlignCenter)
@@ -172,38 +178,24 @@ class PycroGrid(QScrollArea):
         long_desc = '\n'.join(long_desc_lines).strip()
         return short_desc, long_desc, info_lines
 
-    def _rebuild(self, infos):
-        for card in self._cards:
-            self._grid.removeWidget(card)
-            card.deleteLater()
-        self._cards.clear()
+    def _rebuild(self, infos, rebuild_cards: bool = True):
+        self._last_infos = infos
+        if rebuild_cards:
+            for card in self._cards:
+                self._grid.removeWidget(card)
+                card.deleteLater()
+            self._cards.clear()
 
-        if not infos:
-            self._empty_label.show()
-            self._grid.setRowStretch(0, 1)
-            self._grid.setColumnStretch(0, 1)
-            return
-        else:
-            self._empty_label.hide()
+            for info in infos:
+                card = PycroCard(info, parent=self)
+                if info.name in self._invalid_pycros:
+                    try:
+                        card.set_invalid(True)
+                    except Exception:
+                        pass
+                self._cards.append(card)
 
-        columns = 3
-        row = 0
-        col = 0
-        for info in infos:
-            card = PycroCard(info, parent=self)
-            self._cards.append(card)
-            self._grid.addWidget(card, row, col)
-            col += 1
-            if col >= columns:
-                col = 0
-                row += 1
-
-        for r in range(row + 1):
-            self._grid.setRowStretch(r, 0)
-        self._grid.setRowStretch(row + 1, 1)
-        for c in range(columns):
-            self._grid.setColumnStretch(c, 0)
-        self._grid.setColumnStretch(columns, 1)
+        self._relayout_cards(force=True)
 
     def _on_dir_changed(self, path):
         self._last_changed_path = path
@@ -408,6 +400,77 @@ class PycroGrid(QScrollArea):
                 self._pending_callout = None
                 self._hide_info_popup()
         return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_relayout_timer.start()
+
+    def _relayout_on_resize(self):
+        if not self._cards and not self._last_infos:
+            return
+        self._relayout_cards()
+
+    def _clear_grid_items(self):
+        while self._grid.count():
+            self._grid.takeAt(0)
+
+    def _card_width_hint(self) -> int:
+        if not self._cards:
+            return 300
+        card = self._cards[0]
+        width = max(card.sizeHint().width(), card.minimumWidth())
+        max_width = card.maximumWidth()
+        if max_width > 0:
+            width = min(width, max_width)
+        return width
+
+    def _compute_columns(self) -> int:
+        spacing = self._grid.horizontalSpacing()
+        if spacing is None or spacing < 0:
+            spacing = self._grid.spacing()
+        spacing = spacing if spacing is not None and spacing >= 0 else 0
+
+        margins = self._grid.contentsMargins()
+        available_width = self.viewport().width() - margins.left() - margins.right()
+        card_width = max(1, self._card_width_hint())
+        raw_columns = (available_width + spacing) // (card_width + spacing)
+        columns = max(1, int(raw_columns))
+        max_columns = len(self._cards) if self._cards else 1
+        return min(columns, max_columns)
+
+    def _relayout_cards(self, force: bool = False):
+        if not self._cards:
+            self._clear_grid_items()
+            self._empty_label.show()
+            self._grid.addWidget(self._empty_label, 0, 0)
+            self._grid.setRowStretch(0, 1)
+            self._grid.setColumnStretch(0, 1)
+            self._last_column_count = None
+            return
+
+        columns = self._compute_columns()
+        if not force and self._last_column_count == columns:
+            return
+
+        self._clear_grid_items()
+        self._empty_label.hide()
+
+        row = 0
+        col = 0
+        for card in self._cards:
+            self._grid.addWidget(card, row, col)
+            col += 1
+            if col >= columns:
+                col = 0
+                row += 1
+
+        for r in range(row + 1):
+            self._grid.setRowStretch(r, 0)
+        self._grid.setRowStretch(row + 1, 1)
+        for c in range(columns):
+            self._grid.setColumnStretch(c, 0)
+        self._grid.setColumnStretch(columns, 1)
+        self._last_column_count = columns
 
 
 class PycroInfo:

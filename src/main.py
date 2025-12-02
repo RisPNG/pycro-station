@@ -139,12 +139,19 @@ class Window(MSFluentWindow):
             ))
             app_icon = QIcon(QPixmap.fromImage(ti_planet))
 
-        self.resize(1100, 750)
+        self.resize(980, 725)
         self.setWindowIcon(app_icon)
         self.setWindowTitle('Pycro Station')
 
-        w, h = 1200, 800
-        self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
+        screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        target_w = min(self.width(), avail.width())
+        target_h = min(self.height(), avail.height())
+        self.resize(target_w, target_h)
+        self.move(
+            avail.x() + (avail.width() - target_w) // 2,
+            avail.y() + (avail.height() - target_h) // 2,
+        )
 
     def showHub(self):
         """Switch to the Hub (inner grid) regardless of current tab state."""
