@@ -1,14 +1,27 @@
-# Create venv only if it doesn't exist
-if (-not (Test-Path "src\venv-win")) {
-    src\MsPy-3_11_14-win\python.exe -m venv "src\venv-win"
+param([switch]$Update)
+
+# Use the actual location of the script, even if run from shortcuts or another user account
+$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Definition
+Set-Location $scriptPath
+
+$ErrorActionPreference = 'Stop'
+
+if (-not (Test-Path "src\venv-win\Scripts\python.exe")) {
+    & "src\MsPy-3_11_14-win\python.exe" -m venv "src\venv-win"
+    $venvPy = Join-Path $scriptPath "src\venv-win\Scripts\python.exe"
+
+    & $venvPy -m pip install --upgrade pip
+    & $venvPy -m pip install -r requirements.txt
 }
 
-# Activate the venv
-& src\venv-win\Scripts\Activate.ps1
+$venvPy = Join-Path $scriptPath "src\venv-win\Scripts\python.exe"
 
-# Upgrade pip and install requirements
-python.exe -m pip install --upgrade pip
-pip install -r requirements.txt
+if ($Update -and (Test-Path ".pycro-repo")) {
+    Remove-Item ".pycro-repo" -Recurse -Force
+}
 
-# Run the script
-python src\main.py
+$env:PYCRO_REPO_URL    = "https://github.com/RisPNG/pycro-station.git"
+$env:PYCRO_REPO_BRANCH = "main"
+$env:PYCRO_REPO_SUBDIR = "pycros"
+
+& $venvPy "src\main.py"

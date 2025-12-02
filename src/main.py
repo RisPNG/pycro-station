@@ -125,15 +125,22 @@ class Window(MSFluentWindow):
         self.tabBar.currentChanged.connect(self.onTabChanged)
 
     def initWindow(self):
-        ti_planet = ImageQt(TablerIcons.load(
-            OutlineIcon.PLANET,
-            size=24,
-            color="#FFFFFF",
-            stroke_width=2.0,
-        ))
+        # Load icon from file (fallback to generated icon if file doesn't exist)
+        icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pycro-station-icon.png")
+        if os.path.exists(icon_path):
+            app_icon = QIcon(icon_path)
+        else:
+            # Fallback to generated icon
+            ti_planet = ImageQt(TablerIcons.load(
+                OutlineIcon.PLANET,
+                size=24,
+                color="#FFFFFF",
+                stroke_width=2.0,
+            ))
+            app_icon = QIcon(QPixmap.fromImage(ti_planet))
 
         self.resize(1100, 750)
-        self.setWindowIcon(QIcon(QPixmap.fromImage(ti_planet)))
+        self.setWindowIcon(app_icon)
         self.setWindowTitle('Pycro Station')
 
         w, h = 1200, 800
