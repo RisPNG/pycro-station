@@ -87,8 +87,4 @@ if ($Update -and (Test-Path ".pycro-repo")) {
     Remove-Item ".pycro-repo" -Recurse -Force
 }
 
-$env:PYCRO_REPO_URL    = "https://github.com/RisPNG/pycro-station.git"
-$env:PYCRO_REPO_BRANCH = "main"
-$env:PYCRO_REPO_SUBDIR = "pycros"
-
 & $venvPy "src\main.py"
