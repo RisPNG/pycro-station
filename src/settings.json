@@ -1,5 +1,6 @@
 {
     "repo_url": "https://github.com/RisPNG/pycro-station.git",
     "repo_branch": "main",
-    "repo_directory": "pycros"
+    "repo_directory": "pycros",
+    "update_remote_on_launch": true
 }

@@ -22,7 +22,7 @@ from pytablericons import TablerIcons, OutlineIcon
 from PIL.ImageQt import ImageQt
 
 from PycroGrid import PycroGrid
-from PackagesPage import PackagesPage
+from PackagesPage import PackagesPage, CheckIconButton
 from TitleBar import CustomTitleBar
 
 class Settings(QWidget):
@@ -31,6 +31,8 @@ class Settings(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings_file = os.path.join(os.path.dirname(__file__), "settings.json")
+        self._show_update_dialog = True
+        self._launch_update_started = False
 
         # Track editing state for each field
         self.editing_states = {
@@ -109,14 +111,27 @@ class Settings(QWidget):
         row3_layout.addWidget(self.directory_btn)
         main_layout.addLayout(row3_layout)
 
-        # Row 4: Update button
+        # Row 4: Update remote on launch (icon toggle matches packages screen)
         row4_layout = QHBoxLayout()
+        self.update_remote_toggle = CheckIconButton(self, initially_checked=False)
+        self.update_remote_label = QLabel("Update remote pycros on launch", self)
+        self.update_remote_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        row4_layout.addSpacing(110)
+        row4_layout.addWidget(self.update_remote_toggle, 0, Qt.AlignVCenter)
+        row4_layout.addWidget(self.update_remote_label, 0, Qt.AlignVCenter)
+        row4_layout.addStretch(1)
+        main_layout.addLayout(row4_layout)
+        self.update_remote_toggle.toggledManually.connect(lambda _: self._save_settings())
+
+        # Row 5: Update button
+        row5_layout = QHBoxLayout()
         self.update_btn = PrimaryPushButton("Update", self)
         self.update_btn.setFixedWidth(150)
         self.update_btn.clicked.connect(self._on_update_clicked)
-        row4_layout.addWidget(self.update_btn)
-        row4_layout.addStretch(2)
-        main_layout.addLayout(row4_layout)
+        row5_layout.addStretch(1)
+        row5_layout.addWidget(self.update_btn)
+        row5_layout.addStretch(1)
+        main_layout.addLayout(row5_layout)
 
     def _load_settings(self):
         """Load settings from settings.json"""
@@ -127,16 +142,19 @@ class Settings(QWidget):
                     self.repo_url_field.setText(settings.get("repo_url", ""))
                     self.branch_field.setText(settings.get("repo_branch", ""))
                     self.directory_field.setText(settings.get("repo_directory", ""))
+                    update_on_launch = settings.get("update_remote_on_launch", False)
+                    self.update_remote_toggle.setChecked(bool(update_on_launch))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
-    def _save_settings(self):
+    def _save_settings(self, *_args):
         """Save settings to settings.json"""
         try:
             settings = {
                 "repo_url": self.repo_url_field.text(),
                 "repo_branch": self.branch_field.text(),
-                "repo_directory": self.directory_field.text()
+                "repo_directory": self.directory_field.text(),
+                "update_remote_on_launch": self.update_remote_toggle.isChecked()
             }
             with open(self.settings_file, 'w') as f:
                 json.dump(settings, f, indent=4)
@@ -172,6 +190,12 @@ class Settings(QWidget):
 
     def _on_update_clicked(self):
         """Handle update button click"""
+        self._start_update(show_dialog=True)
+
+    def _start_update(self, show_dialog: bool):
+        """Start update process with optional popup."""
+        self._show_update_dialog = show_dialog
+
         # Prefer values from settings.json (falls back to current field values)
         repo_url = (self.repo_url_field.text() or "").strip()
         branch = (self.branch_field.text() or "").strip()
@@ -188,7 +212,10 @@ class Settings(QWidget):
         branch = branch or "main"
 
         if not repo_url:
-            MessageBox("Missing repo URL", "Please provide a repository URL.", self).exec()
+            if show_dialog:
+                MessageBox("Missing repo URL", "Please provide a repository URL.", self).exec()
+            else:
+                print("Skipping remote update: repo URL missing.")
             return
 
         # Disable the button and show status
@@ -254,11 +281,27 @@ class Settings(QWidget):
         self.update_btn.setIcon(QIcon())
         self.update_btn.setText("Update")
 
+        if not self._show_update_dialog:
+            # Reset for future manual updates
+            self._show_update_dialog = True
+            if not success:
+                print(f"Silent remote update failed: {message}")
+            return
+
         title = "Success" if success else "Update failed"
         msg = MessageBox(title, message or "", self)
         msg.yesButton.setText("OK")
         msg.cancelButton.hide()
         msg.exec()
+
+    def run_update_on_launch_if_enabled(self):
+        """Kick off remote update at launch when setting is enabled."""
+        if self._launch_update_started:
+            return
+        if not self.update_remote_toggle.isChecked():
+            return
+        self._launch_update_started = True
+        QTimer.singleShot(0, lambda: self._start_update(show_dialog=False))
 
     @staticmethod
     def _build_archive_url(repo_url: str, branch: str) -> str:
@@ -324,6 +367,10 @@ class Window(MSFluentWindow):
         self.initWindow()
         try:
             self.settingsInterface.updateFinished.connect(self._on_settings_update)
+        except Exception:
+            pass
+        try:
+            self.settingsInterface.run_update_on_launch_if_enabled()
         except Exception:
             pass
         # Keep Hub/tab selection mutually exclusive
