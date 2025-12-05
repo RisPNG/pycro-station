@@ -425,7 +425,9 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
             idx_final_reg = get_col_index(headers, ["FINAL FOB (Regular sizes)"])
             idx_final_ext = get_col_index(headers, ["FINAL FOB (Extended sizes)", "FINAL FOB (Extended sizes) (2)"])
             idx_ext_sizes_def = get_col_index(headers, ["Extended Sizes"])
+
             idx_remarks = get_col_index(headers, ["PRICE DIFF REMARKS"])
+            idx_dpom_fob = get_col_index(headers, ["DPOM - Incorrect FOB"])
 
             # Init Header for Remarks
             if idx_remarks == -1:
@@ -439,11 +441,29 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     output_csv_data[header_idx].append("PRICE DIFF REMARKS")
                     idx_remarks = len(headers)
 
+            # Init Header for DPOM - Incorrect FOB (re-check in case it shifted due to insert)
+            if is_excel:
+                # Re-fetch headers if we inserted a column to ensure we don't mess up indexing
+                headers = [str(cell.value) for cell in ws_write[header_idx+1]]
+                idx_dpom_fob = get_col_index(headers, ["DPOM - Incorrect FOB"])
+
+            if idx_dpom_fob == -1:
+                # Place it after Remarks, or at the end
+                insert_pos = idx_remarks + 1
+                if is_excel:
+                    ws_write.insert_cols(insert_pos + 1)
+                    ws_write.cell(row=header_idx+1, column=insert_pos+1).value = "DPOM - Incorrect FOB"
+                    idx_dpom_fob = insert_pos
+                else:
+                    output_csv_data[header_idx].append("DPOM - Incorrect FOB")
+                    idx_dpom_fob = len(headers) - 1 # Logic slightly tricky for CSV updates in-flight, just appending
+
             for r_i in range(header_idx + 1, len(rows_read)):
                 row_vals = rows_read[r_i]
                 if not row_vals: continue
 
                 remarks = []
+                dpom_errors = [] # Store "Size Price" mismatches
 
                 # --- PPM Comparison ---
                 po_val = str(row_vals[idx_nk_po]).strip() if idx_nk_po != -1 else ""
@@ -469,23 +489,23 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                         ave_ppm_am = sum_am / count if count else 0.0
                         ave_ppm_ao = sum_ao / count if count else 0.0
 
-                        # Surcharge Checks
-                        if abs(safe_float(row_vals[idx_sc_min_prod]) - ave_ppm_ag) > 0.00:
+                        # Surcharge Checks - THRESHOLD 0.01
+                        if abs(safe_float(row_vals[idx_sc_min_prod]) - ave_ppm_ag) > 0.01:
                             remarks.append("S/C MIN PRODUCTION (ZPMX) doesn't match")
 
                         # Min Mat
                         occc_zmmx = safe_float(row_vals[idx_sc_min_mat])
                         zmmx_cmt = str(row_vals[idx_sc_min_mat_comment]).strip().upper() if idx_sc_min_mat_comment != -1 and row_vals[idx_sc_min_mat_comment] else ""
-                        if zmmx_cmt != "DN" and abs(occc_zmmx - ave_ppm_ai) > 0.00:
+                        if zmmx_cmt != "DN" and abs(occc_zmmx - ave_ppm_ai) > 0.01:
                             remarks.append("S/C Min Material (ZMMX) doesn't match")
 
                         # Misc
                         occc_zmsx = safe_float(row_vals[idx_sc_misc])
                         zmsx_cmt = str(row_vals[idx_sc_misc_comment]).strip().upper() if idx_sc_misc_comment != -1 and row_vals[idx_sc_misc_comment] else ""
-                        if zmsx_cmt != "DN" and abs(occc_zmsx - ave_ppm_am) > 0.00:
+                        if zmsx_cmt != "DN" and abs(occc_zmsx - ave_ppm_am) > 0.01:
                             remarks.append("S/C Misc (ZMSX) doesn't match")
 
-                        if abs(safe_float(row_vals[idx_sc_vas]) - ave_ppm_ao) > 0.00:
+                        if abs(safe_float(row_vals[idx_sc_vas]) - ave_ppm_ao) > 0.01:
                             remarks.append("S/C VAS Manual (ZVAX) doesn't match")
 
                         # Final FOB Checks
@@ -493,18 +513,28 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                         occc_final_reg = safe_float(row_vals[idx_final_reg]) if idx_final_reg != -1 else 0.0
                         occc_final_ext = safe_float(row_vals[idx_final_ext]) if idx_final_ext != -1 else 0.0
 
+                        fob_mismatch_found = False # Flag to avoid spamming "Remarks" but keep collecting DPOM errors
+
                         for entry in ppm_entries:
                             ppm_total = round(entry['ag'] + entry['ai'] + entry['ak'] +
                                               entry['am'] + entry['ao'] + entry['aq'], 2)
                             is_ext = is_extended_size(entry['size'], ext_threshold)
                             target_fob = round(occc_final_ext if is_ext else occc_final_reg, 2)
 
-                            if ppm_total > 0 and abs(target_fob - ppm_total) > 0.00:
+                            # THRESHOLD 0.01
+                            if ppm_total > 0 and abs(target_fob - ppm_total) > 0.01:
                                 lbl = "Extended" if is_ext else "Regular"
-                                # Debug Logging
-                                log_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {target_fob} vs PPM {ppm_total}")
-                                remarks.append(f"FINAL FOB ({lbl} sizes) doesn't match with PPM")
-                                break
+
+                                # Add to DPOM Error List: "Size Price"
+                                dpom_errors.append(f"{entry['size']} {ppm_total:.2f}")
+
+                                # Add to Remarks (Only once per row to avoid clutter)
+                                if not fob_mismatch_found:
+                                    log_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {target_fob} vs PPM {ppm_total}")
+                                    remarks.append(f"FINAL FOB ({lbl} sizes) doesn't match with PPM")
+                                    fob_mismatch_found = True
+
+                                # Do NOT break here. Continue checking other sizes for DPOM column.
 
                 # --- PPS Comparison ---
                 style_val = str(row_vals[idx_style]).strip() if idx_style != -1 else ""
@@ -522,24 +552,24 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                             if not matched_rows:
                                 remarks.append("No matching PPS (Color)")
                             else:
-                                # Regular
+                                # Regular - THRESHOLD 0.01
                                 reg_match = next((r for r in matched_rows if not r['size_data']), None)
                                 occc_ofob_reg = safe_float(row_vals[idx_ofob_reg])
                                 if reg_match:
-                                    if abs(reg_match['quote'] - occc_ofob_reg) <= 0.02:
+                                    if abs(reg_match['quote'] - occc_ofob_reg) <= 0.01:
                                         remarks.append("PPS OFOB match for regular sizes")
                                     else:
                                         remarks.append("PPS OFOB doesn't match for regular sizes")
                                 elif occc_ofob_reg > 0:
                                     remarks.append("PPS OFOB missing regular size entry")
 
-                                # Extended
+                                # Extended - THRESHOLD 0.01
                                 ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
                                 occc_ofob_ext = safe_float(row_vals[idx_ofob_ext])
                                 if ext_threshold not in ["-", "", "NONE", "NA"] or occc_ofob_ext > 0:
                                     ext_match = next((r for r in matched_rows if is_extended_size(r['size_data'], ext_threshold)), None)
                                     if ext_match:
-                                        if abs(ext_match['quote'] - occc_ofob_ext) <= 0.02:
+                                        if abs(ext_match['quote'] - occc_ofob_ext) <= 0.01:
                                             remarks.append("PPS OFOB match for extended sizes")
                                         else:
                                             remarks.append("PPS OFOB doesn't match for extended sizes")
@@ -554,19 +584,39 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                 if remarks:
                     remarks = refine_remarks(remarks)
 
-                # --- Write Output (Clearing old if empty) ---
+                # --- Write Output ---
+
+                # 1. PRICE DIFF REMARKS
                 final_remark = "; ".join(remarks) if remarks else ""
 
+                # 2. DPOM - Incorrect FOB
+                final_dpom_val = " / ".join(dpom_errors) if dpom_errors else ""
+
                 if is_excel:
+                    # Write Remarks
                     target_col_idx = idx_remarks + 1
                     if ws_write.cell(row=header_idx+1, column=target_col_idx).value != "PRICE DIFF REMARKS":
                         ws_write.cell(row=header_idx+1, column=target_col_idx).value = "PRICE DIFF REMARKS"
                     ws_write.cell(row=r_i+1, column=target_col_idx).value = final_remark
+
+                    # Write DPOM
+                    target_dpom_idx = idx_dpom_fob + 1
+                    if ws_write.cell(row=header_idx+1, column=target_dpom_idx).value != "DPOM - Incorrect FOB":
+                        ws_write.cell(row=header_idx+1, column=target_dpom_idx).value = "DPOM - Incorrect FOB"
+                    ws_write.cell(row=r_i+1, column=target_dpom_idx).value = final_dpom_val
+
                 else:
-                    if idx_remarks >= len(output_csv_data[r_i]):
-                        output_csv_data[r_i].append(final_remark)
-                    else:
-                        output_csv_data[r_i][idx_remarks] = final_remark
+                    # CSV Handling
+
+                    # Ensure list is long enough for Remarks
+                    while len(output_csv_data[r_i]) <= idx_remarks:
+                         output_csv_data[r_i].append("")
+                    output_csv_data[r_i][idx_remarks] = final_remark
+
+                    # Ensure list is long enough for DPOM
+                    while len(output_csv_data[r_i]) <= idx_dpom_fob:
+                         output_csv_data[r_i].append("")
+                    output_csv_data[r_i][idx_dpom_fob] = final_dpom_val
 
             if is_excel:
                 wb_write.save(occc_path)
