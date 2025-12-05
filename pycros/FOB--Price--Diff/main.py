@@ -26,6 +26,8 @@ from openpyxl.utils import get_column_letter
 # Excel Automation for Formula Calculation
 try:
     import xlwings as xw
+    # pythoncom is part of pywin32, required for threading with Excel on Windows
+    import pythoncom
     HAS_XLWINGS = True
 except ImportError:
     HAS_XLWINGS = False
@@ -174,6 +176,14 @@ def refresh_excel_formulas(filepath, log_emit):
         log_emit("Warning: xlwings not installed. Formulas might read as 0.0.")
         return False
 
+    # === FIX: Initialize COM for Threading ===
+    try:
+        pythoncom.CoInitialize()
+    except Exception:
+        # On some systems or if already initialized, this might fail or not be needed.
+        pass
+    # =========================================
+
     try:
         log_emit(f"Auto-calculating formulas for {os.path.basename(filepath)}... (This may take a moment)")
         app = xw.App(visible=False)
@@ -186,9 +196,18 @@ def refresh_excel_formulas(filepath, log_emit):
         except Exception as e:
             log_emit(f"Excel Automation Error: {e}")
         finally:
-            app.quit()
+            try:
+                app.quit()
+            except:
+                pass
     except Exception as e:
         log_emit(f"Could not launch Excel: {e}")
+    finally:
+        # === FIX: Uninitialize COM ===
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
 
 def refine_remarks(remarks_list):
     """Post-process remarks to consolidate messages."""
@@ -456,7 +475,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     idx_dpom_fob = insert_pos
                 else:
                     output_csv_data[header_idx].append("DPOM - Incorrect FOB")
-                    idx_dpom_fob = len(headers) - 1 # Logic slightly tricky for CSV updates in-flight, just appending
+                    idx_dpom_fob = len(headers) - 1
 
             for r_i in range(header_idx + 1, len(rows_read)):
                 row_vals = rows_read[r_i]
