@@ -1,10 +1,12 @@
 import os
 import csv
+import re
 import threading
 import warnings
 from datetime import datetime
 from typing import List, Tuple, Any, Dict, Optional
 
+# GUI Imports
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -16,13 +18,21 @@ from PySide6.QtWidgets import (
     QSizePolicy
 )
 from qfluentwidgets import PrimaryPushButton, MessageBox
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import PatternFill
+
+# Excel Imports
+from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+
+# Excel Automation for Formula Calculation
+try:
+    import xlwings as xw
+    HAS_XLWINGS = True
+except ImportError:
+    HAS_XLWINGS = False
 
 # --- Logic Implementation ---
 
-# Extended Size Order for comparison
+# Extended Size Order for comparison logic
 SIZE_ORDER = [
     "0", "2", "4", "6", "8", "10", "12", "14", "16", "18", "20", "22", "24", "26", "28", "30", "32", "34", "36", "38", "40", "42",
     "2XS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL",
@@ -71,49 +81,181 @@ def safe_float(value):
     except ValueError:
         return 0.0
 
+def normalize_date_str(date_val):
+    """
+    Convert various date formats (datetime obj, 'MM/DD/YYYY', 'YYYY-MM-DD')
+    to standard 'MM/DD/YYYY' string for comparison.
+    """
+    if not date_val:
+        return ""
+
+    if isinstance(date_val, datetime):
+        return date_val.strftime("%m/%d/%Y")
+
+    s_val = str(date_val).strip()
+
+    # Try parsing common formats
+    formats = ["%m/%d/%Y", "%Y-%m-%d", "%d-%b-%y", "%m-%d-%Y"]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(s_val, fmt)
+            return dt.strftime("%m/%d/%Y")
+        except ValueError:
+            continue
+
+    return s_val # Return as is if parsing fails (fallback)
+
+def calculate_target_effective_date(buy_mth_str):
+    """
+    Converts OCCC 'BUY MTH' (e.g., '25-1E', '26-10M') to PPS Effective Date string.
+    Logic:
+    M=1,2,12 -> Dec 1st (Prev year for 1,2; Curr year for 12)
+    M=3,4,5 -> Mar 1st
+    M=6,7,8 -> Jun 1st
+    M=9,10,11 -> Sep 1st
+    """
+    match = re.match(r"(\d{2})-(\d{1,2})", str(buy_mth_str).strip())
+    if not match:
+        return None
+
+    yy = int(match.group(1))
+    m = int(match.group(2))
+
+    year = 2000 + yy
+    target_month = 1
+    target_year = year
+
+    if m in [12, 1, 2]:
+        target_month = 12
+        if m in [1, 2]:
+            target_year = year - 1
+        else:
+            target_year = year
+    elif m in [3, 4, 5]:
+        target_month = 3
+    elif m in [6, 7, 8]:
+        target_month = 6
+    elif m in [9, 10, 11]:
+        target_month = 9
+
+    return f"{target_month:02d}/01/{target_year}"
+
 def is_extended_size(ppm_size_str, occc_threshold_str):
-    """
-    Determine if a size is extended based on the OCCC threshold or TALL logic.
-    """
+    """Determine if a size is extended based on the OCCC threshold or TALL logic."""
     ppm_size = str(ppm_size_str).strip().upper()
-
-    # Rule 1: TALL sizes are usually extended (contain 'T' but usually at end like XLT, MT)
-    # Based on the list, almost all *T or *TT are extended versions.
-    # Logic: If it contains "T" (Tall) it is likely extended, unless threshold logic applies strictly.
-    # The prompt implies checking the tier list logic.
-
-    # If OCCC threshold is empty/dash, usually implies no extended logic or everything is regular
-    # But usually "Extended Sizes" column has something like "3XL" or "4XL".
     threshold = str(occc_threshold_str).strip().upper()
-    if threshold in ["-", "", "NONE", "NA"]:
-        # Fallback: if T in size, might still be extended, but if threshold is undefined,
-        # usually means this style doesn't have the split. assume regular.
+
+    if not ppm_size:
         return False
 
-    # Check indices in SIZE_ORDER
+    if threshold in ["-", "", "NONE", "NA"]:
+        return False
+
     try:
         idx_ppm = SIZE_ORDER.index(ppm_size)
     except ValueError:
-        # Size not in standard list, treat as regular unless it looks like a TALL
+        if "T" in ppm_size:
+            return True
         return False
 
     try:
         idx_threshold = SIZE_ORDER.index(threshold)
     except ValueError:
-        # Threshold not in list?
         return False
 
     return idx_ppm >= idx_threshold
 
+def refresh_excel_formulas(filepath, log_emit):
+    """
+    Uses xlwings to open, calculate, and save the file.
+    This ensures openpyxl reads the calculated formula results instead of None/0.0.
+    """
+    if not HAS_XLWINGS:
+        log_emit("Warning: xlwings not installed. Formulas might read as 0.0.")
+        return False
+
+    try:
+        log_emit(f"Auto-calculating formulas for {os.path.basename(filepath)}... (This may take a moment)")
+        app = xw.App(visible=False)
+        app.display_alerts = False
+        try:
+            wb = app.books.open(filepath)
+            wb.save()
+            wb.close()
+            log_emit("Formulas calculated and file saved.")
+        except Exception as e:
+            log_emit(f"Excel Automation Error: {e}")
+        finally:
+            app.quit()
+    except Exception as e:
+        log_emit(f"Could not launch Excel: {e}")
+
+def refine_remarks(remarks_list):
+    """Post-process remarks to consolidate messages."""
+    if not remarks_list:
+        return []
+
+    s_pps_match_reg = "PPS OFOB match for regular sizes"
+    s_pps_match_ext = "PPS OFOB match for extended sizes"
+    s_pps_miss_reg = "PPS OFOB doesn't match for regular sizes"
+    s_pps_miss_ext = "PPS OFOB doesn't match for extended sizes"
+    s_final_miss_reg = "FINAL FOB (Regular sizes) doesn't match with PPM"
+    s_final_miss_ext = "FINAL FOB (Extended sizes) doesn't match with PPM"
+
+    r_set = set(remarks_list)
+    targets = {s_pps_match_reg, s_pps_match_ext, s_pps_miss_reg, s_pps_miss_ext, s_final_miss_reg, s_final_miss_ext}
+
+    final_list = []
+
+    # 1. Keep unrelated remarks
+    for r in remarks_list:
+        if r not in targets:
+            final_list.append(r)
+
+    # 2. Regular Sizes Logic
+    added_pps_issue_reg = False
+    added_nike_issue_reg = False
+
+    if s_pps_miss_reg in r_set and s_final_miss_reg in r_set:
+        added_pps_issue_reg = True
+    elif s_pps_match_reg in r_set and s_final_miss_reg in r_set:
+        added_nike_issue_reg = True
+    elif s_pps_miss_reg in r_set and s_final_miss_reg not in r_set:
+        added_pps_issue_reg = True
+    elif s_final_miss_reg in r_set:
+        final_list.append(s_final_miss_reg)
+
+    # 3. Extended Sizes Logic
+    added_pps_issue_ext = False
+    added_nike_issue_ext = False
+
+    if s_pps_miss_ext in r_set and s_final_miss_ext in r_set:
+        added_pps_issue_ext = True
+    elif s_pps_match_ext in r_set and s_final_miss_ext in r_set:
+        added_nike_issue_ext = True
+    elif s_pps_miss_ext in r_set and s_final_miss_ext not in r_set:
+        added_pps_issue_ext = True
+    elif s_final_miss_ext in r_set:
+        final_list.append(s_final_miss_ext)
+
+    # 4. Consolidate
+    if added_pps_issue_reg and added_pps_issue_ext:
+        final_list.append("PPS OFOB issue for all sizes")
+    else:
+        if added_pps_issue_reg: final_list.append("PPS OFOB issue for regular sizes")
+        if added_pps_issue_ext: final_list.append("PPS OFOB issue for extended sizes")
+
+    if added_nike_issue_reg and added_nike_issue_ext:
+        final_list.append("NIKE OFOB issue for all sizes")
+    else:
+        if added_nike_issue_reg: final_list.append("NIKE OFOB issue for regular sizes")
+        if added_nike_issue_ext: final_list.append("NIKE OFOB issue for extended sizes")
+
+    return final_list
+
 def load_file_data(path, log_emit) -> Tuple[List[Any], List[List[Any]], Any]:
-    """
-    Load data from Excel or CSV.
-    Returns: (headers, data_rows, workbook_object_if_excel)
-    """
+    """Load data from Excel or CSV."""
     ext = os.path.splitext(path)[1].lower()
-    headers = []
-    data = []
-    wb = None
 
     if ext == '.csv':
         try:
@@ -122,49 +264,39 @@ def load_file_data(path, log_emit) -> Tuple[List[Any], List[List[Any]], Any]:
                 rows = list(reader)
                 if not rows:
                     return [], [], None
-                # Return all rows, logic will determine header row index later
-                return rows, rows, None # CSV returns raw rows as both header source and data
+                return rows, rows, None
         except Exception as e:
             log_emit(f"Error reading CSV {path}: {e}")
             raise e
     elif ext in ['.xlsx', '.xlsm']:
-        wb = load_workbook(path, data_only=True) # Read values for processing
+        wb = load_workbook(path, data_only=True)
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
         return rows, rows, wb
     else:
         raise ValueError("Unsupported file format")
 
-def process_logic(master_files, ppm_files, log_emit, report_emit) -> Tuple[str, int, int]:
+def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> Tuple[str, int, int]:
     success_count = 0
     fail_count = 0
     last_output = ""
 
-    # 1. Parse PPM Files into a Lookup Dictionary
-    # Key: (PO Number, PO Line Item) -> Value: List of row dicts containing costs & sizes
+    # --- 1. Parse PPM Files ---
     ppm_lookup = {}
-
     log_emit("Parsing PPM Files...")
-
     for ppm_path in ppm_files:
         try:
             rows, raw_data, _ = load_file_data(ppm_path, log_emit)
-            if not rows:
-                continue
+            if not rows: continue
 
-            # Header is usually row 1 (index 0)
             header_row_idx = 0
             headers = [str(c) for c in rows[header_row_idx]]
-
-            # Map columns
-            # Required: PO, Line Item, Size Desc
-            # Costs: Min Mat Main, Min Mat Trim, Min Prod, Misc, VAS, Gross FOB
 
             col_po = get_col_index(headers, ["Purchase Order Number", "TC PO (85/58)"])
             col_line = get_col_index(headers, ["PO Line Item Number", "PO LINE ITEM"])
             col_size = get_col_index(headers, ["Size Description"])
 
-            # Cost columns
+            # Costs
             col_ag = get_col_index(headers, ["Surcharge Min Mat Main Body"])
             col_ai = get_col_index(headers, ["Surcharge Min Material Trim"])
             col_ak = get_col_index(headers, ["Surcharge Min Productivity"])
@@ -173,24 +305,17 @@ def process_logic(master_files, ppm_files, log_emit, report_emit) -> Tuple[str, 
             col_aq = get_col_index(headers, ["Gross Price/FOB"])
 
             if col_po == -1 or col_line == -1:
-                log_emit(f"Skipping PPM {os.path.basename(ppm_path)}: Missing PO/Line headers.")
                 continue
 
             for r_idx in range(header_row_idx + 1, len(rows)):
                 row = rows[r_idx]
                 if not row: continue
 
-                # Extract Keys
                 po_num = str(row[col_po]).strip()
-                # Handle line item being integer or float (e.g. 10.0 -> 10)
-                try:
-                    line_item = str(int(float(row[col_line])))
-                except:
-                    line_item = str(row[col_line]).strip()
-
+                try: line_item = str(int(float(row[col_line])))
+                except: line_item = str(row[col_line]).strip()
                 key = (po_num, line_item)
 
-                # Extract Costs
                 costs = {
                     'ag': safe_float(row[col_ag]) if col_ag != -1 else 0.0,
                     'ai': safe_float(row[col_ai]) if col_ai != -1 else 0.0,
@@ -201,39 +326,76 @@ def process_logic(master_files, ppm_files, log_emit, report_emit) -> Tuple[str, 
                     'size': str(row[col_size]).strip() if col_size != -1 else ""
                 }
 
-                if key not in ppm_lookup:
-                    ppm_lookup[key] = []
+                if key not in ppm_lookup: ppm_lookup[key] = []
                 ppm_lookup[key].append(costs)
-
         except Exception as e:
             log_emit(f"Error parsing PPM {os.path.basename(ppm_path)}: {e}")
 
-    log_emit(f"PPM Data Loaded. Found {len(ppm_lookup)} unique PO Lines.")
+    # --- 2. Parse PPS Files ---
+    pps_lookup = {}
+    log_emit("Parsing PPS Files...")
+    for pps_path in pps_files:
+        try:
+            rows, raw_data, _ = load_file_data(pps_path, log_emit)
+            if not rows: continue
 
-    # 2. Process OCCC Files
+            headers = [str(c) for c in rows[0]]
+
+            col_style = get_col_index(headers, ["STYLE"])
+            col_eff_date = get_col_index(headers, ["EFFECTIVE_DATE"])
+            col_color = get_col_index(headers, ["COLOR"])
+            col_size_data = get_col_index(headers, ["SIZE_DATA"])
+            col_quote = get_col_index(headers, ["LOCAL_QUOTE_AMOUNT"])
+
+            if col_style == -1 or col_eff_date == -1:
+                continue
+
+            for r_idx in range(1, len(rows)):
+                row = rows[r_idx]
+                if not row: continue
+
+                style = str(row[col_style]).strip()
+                eff_date = normalize_date_str(row[col_eff_date])
+
+                if not style or not eff_date:
+                    continue
+
+                color = str(row[col_color]).strip() if col_color != -1 and row[col_color] is not None else ""
+                size_data = str(row[col_size_data]).strip() if col_size_data != -1 and row[col_size_data] is not None else ""
+                quote = safe_float(row[col_quote]) if col_quote != -1 else 0.0
+
+                key = (style, eff_date)
+                entry = {'color': color, 'size_data': size_data, 'quote': quote}
+
+                if key not in pps_lookup: pps_lookup[key] = []
+                pps_lookup[key].append(entry)
+
+        except Exception as e:
+            log_emit(f"Error parsing PPS {os.path.basename(pps_path)}: {e}")
+
+    log_emit(f"PPS Data Loaded. Found {len(pps_lookup)} Style/Date keys.")
+
+    # --- 3. Process OCCC Files ---
     for occc_path in master_files:
         try:
-            log_emit(f"Processing Master: {os.path.basename(occc_path)}")
+            # === xlwings Magic: Calculate Formulas ===
+            if occc_path.lower().endswith(('.xlsx', '.xlsm')):
+                refresh_excel_formulas(occc_path, log_emit)
 
-            # We need the Workbook object to save editable Excel
+            log_emit(f"Processing Master: {os.path.basename(occc_path)}")
             is_excel = occc_path.lower().endswith(('.xlsx', '.xlsm'))
 
             if is_excel:
-                # Load twice: one data_only for reading values, one normal for writing
                 wb_read = load_workbook(occc_path, data_only=True)
                 ws_read = wb_read.active
-                rows_read = list(ws_read.values) # Tuple of tuples
-
+                rows_read = list(ws_read.values)
                 wb_write = load_workbook(occc_path, data_only=False)
                 ws_write = wb_write.active
             else:
-                # CSV
                 rows_read, _, _ = load_file_data(occc_path, log_emit)
-                # Prepare data for CSV write later
                 output_csv_data = [list(r) for r in rows_read]
-                ws_write = None # No worksheet object for CSV
+                ws_write = None
 
-            # Header is Row 3 (Index 2)
             header_idx = 2
             if len(rows_read) <= header_idx:
                 log_emit(f"Master file too short.")
@@ -242,197 +404,170 @@ def process_logic(master_files, ppm_files, log_emit, report_emit) -> Tuple[str, 
 
             headers = [str(x) for x in rows_read[header_idx]]
 
-            # Map OCCC Columns
+            # Map Columns
             idx_nk_po = get_col_index(headers, ["NK SAP PO (45/35)", "NK SAP PO"])
-            idx_tc_po = get_col_index(headers, ["TC PO (85/58)"])
             idx_line = get_col_index(headers, ["PO LINE ITEM"])
-
-            # OCCC Target Columns for Comparison
             idx_ave_fob = get_col_index(headers, ["AVE FOB ON DPOM"])
 
-            # Individual Surcharges in OCCC
             idx_sc_min_prod = get_col_index(headers, ["S/C Min Production (ZPMX)"])
             idx_sc_min_mat = get_col_index(headers, ["S/C Min Material (ZMMX)"])
+            idx_sc_min_mat_comment = get_col_index(headers, ["S/C Min Material (ZMMX) Comment"])
             idx_sc_misc = get_col_index(headers, ["S/C Misc (ZMSX)"])
+            idx_sc_misc_comment = get_col_index(headers, ["S/C Misc (ZMSX) Comment"])
             idx_sc_vas = get_col_index(headers, ["S/C VAS Manual (ZVAX)"])
 
-            # FOBs
+            idx_style = get_col_index(headers, ["STYLE"])
+            idx_buy_mth = get_col_index(headers, ["BUY MTH"])
+            idx_cw = get_col_index(headers, ["CW"])
+
+            idx_ofob_reg = get_col_index(headers, ["OFOB (Regular sizes)"])
+            idx_ofob_ext = get_col_index(headers, ["OFOB (Extended sizes)"])
             idx_final_reg = get_col_index(headers, ["FINAL FOB (Regular sizes)"])
             idx_final_ext = get_col_index(headers, ["FINAL FOB (Extended sizes)", "FINAL FOB (Extended sizes) (2)"])
             idx_ext_sizes_def = get_col_index(headers, ["Extended Sizes"])
-
-            # Remarks Column
             idx_remarks = get_col_index(headers, ["PRICE DIFF REMARKS"])
 
+            # Init Header for Remarks
             if idx_remarks == -1:
-                # Insert new column after AVE FOB ON DPOM if possible, else at end
-                insert_pos = idx_ave_fob + 1 if idx_ave_fob != -1 else len(headers)
-
+                ref_col = idx_ave_fob if idx_ave_fob != -1 else len(headers) - 1
+                insert_pos = ref_col + 1
                 if is_excel:
-                    ws_write.insert_cols(insert_pos + 1) # 1-based index
+                    ws_write.insert_cols(insert_pos + 1)
                     ws_write.cell(row=header_idx+1, column=insert_pos+1).value = "PRICE DIFF REMARKS"
                     idx_remarks = insert_pos
-                    # Adjust read indices that are after insertion point?
-                    # Since we use `rows_read` loaded before insertion, indices reference original state.
-                    # But writing needs to account for shift.
-                    # Easier strategy: Append to end to avoid index shifting headaches in complex sheets
-                    pass
                 else:
                     output_csv_data[header_idx].append("PRICE DIFF REMARKS")
                     idx_remarks = len(headers)
 
-            # Re-evaluate logic: simple append to end is safer for logic simplicity
-            # But prompt suggests "after AVE FOB".
-            # To strictly follow "replace input", let's just use the column if exists, or append to end.
-
-            # Iterate Data Rows
             for r_i in range(header_idx + 1, len(rows_read)):
                 row_vals = rows_read[r_i]
                 if not row_vals: continue
 
-                # Get Keys (Try NK PO first, then TC PO if needed, usually NK is key)
+                remarks = []
+
+                # --- PPM Comparison ---
                 po_val = str(row_vals[idx_nk_po]).strip() if idx_nk_po != -1 else ""
                 line_val = ""
                 if idx_line != -1:
-                    try:
-                        line_val = str(int(float(row_vals[idx_line])))
-                    except:
-                        line_val = str(row_vals[idx_line]).strip()
+                    try: line_val = str(int(float(row_vals[idx_line])))
+                    except: line_val = str(row_vals[idx_line]).strip()
 
-                if not po_val or not line_val:
-                    continue
+                if po_val and line_val:
+                    ppm_entries = ppm_lookup.get((po_val, line_val))
+                    if ppm_entries:
+                        # Avg calc for surcharges
+                        sum_ag = sum_ai = sum_am = sum_ao = 0.0
+                        count = len(ppm_entries)
+                        for entry in ppm_entries:
+                            sum_ag += entry['ag']
+                            sum_ai += entry['ai']
+                            sum_am += entry['am']
+                            sum_ao += entry['ao']
 
-                lookup_key = (po_val, line_val)
-                ppm_entries = ppm_lookup.get(lookup_key)
+                        ave_ppm_ag = sum_ag / count if count else 0.0
+                        ave_ppm_ai = sum_ai / count if count else 0.0
+                        ave_ppm_am = sum_am / count if count else 0.0
+                        ave_ppm_ao = sum_ao / count if count else 0.0
 
-                if not ppm_entries:
-                    # report_emit(f"No PPM data for PO {po_val} Line {line_val}")
-                    continue
+                        # Surcharge Checks
+                        if abs(safe_float(row_vals[idx_sc_min_prod]) - ave_ppm_ag) > 0.00:
+                            remarks.append("S/C MIN PRODUCTION (ZPMX) doesn't match")
 
-                # --- COMPARISON LOGIC ---
-                remarks = []
+                        # Min Mat
+                        occc_zmmx = safe_float(row_vals[idx_sc_min_mat])
+                        zmmx_cmt = str(row_vals[idx_sc_min_mat_comment]).strip().upper() if idx_sc_min_mat_comment != -1 and row_vals[idx_sc_min_mat_comment] else ""
+                        if zmmx_cmt != "DN" and abs(occc_zmmx - ave_ppm_ai) > 0.00:
+                            remarks.append("S/C Min Material (ZMMX) doesn't match")
 
-                # 1. Calculate PPM Average FOB
-                total_sum_fob = 0.0
+                        # Misc
+                        occc_zmsx = safe_float(row_vals[idx_sc_misc])
+                        zmsx_cmt = str(row_vals[idx_sc_misc_comment]).strip().upper() if idx_sc_misc_comment != -1 and row_vals[idx_sc_misc_comment] else ""
+                        if zmsx_cmt != "DN" and abs(occc_zmsx - ave_ppm_am) > 0.00:
+                            remarks.append("S/C Misc (ZMSX) doesn't match")
 
-                # Summing all components for average
-                # PPM columns: AG(Main) + AI(Trim) + AK(Prod) + AM(Misc) + AO(VAS) + AQ(Gross)
-                sum_ag = 0.0
-                sum_ai = 0.0
-                sum_am = 0.0
-                sum_ao = 0.0
-                count = len(ppm_entries)
+                        if abs(safe_float(row_vals[idx_sc_vas]) - ave_ppm_ao) > 0.00:
+                            remarks.append("S/C VAS Manual (ZVAX) doesn't match")
 
-                for entry in ppm_entries:
-                    row_total = (entry['ag'] + entry['ai'] + entry['ak'] +
-                                 entry['am'] + entry['ao'] + entry['aq'])
-                    total_sum_fob += row_total
+                        # Final FOB Checks
+                        ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
+                        occc_final_reg = safe_float(row_vals[idx_final_reg]) if idx_final_reg != -1 else 0.0
+                        occc_final_ext = safe_float(row_vals[idx_final_ext]) if idx_final_ext != -1 else 0.0
 
-                    sum_ag += entry['ag']
-                    sum_ai += entry['ai']
-                    sum_am += entry['am']
-                    sum_ao += entry['ao']
+                        for entry in ppm_entries:
+                            ppm_total = round(entry['ag'] + entry['ai'] + entry['ak'] +
+                                              entry['am'] + entry['ao'] + entry['aq'], 2)
+                            is_ext = is_extended_size(entry['size'], ext_threshold)
+                            target_fob = round(occc_final_ext if is_ext else occc_final_reg, 2)
 
-                ave_ppm_fob = total_sum_fob / count if count > 0 else 0.0
-                ave_ppm_ag = sum_ag / count if count > 0 else 0.0
-                ave_ppm_ai = sum_ai / count if count > 0 else 0.0
-                ave_ppm_am = sum_am / count if count > 0 else 0.0
-                ave_ppm_ao = sum_ao / count if count > 0 else 0.0
+                            if ppm_total > 0 and abs(target_fob - ppm_total) > 0.00:
+                                lbl = "Extended" if is_ext else "Regular"
+                                # Debug Logging
+                                log_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {target_fob} vs PPM {ppm_total}")
+                                remarks.append(f"FINAL FOB ({lbl} sizes) doesn't match with PPM")
+                                break
 
-                # 2. Check Average FOB against OCCC
-                occc_ave_fob = safe_float(row_vals[idx_ave_fob]) if idx_ave_fob != -1 else 0.0
+                # --- PPS Comparison ---
+                style_val = str(row_vals[idx_style]).strip() if idx_style != -1 else ""
+                buy_mth_val = str(row_vals[idx_buy_mth]).strip() if idx_buy_mth != -1 else ""
+                cw_val = str(row_vals[idx_cw]).strip() if idx_cw != -1 else ""
 
-                fob_diff = abs(occc_ave_fob - ave_ppm_fob)
-                is_avg_match = fob_diff < 0.02 # Tolerance
+                if style_val and buy_mth_val:
+                    target_date = calculate_target_effective_date(buy_mth_val)
+                    if target_date:
+                        pps_candidates = pps_lookup.get((style_val, target_date))
+                        if pps_candidates:
+                            matched_rows = [r for r in pps_candidates if r['color'] == cw_val]
+                            if not matched_rows: matched_rows = [r for r in pps_candidates if not r['color']]
 
-                if not is_avg_match:
-                    # "Ave. FOB doesn't match" - Proceed to check components
-                    remarks.append(f"Ave. FOB doesn't match (OCCC:{occc_ave_fob:.2f} vs PPM:{ave_ppm_fob:.2f})")
+                            if not matched_rows:
+                                remarks.append("No matching PPS (Color)")
+                            else:
+                                # Regular
+                                reg_match = next((r for r in matched_rows if not r['size_data']), None)
+                                occc_ofob_reg = safe_float(row_vals[idx_ofob_reg])
+                                if reg_match:
+                                    if abs(reg_match['quote'] - occc_ofob_reg) <= 0.02:
+                                        remarks.append("PPS OFOB match for regular sizes")
+                                    else:
+                                        remarks.append("PPS OFOB doesn't match for regular sizes")
+                                elif occc_ofob_reg > 0:
+                                    remarks.append("PPS OFOB missing regular size entry")
 
-                    # Check Components
-                    # OCCC ZPMX vs PPM AG (Min Prod? Prompt says PPM AG is Min Mat Main??)
-                    # Prompt Mapping:
-                    # OCCC ZPMX <-> PPM AG (Surcharge Min Mat Main Body)
-                    # OCCC ZMMX <-> PPM AI (Surcharge Min Material Trim)
-                    # OCCC ZMSX <-> PPM AM (Surcharge Misc)
-                    # OCCC ZVAX <-> PPM AO (Surcharge VAS)
-
-                    occc_zpmx = safe_float(row_vals[idx_sc_min_prod]) if idx_sc_min_prod != -1 else 0.0
-                    if abs(occc_zpmx - ave_ppm_ag) > 0.02:
-                        remarks.append(f"S/C MIN PRODUCTION (ZPMX) doesn't match")
-
-                    occc_zmmx = safe_float(row_vals[idx_sc_min_mat]) if idx_sc_min_mat != -1 else 0.0
-                    if abs(occc_zmmx - ave_ppm_ai) > 0.02:
-                        remarks.append(f"S/C Min Material (ZMMX) doesn't match")
-
-                    occc_zmsx = safe_float(row_vals[idx_sc_misc]) if idx_sc_misc != -1 else 0.0
-                    if abs(occc_zmsx - ave_ppm_am) > 0.02:
-                        remarks.append(f"S/C Misc (ZMSX) doesn't match")
-
-                    occc_zvax = safe_float(row_vals[idx_sc_vas]) if idx_sc_vas != -1 else 0.0
-                    if abs(occc_zvax - ave_ppm_ao) > 0.02:
-                        remarks.append(f"S/C VAS Manual (ZVAX) doesn't match")
-
-                # 3. Check Final FOB per Size (Regular vs Extended)
-                # OCCC Threshold
-                ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
-
-                occc_final_reg = safe_float(row_vals[idx_final_reg]) if idx_final_reg != -1 else 0.0
-                occc_final_ext = safe_float(row_vals[idx_final_ext]) if idx_final_ext != -1 else 0.0
-
-                size_mismatch_found = False
-
-                for entry in ppm_entries:
-                    ppm_total_fob = (entry['ag'] + entry['ai'] + entry['ak'] +
-                                     entry['am'] + entry['ao'] + entry['aq'])
-
-                    is_ext = is_extended_size(entry['size'], ext_threshold)
-
-                    target_occc_fob = occc_final_ext if is_ext else occc_final_reg
-                    # Usually Extended FOB is 0 if no extended sizes exist, handle that?
-                    # If target is 0 and ppm is not 0, it's a mismatch.
-
-                    if abs(target_occc_fob - ppm_total_fob) > 0.02:
-                        lbl = "Extended" if is_ext else "Regular"
-                        remarks.append(f"FINAL FOB ({lbl} sizes) doesn't match")
-                        size_mismatch_found = True
-                        break # Stop checking other sizes if one fails to avoid spamming remarks
-
-                # Write Remarks
-                if remarks:
-                    final_remark = "; ".join(remarks)
-
-                    if is_excel:
-                        # Write to Excel
-                        # Check if column existed or we append
-                        if idx_remarks >= len(headers):
-                             # Column was appended virtually, need to ensure column exists in sheet
-                             # For simplicity in this logic, we write to the calculated column index + 1 (1-based)
-                             cell = ws_write.cell(row=r_i + 1, column=ws_write.max_column + 1)
-                             # This appends a new column every row if not careful.
-                             # Better: define column index fixed.
-                             # If we didn't find the header, we assume column index is len(headers) (0-based)
-                             # So 1-based is len(headers)+1
-                             target_col = len(headers) + 1
-                             # Update header if first time (check r_i == header_idx + 1 is risky if we skipped rows)
-                             if ws_write.cell(row=header_idx+1, column=target_col).value != "PRICE DIFF REMARKS":
-                                 ws_write.cell(row=header_idx+1, column=target_col).value = "PRICE DIFF REMARKS"
-                             ws_write.cell(row=r_i+1, column=target_col).value = final_remark
+                                # Extended
+                                ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
+                                occc_ofob_ext = safe_float(row_vals[idx_ofob_ext])
+                                if ext_threshold not in ["-", "", "NONE", "NA"] or occc_ofob_ext > 0:
+                                    ext_match = next((r for r in matched_rows if is_extended_size(r['size_data'], ext_threshold)), None)
+                                    if ext_match:
+                                        if abs(ext_match['quote'] - occc_ofob_ext) <= 0.02:
+                                            remarks.append("PPS OFOB match for extended sizes")
+                                        else:
+                                            remarks.append("PPS OFOB doesn't match for extended sizes")
+                                    elif occc_ofob_ext > 0:
+                                        remarks.append("PPS OFOB missing extended size entry")
                         else:
-                            # Existing column
-                            ws_write.cell(row=r_i+1, column=idx_remarks+1).value = final_remark
-
-                        # Highlight row? (Optional, per "skeleton" usually implies just logic)
+                            remarks.append("No matching PPS found")
                     else:
-                        # CSV
-                        if idx_remarks >= len(headers):
-                            # Append to row
-                            output_csv_data[r_i].append(final_remark)
-                        else:
-                            output_csv_data[r_i][idx_remarks] = final_remark
+                        remarks.append("Invalid BUY MTH format")
 
-            # Save Output
-            # "output occc replaces the input occc" -> Overwrite
+                # --- Post-Processing ---
+                if remarks:
+                    remarks = refine_remarks(remarks)
+
+                # --- Write Output (Clearing old if empty) ---
+                final_remark = "; ".join(remarks) if remarks else ""
+
+                if is_excel:
+                    target_col_idx = idx_remarks + 1
+                    if ws_write.cell(row=header_idx+1, column=target_col_idx).value != "PRICE DIFF REMARKS":
+                        ws_write.cell(row=header_idx+1, column=target_col_idx).value = "PRICE DIFF REMARKS"
+                    ws_write.cell(row=r_i+1, column=target_col_idx).value = final_remark
+                else:
+                    if idx_remarks >= len(output_csv_data[r_i]):
+                        output_csv_data[r_i].append(final_remark)
+                    else:
+                        output_csv_data[r_i][idx_remarks] = final_remark
+
             if is_excel:
                 wb_write.save(occc_path)
             else:
@@ -514,7 +649,6 @@ class MainWidget(QWidget):
         self.log_box.setStyleSheet(shared_style)
 
         main_layout = QVBoxLayout(self)
-
         main_layout.addWidget(self.desc_label)
 
         row1 = QHBoxLayout()
@@ -582,11 +716,15 @@ class MainWidget(QWidget):
     def run_process(self):
         master_files = self.get_files_from_box(self.master_files_box)
         ppm_files = self.get_files_from_box(self.ppm_files_box)
-        pps_files = self.get_files_from_box(self.pps_files_box) # Logic to be added later
+        pps_files = self.get_files_from_box(self.pps_files_box)
 
-        if not master_files or not ppm_files:
-            MessageBox("Warning", "Please select OCCC Master and PPM files.", self).exec()
+        if not master_files:
+            MessageBox("Warning", "Please select OCCC Master file.", self).exec()
             return
+
+        if not ppm_files and not pps_files:
+             MessageBox("Warning", "Please select at least one report file (PPM or PPS).", self).exec()
+             return
 
         self.log_box.clear()
         self.reports_box.clear()
@@ -599,8 +737,7 @@ class MainWidget(QWidget):
 
         def worker():
             try:
-                # We currently ignore PPS in processing as per instruction "this is it for now for PPM"
-                last_file, ok, fail = process_logic(master_files, ppm_files, self.log_message.emit, self.report_message.emit)
+                last_file, ok, fail = process_logic(master_files, ppm_files, pps_files, self.log_message.emit, self.report_message.emit)
                 self.processing_done.emit(ok, fail, last_file)
             except Exception as e:
                 self.log_message.emit(f"CRITICAL ERROR: {e}")
@@ -625,3 +762,17 @@ class MainWidget(QWidget):
 
 def get_widget():
     return MainWidget()
+
+# - If value contains "PPS OFOB match for extended sizes" but not accompanied with "FINAL FOB (Extended sizes) doesn't match", replace the "PPS OFOB match for extended sizes" with ""
+# - If value contains "PPS OFOB match for regular sizes" but not accompanied with "FINAL FOB (Regular sizes) doesn't match", replace the "PPS OFOB match for regular sizes" with ""
+# - If value contains "PPS OFOB match for extended sizes" but not accompanied with "FINAL FOB (Extended sizes) doesn't match", replace the "PPS OFOB match for extended sizes" with ""
+# - If value contains "PPS OFOB doesn't match for regular sizes" and accompanied with "FINAL FOB (Regular sizes) doesn't match", replace them both with a single "PPS OFOB issue for regular sizes"
+# - If value contains "PPS OFOB doesn't match for extended sizes" and accompanied with "FINAL FOB (Extended sizes) doesn't match", replace them both with a single "PPS OFOB issue for extended sizes"
+# - If value contains "PPS OFOB match for regular sizes" and accompanied with "FINAL FOB (Regular sizes) doesn't match", replace them both with a single "NIKE OFOB issue for regular sizes"
+# - If value contains "PPS OFOB match for extended sizes" and accompanied with "FINAL FOB (Extended sizes) doesn't match", replace them both with a single "NIKE OFOB issue for extended sizes"
+# - If value contains "PPS OFOB doesn't match for regular sizes" and not accompanied with "FINAL FOB (Regular sizes) doesn't match", replace it with a single "PPS OFOB issue for regular sizes"
+# - If value contains "PPS OFOB doesn't match for extended sizes" and not accompanied with "FINAL FOB (Extended sizes) doesn't match", replace it with a single "PPS OFOB issue for extended sizes"
+
+# once all that is process, do another pass for the following:
+# - If value contains "PPS OFOB issue for regular sizes" and accompanied with "PPS OFOB issue for extended sizes", replace them both with a single "PPS OFOB issue for all sizes"
+# - If value contains "NIKE OFOB issue for regular sizes" and accompanied with "NIKE OFOB issue for extended sizes", replace them both with a single "NIKE OFOB issue for all sizes"

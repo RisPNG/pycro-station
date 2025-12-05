@@ -1,3 +1,3 @@
 PySide6
-PySide6-Fluent-Widgets
+PySide6-Fluent-Widgets[full]
 pytablericons
