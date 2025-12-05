@@ -26,8 +26,6 @@ from openpyxl.utils import get_column_letter
 # Excel Automation for Formula Calculation
 try:
     import xlwings as xw
-    # pythoncom is part of pywin32, required for threading with Excel on Windows
-    import pythoncom
     HAS_XLWINGS = True
 except ImportError:
     HAS_XLWINGS = False
@@ -176,14 +174,6 @@ def refresh_excel_formulas(filepath, log_emit):
         log_emit("Warning: xlwings not installed. Formulas might read as 0.0.")
         return False
 
-    # === FIX: Initialize COM for Threading ===
-    try:
-        pythoncom.CoInitialize()
-    except Exception:
-        # On some systems or if already initialized, this might fail or not be needed.
-        pass
-    # =========================================
-
     try:
         log_emit(f"Auto-calculating formulas for {os.path.basename(filepath)}... (This may take a moment)")
         app = xw.App(visible=False)
@@ -202,12 +192,6 @@ def refresh_excel_formulas(filepath, log_emit):
                 pass
     except Exception as e:
         log_emit(f"Could not launch Excel: {e}")
-    finally:
-        # === FIX: Uninitialize COM ===
-        try:
-            pythoncom.CoUninitialize()
-        except:
-            pass
 
 def refine_remarks(remarks_list):
     """Post-process remarks to consolidate messages."""
@@ -299,6 +283,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
     success_count = 0
     fail_count = 0
     last_output = ""
+    row_emit = report_emit if callable(report_emit) else log_emit
 
     # --- 1. Parse PPM Files ---
     ppm_lookup = {}
@@ -549,7 +534,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
 
                                 # Add to Remarks (Only once per row to avoid clutter)
                                 if not fob_mismatch_found:
-                                    log_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {target_fob} vs PPM {ppm_total}")
+                                    row_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {target_fob} vs PPM {ppm_total}")
                                     remarks.append(f"FINAL FOB ({lbl} sizes) doesn't match with PPM")
                                     fob_mismatch_found = True
 
@@ -828,6 +813,15 @@ class MainWidget(QWidget):
         self.select_master_btn.setEnabled(True)
         self.select_ppm_btn.setEnabled(True)
         self.select_pps_btn.setEnabled(True)
+
+        title = "Process complete" if fail == 0 else "Process finished with issues"
+        lines = [f"Success: {ok}", f"Failed: {fail}"]
+        if last_file:
+            lines.append(f"Last processed: {last_file}")
+        msg = MessageBox(title, "\n".join(lines), self)
+        msg.yesButton.setText("OK")
+        msg.cancelButton.hide()
+        msg.exec()
 
 def get_widget():
     return MainWidget()
