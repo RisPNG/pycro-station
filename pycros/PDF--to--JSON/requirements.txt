@@ -1,6 +1,0 @@
-
-
-openpyxl
-xlrd
-chandra-ocr
-pdf2image
