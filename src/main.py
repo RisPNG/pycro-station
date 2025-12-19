@@ -25,6 +25,95 @@ from PycroGrid import PycroGrid
 from PackagesPage import PackagesPage, CheckIconButton
 from TitleBar import CustomTitleBar
 
+
+class AnimatedStackedWidget(QStackedWidget):
+    """QStackedWidget with fly-up (load) transitions."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Match the MSFluentWindow default "fly up" feel for consistency
+        self._duration = 300  # milliseconds
+        self._offset = 76
+        self._slideAnimation = None
+
+    def _stop_animations(self):
+        anim = getattr(self, "_slideAnimation", None)
+        if anim is None:
+            return
+        try:
+            anim.stop()
+        except Exception:
+            pass
+        try:
+            anim.deleteLater()
+        except Exception:
+            pass
+        self._slideAnimation = None
+
+    def setCurrentWidgetNoAnimation(self, widget):
+        """Switch immediately (no animation)."""
+        if widget is None:
+            return
+        if self.indexOf(widget) == -1:
+            self.addWidget(widget)
+        self._stop_animations()
+        super().setCurrentWidget(widget)
+        try:
+            widget.move(0, 0)
+        except Exception:
+            pass
+
+    def setCurrentWidget(self, widget):
+        """Switch to widget with fly-up (load) animation."""
+        if widget is None:
+            return
+        current = self.currentWidget()
+        if current is widget:
+            return
+
+        # Ensure widget is in the stack
+        if self.indexOf(widget) == -1:
+            self.addWidget(widget)
+
+        # Skip animation if not visible (e.g. selecting a tab while sidebar is active)
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            self.setCurrentWidgetNoAnimation(widget)
+            return
+
+        self._stop_animations()
+
+        super().setCurrentWidget(widget)
+
+        # Fly-up the new widget (load)
+        try:
+            widget.move(0, self._offset)
+        except Exception:
+            pass
+
+        self._slideAnimation = QPropertyAnimation(widget, b"pos", self)
+        self._slideAnimation.setDuration(self._duration)
+        self._slideAnimation.setStartValue(QPoint(0, self._offset))
+        self._slideAnimation.setEndValue(QPoint(0, 0))
+        self._slideAnimation.setEasingCurve(QEasingCurve.OutQuad)
+        slide_anim = self._slideAnimation
+
+        def _cleanup_slide():
+            try:
+                slide_anim.deleteLater()
+            except Exception:
+                pass
+            if self._slideAnimation is slide_anim:
+                self._slideAnimation = None
+
+        self._slideAnimation.finished.connect(_cleanup_slide)
+        self._slideAnimation.start()
+
+    def setCurrentIndex(self, index):
+        """Switch to index with fly-up (load) animation."""
+        widget = self.widget(index)
+        if widget:
+            self.setCurrentWidget(widget)
+
 class Settings(QWidget):
     updateFinished = Signal(bool, str)
 
@@ -359,6 +448,14 @@ class Window(MSFluentWindow):
         self.homeInterface.setFrameShape(QFrame.NoFrame)
         self.homeInterface.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.homeInterface.setStyleSheet("background: transparent;")
+
+        # Separate container for macro tab content (disconnected from Hub navigation)
+        self.tabsInterface = AnimatedStackedWidget(self)
+        self.tabsInterface.setObjectName('tabsInterface')
+        self.tabsInterface.setFrameShape(QFrame.NoFrame)
+        self.tabsInterface.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.tabsInterface.setStyleSheet("background: transparent;")
+
         self.settingsInterface = Settings(self)
         self.settingsInterface.setObjectName("settingsInterface")
         # No initial tabs; Hub shows the grid
@@ -373,14 +470,8 @@ class Window(MSFluentWindow):
             self.settingsInterface.run_update_on_launch_if_enabled()
         except Exception:
             pass
-        # Keep Hub/tab selection mutually exclusive
+        # Disable tab highlight when switching to navigation items
         self.stackedWidget.currentChanged.connect(self.onContentChanged)
-        # Hub active: keep last tab selection internally; hide its highlight
-        # Also disable tab highlight when Hub is active
-        try:
-            self.titleBar.setTabsSelectionHighlightEnabled(False)
-        except Exception:
-            pass
         # initialize packages lock state
         try:
             self.packagesPage.setLocked(False)
@@ -396,11 +487,6 @@ class Window(MSFluentWindow):
 
         ))))
         self.addSubInterface(self.homeInterface, hub, 'Hub', hub, NavigationItemPosition.TOP)
-        # Ensure clicking Hub also switches inner stack back to the grid view
-        try:
-            self.navigationInterface.widget(self.homeInterface.objectName()).clicked.connect(self.showHub)
-        except Exception:
-            pass
         # Packages page button under Hub
         ti_pkg = QIcon(QPixmap.fromImage(ImageQt(TablerIcons.load(
             OutlineIcon.PLAYLIST_X,
@@ -429,6 +515,9 @@ class Window(MSFluentWindow):
         self.hubGrid = PycroGrid(self)
         self.homeInterface.addWidget(self.hubGrid)
         self.homeInterface.setCurrentWidget(self.hubGrid)
+
+        # Add tabsInterface to stackedWidget (not to navigation - keeps it disconnected)
+        self.stackedWidget.addWidget(self.tabsInterface)
 
         # Select Hub in navigation
         self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
@@ -466,19 +555,9 @@ class Window(MSFluentWindow):
         )
 
     def showHub(self):
-        """Switch to the Hub (inner grid) regardless of current tab state."""
-        try:
-            self.switchTo(self.homeInterface)
-        except Exception:
-            self.stackedWidget.setCurrentWidget(self.homeInterface)
-        try:
-            self.homeInterface.setCurrentWidget(self.hubGrid)
-        except Exception:
-            pass
-        try:
-            self.titleBar.setTabsSelectionHighlightEnabled(False)
-        except Exception:
-            pass
+        """Switch to the Hub grid view."""
+        self.switchTo(self.homeInterface)
+        self.homeInterface.setCurrentWidget(self.hubGrid)
 
     def showMessageBox(self):
         w = MessageBox(
@@ -497,21 +576,15 @@ class Window(MSFluentWindow):
             QDesktopServices.openUrl(QUrl("https://github.com/rispng/"))
 
     def onTabChanged(self, index: int):
-        # Switch content area to the selected macro page (robust)
+        # Switch content area to the selected macro page
         try:
             routeKey = self.tabBar.currentTab().routeKey()
         except Exception:
             return
         self._show_macro_page(routeKey)
-        # When a tab is active, deselect sidebar items so the tab highlight is clear
-        try:
-            self._deselect_navigation()
-            self.titleBar.setTabsSelectionHighlightEnabled(True)
-        except Exception:
-            pass
 
     def onTabClicked(self, index: int):
-        """Handle clicks on the current tab to re-activate its content when Hub is active."""
+        """Handle clicks on the current tab to re-activate its content."""
         # Try to derive routeKey from the tab label
         routeKey = None
         try:
@@ -529,33 +602,38 @@ class Window(MSFluentWindow):
             except Exception:
                 return
         self._show_macro_page(routeKey)
-        try:
-            self._deselect_navigation()
-            self.titleBar.setTabsSelectionHighlightEnabled(True)
-        except Exception:
-            pass
 
     def _show_macro_page(self, routeKey: str):
         """Ensure the macro page is in the stack and visible."""
         page = self.macro_pages.get(routeKey)
         if page is None:
             return
-        # Ensure page is in homeInterface and visible
+        # Ensure page is in tabsInterface and visible
         try:
-            if self.homeInterface.indexOf(page) == -1:
-                self.homeInterface.addWidget(page)
+            if self.tabsInterface.indexOf(page) == -1:
+                self.tabsInterface.addWidget(page)
         except Exception:
             pass
+        # If coming from a different interface, preselect the page without animating
+        # (the main switch animation will handle the transition).
         try:
-            self.stackedWidget.setCurrentWidget(self.homeInterface)
+            from_other_interface = self.stackedWidget.currentWidget() is not self.tabsInterface
         except Exception:
-            pass
-        self.homeInterface.setCurrentWidget(page)
-        # ensure highlight is visible and hub deselected
-        try:
-            self.titleBar.setTabsSelectionHighlightEnabled(True)
-        except Exception:
-            pass
+            from_other_interface = True
+
+        if from_other_interface:
+            try:
+                self.tabsInterface.setCurrentWidgetNoAnimation(page)
+            except Exception:
+                try:
+                    self.tabsInterface.setCurrentWidget(page)
+                except Exception:
+                    pass
+            self.switchTo(self.tabsInterface)
+        else:
+            # tabsInterface is AnimatedStackedWidget - will animate tab-to-tab
+            self.tabsInterface.setCurrentWidget(page)
+        # Deselect sidebar since tabs are active
         self._deselect_navigation()
 
     # No external tab add; tabs are created by launching a Pycro from the Hub
@@ -668,20 +746,26 @@ class Window(MSFluentWindow):
                     pass
                 page = self.macro_pages[routeKey]
                 try:
-                    if self.homeInterface.indexOf(page) == -1:
-                        self.homeInterface.addWidget(page)
+                    if self.tabsInterface.indexOf(page) == -1:
+                        self.tabsInterface.addWidget(page)
                 except Exception:
                     pass
                 try:
-                    self.stackedWidget.setCurrentWidget(self.homeInterface)
+                    from_other_interface = self.stackedWidget.currentWidget() is not self.tabsInterface
                 except Exception:
-                    pass
-                self.homeInterface.setCurrentWidget(page)
-                self._deselect_navigation()
-                try:
-                    self.titleBar.setTabsSelectionHighlightEnabled(True)
-                except Exception:
-                    pass
+                    from_other_interface = True
+
+                if from_other_interface:
+                    try:
+                        self.tabsInterface.setCurrentWidgetNoAnimation(page)
+                    except Exception:
+                        try:
+                            self.tabsInterface.setCurrentWidget(page)
+                        except Exception:
+                            pass
+                    self.switchTo(self.tabsInterface)
+                else:
+                    self.tabsInterface.setCurrentWidget(page)
                 try:
                     self.packagesPage.setLocked(True)
                 except Exception:
@@ -692,7 +776,7 @@ class Window(MSFluentWindow):
             old_page = self.macro_pages.get(routeKey)
             if old_page is not None:
                 try:
-                    self.homeInterface.removeWidget(old_page)
+                    self.tabsInterface.removeWidget(old_page)
                 except Exception:
                     pass
                 old_page.deleteLater()
@@ -701,22 +785,28 @@ class Window(MSFluentWindow):
 
             content_widget.setObjectName(routeKey)
             content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.homeInterface.addWidget(content_widget)
+            self.tabsInterface.addWidget(content_widget)
 
             try:
                 self.tabBar.setCurrentTab(routeKey)
             except Exception:
                 pass
             try:
-                self.stackedWidget.setCurrentWidget(self.homeInterface)
+                from_other_interface = self.stackedWidget.currentWidget() is not self.tabsInterface
             except Exception:
-                pass
-            self.homeInterface.setCurrentWidget(content_widget)
-            self._deselect_navigation()
-            try:
-                self.titleBar.setTabsSelectionHighlightEnabled(True)
-            except Exception:
-                pass
+                from_other_interface = True
+
+            if from_other_interface:
+                try:
+                    self.tabsInterface.setCurrentWidgetNoAnimation(content_widget)
+                except Exception:
+                    try:
+                        self.tabsInterface.setCurrentWidget(content_widget)
+                    except Exception:
+                        pass
+                self.switchTo(self.tabsInterface)
+            else:
+                self.tabsInterface.setCurrentWidget(content_widget)
             try:
                 self.packagesPage.setLocked(True)
             except Exception:
@@ -726,7 +816,7 @@ class Window(MSFluentWindow):
         # New macro page
         content_widget.setObjectName(routeKey)
         content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.homeInterface.addWidget(content_widget)
+        self.tabsInterface.addWidget(content_widget)
         self.macro_pages[routeKey] = content_widget
         self.macro_labels[routeKey] = text
 
@@ -736,15 +826,21 @@ class Window(MSFluentWindow):
         except Exception:
             pass
         try:
-            self.stackedWidget.setCurrentWidget(self.homeInterface)
+            from_other_interface = self.stackedWidget.currentWidget() is not self.tabsInterface
         except Exception:
-            pass
-        self.homeInterface.setCurrentWidget(content_widget)
-        self._deselect_navigation()
-        try:
-            self.titleBar.setTabsSelectionHighlightEnabled(True)
-        except Exception:
-            pass
+            from_other_interface = True
+
+        if from_other_interface:
+            try:
+                self.tabsInterface.setCurrentWidgetNoAnimation(content_widget)
+            except Exception:
+                try:
+                    self.tabsInterface.setCurrentWidget(content_widget)
+                except Exception:
+                    pass
+            self.switchTo(self.tabsInterface)
+        else:
+            self.tabsInterface.setCurrentWidget(content_widget)
         try:
             self.packagesPage.setLocked(True)
         except Exception:
@@ -782,9 +878,7 @@ class Window(MSFluentWindow):
                 self.tabBar.removeTab(index)
             except Exception:
                 pass
-            self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
-            self.stackedWidget.setCurrentWidget(self.homeInterface)
-            self.homeInterface.setCurrentWidget(self.hubGrid)
+            self.showHub()
             return
 
         # Dispose content widget
@@ -792,7 +886,7 @@ class Window(MSFluentWindow):
         self.macro_labels.pop(routeKey, None)
         if page is not None:
             try:
-                self.homeInterface.removeWidget(page)
+                self.tabsInterface.removeWidget(page)
             except Exception:
                 pass
             page.deleteLater()
@@ -804,13 +898,7 @@ class Window(MSFluentWindow):
             pass
 
         # Show Hub
-        self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
-        self.stackedWidget.setCurrentWidget(self.homeInterface)
-        self.homeInterface.setCurrentWidget(self.hubGrid)
-        try:
-            self.titleBar.setTabsSelectionHighlightEnabled(False)
-        except Exception:
-            pass
+        self.showHub()
         # unlock packages if no tabs remain
         try:
             self.packagesPage.setLocked(len(self.macro_pages) > 0)
@@ -830,23 +918,6 @@ class Window(MSFluentWindow):
             except Exception:
                 pass
 
-    def onContentChanged(self, index: int):
-        """Ensure Hub and tabs aren't selected simultaneously."""
-        w = self.stackedWidget.widget(index)
-        # If homeInterface is showing the hub grid, treat it as Hub; otherwise treat as macro content
-        is_hub = (w is self.homeInterface and getattr(self.homeInterface, 'currentWidget', lambda: None)() is self.hubGrid)
-        if is_hub or w is self.settingsInterface or w is getattr(self, 'packagesPage', object()):
-            try:
-                self.titleBar.setTabsSelectionHighlightEnabled(False)
-            except Exception:
-                pass
-        else:
-            self._deselect_navigation()
-            try:
-                self.titleBar.setTabsSelectionHighlightEnabled(True)
-            except Exception:
-                pass
-
     def _on_settings_update(self, success: bool, _msg: str):
         """Refresh hub when settings update pulls new remote_pycros."""
         if success:
@@ -859,15 +930,24 @@ class Window(MSFluentWindow):
         except Exception:
             pass
 
-    # removed unused text-editor helpers and tab stubs
-
     def _deselect_navigation(self):
-        # Explicitly clear selection on NavigationBar
+        """Clear selection on navigation sidebar when tabs are active."""
         try:
-            for widget in getattr(self.navigationInterface, 'items', {}).values():
+            for widget in self.navigationInterface.items.values():
                 widget.setSelected(False)
         except Exception:
             pass
+
+    def onContentChanged(self, index: int):
+        """Toggle tab highlight based on whether tabs or navigation is active."""
+        w = self.stackedWidget.widget(index)
+        if w is self.tabsInterface:
+            # Tabs are active - enable highlight, deselect navigation
+            self.titleBar.setTabsSelectionHighlightEnabled(True)
+            self._deselect_navigation()
+        else:
+            # A navigation item is active - disable tab highlight
+            self.titleBar.setTabsSelectionHighlightEnabled(False)
 
     def _has_text_editor(self) -> bool:
         """Return True if the current view is a text editor-like widget."""

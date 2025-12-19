@@ -51,12 +51,6 @@ class CustomTitleBar(MSFluentTitleBar):
             except Exception:
                 pass
 
-        # Also react to clicking the already-selected tab to re-show content
-        try:
-            self.tabBar.tabBarClicked.connect(parent.onTabClicked)
-        except Exception:
-            pass
-
         # Enable middle-click to close tabs via event filter
         try:
             self.tabBar.installEventFilter(self)
@@ -71,6 +65,8 @@ class CustomTitleBar(MSFluentTitleBar):
 
         # guard to avoid double handling
         self._lastMiddleCloseTs = 0
+        self._leftPressTabIndex = -1
+        self._leftPressWasCurrent = False
         # self.tabBar.currentChanged.connect(lambda i: print(self.tabBar.tabText(i)))
 
         self.hBoxLayout.insertWidget(5, self.tabBar, 1)
@@ -139,72 +135,99 @@ class CustomTitleBar(MSFluentTitleBar):
         pos.setX(pos.x() - self.tabBar.x())
         return not self.tabBar.tabRegion().contains(pos)
 
-    def eventFilter(self, obj, e):
-        # Handle middle-click close on the tab bar: close only the tab under cursor
+    def _tabIndexAtGlobalPos(self, gpos: QPoint) -> int:
+        tb = self.tabBar
         try:
+            local = tb.mapFromGlobal(gpos)
+            if not tb.rect().contains(local):
+                return -1
+        except Exception:
+            return -1
+
+        # Try built-in hit test methods first
+        for name in (
+            'tabAt', 'indexAt', 'tabIndexAt', 'tabIndexFromPosition',
+            'tabIndexAtPos', 'tabIndexAtPosition', 'tabAtPos'
+        ):
+            meth = getattr(tb, name, None)
+            if callable(meth):
+                try:
+                    idx = meth(local)
+                    if isinstance(idx, int) and idx >= 0:
+                        return idx
+                except Exception:
+                    continue
+
+        # Fallback: check per-tab rects, then region approximation
+        count = 0
+        try:
+            count = tb.count()
+        except Exception:
+            count = 0
+
+        if count > 0:
+            # Try tabRect geometry per index
+            for name in ('tabRect', 'tabGeometry'):
+                geom = getattr(tb, name, None)
+                if not callable(geom):
+                    continue
+                for i in range(count):
+                    try:
+                        r = geom(i)
+                        if r.contains(local):
+                            return i
+                    except Exception:
+                        continue
+
+            # Approximate by dividing tabRegion if still not found
+            try:
+                region = tb.tabRegion()
+                if region.contains(local):
+                    relx = local.x() - region.x()
+                    w = region.width() if region.width() > 0 else 1
+                    width_per = w / count
+                    approx = int(relx / width_per)
+                    if 0 <= approx < count:
+                        return approx
+            except Exception:
+                pass
+
+        return -1
+
+    def eventFilter(self, obj, e):
+        try:
+            # Track left click on the already-selected tab to re-show content (without duplicating tab switch logic)
+            if e.type() == QEvent.MouseButtonPress and hasattr(e, 'button') and e.button() == Qt.LeftButton:
+                gpos = e.globalPosition().toPoint() if hasattr(e, 'globalPosition') else e.globalPos()
+                idx = self._tabIndexAtGlobalPos(gpos)
+                if isinstance(idx, int) and idx >= 0:
+                    self._leftPressTabIndex = idx
+                    try:
+                        self._leftPressWasCurrent = idx == self.tabBar.currentIndex()
+                    except Exception:
+                        self._leftPressWasCurrent = False
+                return super().eventFilter(obj, e)
+
+            if e.type() == QEvent.MouseButtonRelease and hasattr(e, 'button') and e.button() == Qt.LeftButton:
+                gpos = e.globalPosition().toPoint() if hasattr(e, 'globalPosition') else e.globalPos()
+                idx = self._tabIndexAtGlobalPos(gpos)
+                if self._leftPressWasCurrent and idx == self._leftPressTabIndex and isinstance(idx, int) and idx >= 0:
+                    try:
+                        self.parent().onTabClicked(idx)
+                    except Exception:
+                        pass
+                self._leftPressTabIndex = -1
+                self._leftPressWasCurrent = False
+                return super().eventFilter(obj, e)
+
+            # Handle middle-click close on the tab bar: close only the tab under cursor
             if e.type() == QEvent.MouseButtonRelease and hasattr(e, 'button') and e.button() == Qt.MiddleButton:
                 # throttle to avoid duplicate from multiple filters
                 now = QDateTime.currentMSecsSinceEpoch()
                 if now - self._lastMiddleCloseTs < 150:
                     return True
-                tb = self.tabBar
-                # map global pos to tab bar coordinates
                 gpos = e.globalPosition().toPoint() if hasattr(e, 'globalPosition') else e.globalPos()
-                local = tb.mapFromGlobal(gpos)
-                if not tb.rect().contains(local):
-                    return super().eventFilter(obj, e)
-                # Try built-in hit test methods first
-                index = -1
-                for name in (
-                    'tabAt', 'indexAt', 'tabIndexAt', 'tabIndexFromPosition',
-                    'tabIndexAtPos', 'tabIndexAtPosition', 'tabAtPos'
-                ):
-                    meth = getattr(tb, name, None)
-                    if callable(meth):
-                        try:
-                            idx = meth(local)
-                            if isinstance(idx, int) and idx >= 0:
-                                index = idx
-                                break
-                        except Exception:
-                            continue
-                # Fallback: check per-tab rects, then region approximation
-                if index < 0:
-                    count = 0
-                    try:
-                        count = tb.count()
-                    except Exception:
-                        count = 0
-                    if count > 0:
-                        # Try tabRect geometry per index
-                        got = False
-                        for name in ('tabRect', 'tabGeometry'):
-                            geom = getattr(tb, name, None)
-                            if callable(geom):
-                                for i in range(count):
-                                    try:
-                                        r = geom(i)
-                                        if r.contains(local):
-                                            index = i
-                                            got = True
-                                            break
-                                    except Exception:
-                                        continue
-                            if got:
-                                break
-                        # Approximate by dividing tabRegion if still not found
-                        if index < 0:
-                            try:
-                                region = tb.tabRegion()
-                                if region.contains(local):
-                                    relx = local.x() - region.x()
-                                    w = region.width() if region.width() > 0 else 1
-                                    width_per = w / count
-                                    approx = int(relx / width_per)
-                                    if 0 <= approx < count:
-                                        index = approx
-                            except Exception:
-                                pass
+                index = self._tabIndexAtGlobalPos(gpos)
                 if isinstance(index, int) and index >= 0:
                     self._lastMiddleCloseTs = now
                     try:
