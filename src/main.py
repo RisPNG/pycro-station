@@ -1,9 +1,11 @@
 """
 The main python file. Run this file to use the app.
 """
+APP_VERSION = "0.0.1"
 import datetime
 import json
 import os
+import re
 import shutil
 import tempfile
 import urllib.error
@@ -116,18 +118,25 @@ class AnimatedStackedWidget(QStackedWidget):
 
 class Settings(QWidget):
     updateFinished = Signal(bool, str)
+    appUpdateFinished = Signal(bool, str)
+    appUpdateAvailable = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings_file = os.path.join(os.path.dirname(__file__), "settings.json")
         self._show_update_dialog = True
         self._launch_update_started = False
+        self._show_app_update_dialog = True
+        self._launch_app_update_started = False
 
         # Track editing state for each field
         self.editing_states = {
             "repo_url": False,
             "repo_branch": False,
-            "repo_directory": False
+            "repo_directory": False,
+            "app_repo_url": False,
+            "app_repo_branch": False,
+            "app_repo_directory": False,
         }
 
         # Match the BoM--to--MSL log/description styling
@@ -144,6 +153,8 @@ class Settings(QWidget):
         self._build_ui()
         self._load_settings()
         self.updateFinished.connect(self._finish_update)
+        self.appUpdateFinished.connect(self._finish_app_update)
+        self.appUpdateAvailable.connect(self._prompt_app_update)
 
     def _build_ui(self):
         # Main vertical layout
@@ -151,6 +162,13 @@ class Settings(QWidget):
         main_layout.setContentsMargins(200, 100, 200, 100)
         main_layout.setSpacing(12)
         main_layout.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+
+        # Title
+        self.remote_settings_title = QLabel("remote pycros settings", self)
+        self.remote_settings_title.setStyleSheet(
+            "color: #dcdcdc; background: transparent; font-size: 18px; font-weight: 600;"
+        )
+        main_layout.addWidget(self.remote_settings_title, 0, Qt.AlignLeft)
 
         # Row 1: Repo URL
         row1_layout = QHBoxLayout()
@@ -222,17 +240,128 @@ class Settings(QWidget):
         row5_layout.addStretch(1)
         main_layout.addLayout(row5_layout)
 
+        # Divider
+        main_layout.addSpacing(24)
+        divider = QFrame(self)
+        divider.setFrameShape(QFrame.HLine)
+        divider.setFrameShadow(QFrame.Sunken)
+        divider.setStyleSheet("color: #3a3a3a; background: transparent;")
+        main_layout.addWidget(divider)
+        main_layout.addSpacing(12)
+
+        # App Source title
+        self.app_source_title = QLabel("App Source", self)
+        self.app_source_title.setStyleSheet(
+            "color: #dcdcdc; background: transparent; font-size: 18px; font-weight: 600;"
+        )
+        main_layout.addWidget(self.app_source_title, 0, Qt.AlignLeft)
+
+        # App Row 1: Repo URL
+        app_row1_layout = QHBoxLayout()
+        self.app_repo_url_label = QLabel("Repo URL", self)
+        self.app_repo_url_label.setFixedWidth(100)
+        self.app_repo_url_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        self.app_repo_url_field = LineEdit(self)
+        self.app_repo_url_field.setEnabled(False)
+        self.app_repo_url_field.setStyleSheet(self.field_disabled_style)
+        self.app_repo_url_btn = PrimaryPushButton("Edit", self)
+        self.app_repo_url_btn.setFixedWidth(80)
+        self.app_repo_url_btn.clicked.connect(lambda: self._toggle_edit("app_repo_url"))
+        app_row1_layout.addWidget(self.app_repo_url_label)
+        app_row1_layout.addWidget(self.app_repo_url_field)
+        app_row1_layout.addWidget(self.app_repo_url_btn)
+        main_layout.addLayout(app_row1_layout)
+
+        # App Row 2: Branch
+        app_row2_layout = QHBoxLayout()
+        self.app_branch_label = QLabel("Branch", self)
+        self.app_branch_label.setFixedWidth(100)
+        self.app_branch_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        self.app_branch_field = LineEdit(self)
+        self.app_branch_field.setEnabled(False)
+        self.app_branch_field.setStyleSheet(self.field_disabled_style)
+        self.app_branch_btn = PrimaryPushButton("Edit", self)
+        self.app_branch_btn.setFixedWidth(80)
+        self.app_branch_btn.clicked.connect(lambda: self._toggle_edit("app_repo_branch"))
+        app_row2_layout.addWidget(self.app_branch_label)
+        app_row2_layout.addWidget(self.app_branch_field)
+        app_row2_layout.addWidget(self.app_branch_btn)
+        main_layout.addLayout(app_row2_layout)
+
+        # App Row 3: Directory
+        app_row3_layout = QHBoxLayout()
+        self.app_directory_label = QLabel("Directory", self)
+        self.app_directory_label.setFixedWidth(100)
+        self.app_directory_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        self.app_directory_field = LineEdit(self)
+        self.app_directory_field.setEnabled(False)
+        self.app_directory_field.setStyleSheet(self.field_disabled_style)
+        self.app_directory_btn = PrimaryPushButton("Edit", self)
+        self.app_directory_btn.setFixedWidth(80)
+        self.app_directory_btn.clicked.connect(lambda: self._toggle_edit("app_repo_directory"))
+        app_row3_layout.addWidget(self.app_directory_label)
+        app_row3_layout.addWidget(self.app_directory_field)
+        app_row3_layout.addWidget(self.app_directory_btn)
+        main_layout.addLayout(app_row3_layout)
+
+        # App Row 4: Check updates on launch
+        app_row4_layout = QHBoxLayout()
+        self.app_update_toggle = CheckIconButton(self, initially_checked=False)
+        self.app_update_label = QLabel("Check for updates on launch", self)
+        self.app_update_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        app_row4_layout.addSpacing(110)
+        app_row4_layout.addWidget(self.app_update_toggle, 0, Qt.AlignVCenter)
+        app_row4_layout.addWidget(self.app_update_label, 0, Qt.AlignVCenter)
+        app_row4_layout.addStretch(1)
+        main_layout.addLayout(app_row4_layout)
+        self.app_update_toggle.toggledManually.connect(lambda _: self._save_settings())
+
+        # App Row 5: Version (info)
+        app_row5_layout = QHBoxLayout()
+        self.app_version_label = QLabel("Version", self)
+        self.app_version_label.setFixedWidth(100)
+        self.app_version_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        self.app_version_field = LineEdit(self)
+        self.app_version_field.setEnabled(False)
+        self.app_version_field.setStyleSheet(self.field_disabled_style)
+        self.app_version_field.setText(APP_VERSION)
+        app_row5_layout.addWidget(self.app_version_label)
+        app_row5_layout.addWidget(self.app_version_field)
+        app_row5_layout.addSpacing(80)
+        main_layout.addLayout(app_row5_layout)
+
+        # App Row 6: Force update button
+        app_row6_layout = QHBoxLayout()
+        self.force_update_btn = PrimaryPushButton("Force Update", self)
+        self.force_update_btn.setFixedWidth(150)
+        self.force_update_btn.clicked.connect(self._on_force_update_clicked)
+        app_row6_layout.addStretch(1)
+        app_row6_layout.addWidget(self.force_update_btn)
+        app_row6_layout.addStretch(1)
+        main_layout.addLayout(app_row6_layout)
+
     def _load_settings(self):
         """Load settings from settings.json"""
         try:
+            settings = {}
             if os.path.exists(self.settings_file):
-                with open(self.settings_file, 'r') as f:
-                    settings = json.load(f)
-                    self.repo_url_field.setText(settings.get("repo_url", ""))
-                    self.branch_field.setText(settings.get("repo_branch", ""))
-                    self.directory_field.setText(settings.get("repo_directory", ""))
-                    update_on_launch = settings.get("update_remote_on_launch", False)
-                    self.update_remote_toggle.setChecked(bool(update_on_launch))
+                with open(self.settings_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        settings = loaded
+
+            self.repo_url_field.setText(settings.get("repo_url", ""))
+            self.branch_field.setText(settings.get("repo_branch", ""))
+            self.directory_field.setText(settings.get("repo_directory", ""))
+            update_on_launch = settings.get("update_remote_on_launch", False)
+            self.update_remote_toggle.setChecked(bool(update_on_launch))
+
+            self.app_repo_url_field.setText(settings.get("app_repo_url", "https://github.com/RisPNG/pycro-station.git"))
+            self.app_branch_field.setText(settings.get("app_repo_branch", "main"))
+            self.app_directory_field.setText(settings.get("app_repo_directory", "src"))
+            app_update_on_launch = settings.get("app_update_on_launch", False)
+            self.app_update_toggle.setChecked(bool(app_update_on_launch))
+            self.app_version_field.setText(APP_VERSION)
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -253,7 +382,11 @@ class Settings(QWidget):
                 "repo_url": self.repo_url_field.text(),
                 "repo_branch": self.branch_field.text(),
                 "repo_directory": self.directory_field.text(),
-                "update_remote_on_launch": self.update_remote_toggle.isChecked()
+                "update_remote_on_launch": self.update_remote_toggle.isChecked(),
+                "app_repo_url": self.app_repo_url_field.text(),
+                "app_repo_branch": self.app_branch_field.text(),
+                "app_repo_directory": self.app_directory_field.text(),
+                "app_update_on_launch": self.app_update_toggle.isChecked(),
             })
 
             with open(self.settings_file, "w", encoding="utf-8") as f:
@@ -263,15 +396,19 @@ class Settings(QWidget):
 
     def _toggle_edit(self, field_name):
         """Toggle edit/save mode for a field"""
-        if field_name == "repo_url":
-            field = self.repo_url_field
-            btn = self.repo_url_btn
-        elif field_name == "repo_branch":
-            field = self.branch_field
-            btn = self.branch_btn
-        else:  # repo_directory
-            field = self.directory_field
-            btn = self.directory_btn
+        field_map = {
+            "repo_url": (self.repo_url_field, self.repo_url_btn),
+            "repo_branch": (self.branch_field, self.branch_btn),
+            "repo_directory": (self.directory_field, self.directory_btn),
+            "app_repo_url": (self.app_repo_url_field, self.app_repo_url_btn),
+            "app_repo_branch": (self.app_branch_field, self.app_branch_btn),
+            "app_repo_directory": (self.app_directory_field, self.app_directory_btn),
+        }
+
+        pair = field_map.get(field_name)
+        if not pair:
+            return
+        field, btn = pair
 
         if self.editing_states[field_name]:
             # Currently editing, save the changes
@@ -291,6 +428,10 @@ class Settings(QWidget):
     def _on_update_clicked(self):
         """Handle update button click"""
         self._start_update(show_dialog=True)
+
+    def _on_force_update_clicked(self):
+        """Handle force app update button click"""
+        self._start_app_update(show_dialog=True)
 
     def _start_update(self, show_dialog: bool):
         """Start update process with optional popup."""
@@ -403,6 +544,115 @@ class Settings(QWidget):
         self._launch_update_started = True
         QTimer.singleShot(0, lambda: self._start_update(show_dialog=False))
 
+    def run_app_update_check_on_launch_if_enabled(self):
+        """Check for app updates at launch when enabled."""
+        if self._launch_app_update_started:
+            return
+        if not self.app_update_toggle.isChecked():
+            return
+        self._launch_app_update_started = True
+        QTimer.singleShot(0, self._start_app_update_check)
+
+    def _start_app_update_check(self):
+        """Check remote main.py version and prompt if newer."""
+        repo_url, branch, repo_dir = self._get_app_source_settings()
+        if not repo_url:
+            return
+
+        def worker():
+            temp_dir = tempfile.mkdtemp(prefix="pycro_app_check_")
+            clone_dir = os.path.join(temp_dir, "repo")
+            try:
+                archive_url = self._build_archive_url(repo_url, branch)
+                archive_file = os.path.join(temp_dir, "repo.zip")
+
+                req = urllib.request.Request(archive_url, headers={"User-Agent": "pycro-station"})
+                with urllib.request.urlopen(req, timeout=60) as resp, open(archive_file, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+
+                os.makedirs(clone_dir, exist_ok=True)
+                with zipfile.ZipFile(archive_file, "r") as zf:
+                    self._safe_extract(zf, clone_dir)
+
+                clone_root = self._find_extract_root(clone_dir)
+                source_path = clone_root if not repo_dir else os.path.abspath(os.path.join(clone_root, repo_dir))
+                if os.path.commonpath([clone_root, source_path]) != clone_root:
+                    raise ValueError("Invalid directory path specified.")
+
+                main_py = os.path.join(source_path, "main.py")
+                if not os.path.isfile(main_py):
+                    return
+
+                with open(main_py, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+
+                remote_version = self._extract_version_from_text(text)
+                if not remote_version:
+                    return
+                if self._is_version_newer(remote_version, APP_VERSION):
+                    self.appUpdateAvailable.emit(remote_version)
+            except Exception as e:
+                print(f"App update check failed: {e}")
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _prompt_app_update(self, remote_version: str):
+        """Show update prompt with later/disable/update-now options."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Update Available")
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("Update Available", dialog)
+        title.setStyleSheet("color: #dcdcdc; background: transparent; font-size: 16px; font-weight: 600;")
+
+        content = QLabel(
+            f"An update is available for version {remote_version}.\nCurrent version: {APP_VERSION}",
+            dialog,
+        )
+        content.setWordWrap(True)
+        content.setStyleSheet("color: #dcdcdc; background: transparent;")
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        later_btn = QPushButton("Later", dialog)
+        disable_btn = QPushButton("Disable update check", dialog)
+        update_btn = PrimaryPushButton("Update now", dialog)
+        buttons.addWidget(later_btn)
+        buttons.addWidget(disable_btn)
+        buttons.addWidget(update_btn)
+
+        layout.addWidget(title)
+        layout.addWidget(content)
+        layout.addLayout(buttons)
+
+        choice = {"value": "later"}
+
+        def choose(value: str):
+            choice["value"] = value
+            dialog.accept()
+
+        later_btn.clicked.connect(lambda: choose("later"))
+        disable_btn.clicked.connect(lambda: choose("disable"))
+        update_btn.clicked.connect(lambda: choose("update"))
+
+        try:
+            dialog.exec()
+        except Exception:
+            return
+
+        if choice["value"] == "disable":
+            self.app_update_toggle.setChecked(False)
+            self._save_settings()
+        elif choice["value"] == "update":
+            self._start_app_update(show_dialog=True)
+
     @staticmethod
     def _build_archive_url(repo_url: str, branch: str) -> str:
         base = (repo_url or "").strip()
@@ -428,6 +678,146 @@ class Settings(QWidget):
         if len(target_list) >= 1:
             return os.path.join(tmp_dir, sorted(target_list)[0])
         return tmp_dir
+
+    def _get_app_source_settings(self) -> tuple[str, str, str]:
+        repo_url = (self.app_repo_url_field.text() or "").strip()
+        branch = (self.app_branch_field.text() or "").strip()
+        repo_dir = (self.app_directory_field.text() or "").strip()
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                    if isinstance(saved, dict):
+                        repo_url = (saved.get("app_repo_url") or repo_url).strip()
+                        branch = (saved.get("app_repo_branch") or branch).strip()
+                        repo_dir = (saved.get("app_repo_directory") or repo_dir).strip()
+        except Exception:
+            pass
+        branch = branch or "main"
+        repo_dir = repo_dir or "src"
+        return repo_url, branch, repo_dir
+
+    @staticmethod
+    def _extract_version_from_text(text: str) -> str | None:
+        patterns = [
+            r'^\s*APP_VERSION\s*=\s*[\'"]([^\'"]+)[\'"]\s*$',
+            r'^\s*__version__\s*=\s*[\'"]([^\'"]+)[\'"]\s*$',
+            r'^\s*VERSION\s*=\s*[\'"]([^\'"]+)[\'"]\s*$',
+            r'@version\s+([0-9A-Za-z.+-]+)',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.MULTILINE)
+            if m:
+                return (m.group(1) or "").strip()
+        return None
+
+    @staticmethod
+    def _version_key(version: str) -> tuple[int, ...]:
+        nums = [int(x) for x in re.findall(r"\d+", version or "")]
+        return tuple(nums) if nums else (0,)
+
+    @classmethod
+    def _is_version_newer(cls, remote_version: str, current_version: str) -> bool:
+        r = cls._version_key(remote_version)
+        c = cls._version_key(current_version)
+        max_len = max(len(r), len(c))
+        r = r + (0,) * (max_len - len(r))
+        c = c + (0,) * (max_len - len(c))
+        return r > c
+
+    def _start_app_update(self, show_dialog: bool):
+        """Update this app by replacing src/*.py from the configured repo."""
+        self._show_app_update_dialog = show_dialog
+
+        repo_url, branch, repo_dir = self._get_app_source_settings()
+        if not repo_url:
+            if show_dialog:
+                MessageBox("Missing repo URL", "Please provide a repository URL.", self).exec()
+            else:
+                print("Skipping app update: repo URL missing.")
+            return
+
+        self.force_update_btn.setEnabled(False)
+        self.force_update_btn.setText("Updating...")
+
+        src_dir = os.path.abspath(os.path.dirname(__file__))
+        targets = ["TitleBar.py", "PycroGrid.py", "PackagesPage.py", "main.py"]
+
+        def worker():
+            temp_dir = tempfile.mkdtemp(prefix="pycro_app_update_")
+            clone_dir = os.path.join(temp_dir, "repo")
+            try:
+                archive_url = self._build_archive_url(repo_url, branch)
+                archive_file = os.path.join(temp_dir, "repo.zip")
+
+                req = urllib.request.Request(archive_url, headers={"User-Agent": "pycro-station"})
+                with urllib.request.urlopen(req, timeout=60) as resp, open(archive_file, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+
+                os.makedirs(clone_dir, exist_ok=True)
+                with zipfile.ZipFile(archive_file, "r") as zf:
+                    self._safe_extract(zf, clone_dir)
+
+                clone_root = self._find_extract_root(clone_dir)
+                source_path = clone_root if not repo_dir else os.path.abspath(os.path.join(clone_root, repo_dir))
+                if os.path.commonpath([clone_root, source_path]) != clone_root:
+                    raise ValueError("Invalid directory path specified.")
+                if not os.path.isdir(source_path):
+                    raise FileNotFoundError(f"Directory '{repo_dir}' not found in branch '{branch}'.")
+
+                missing = [n for n in targets if not os.path.isfile(os.path.join(source_path, n))]
+                if missing:
+                    missing_list = ", ".join(missing)
+                    raise FileNotFoundError(f"Missing {missing_list} in '{repo_dir or 'repo root'}'.")
+
+                for name in targets:
+                    src_file = os.path.join(source_path, name)
+                    dst_file = os.path.join(src_dir, name)
+                    tmp_file = dst_file + ".tmp"
+                    shutil.copy2(src_file, tmp_file)
+                    os.replace(tmp_file, dst_file)
+
+                msg = "Updated app source files. Please restart Pycro Station."
+                try:
+                    main_py = os.path.join(source_path, "main.py")
+                    with open(main_py, "r", encoding="utf-8", errors="ignore") as f:
+                        remote_version = self._extract_version_from_text(f.read())
+                    if remote_version:
+                        msg = f"Updated to {remote_version}. Please restart Pycro Station."
+                except Exception:
+                    pass
+
+                self.appUpdateFinished.emit(True, msg)
+            except Exception as e:
+                self.appUpdateFinished.emit(False, str(e))
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                for name in targets:
+                    tmp_path = os.path.join(src_dir, name + ".tmp")
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_app_update(self, success: bool, message: str):
+        self.force_update_btn.setEnabled(True)
+        self.force_update_btn.setText("Force Update")
+
+        if not self._show_app_update_dialog:
+            self._show_app_update_dialog = True
+            if not success:
+                print(f"Silent app update failed: {message}")
+            return
+
+        title = "Success" if success else "Update failed"
+        msg = MessageBox(title, message or "", self)
+        msg.yesButton.setText("OK")
+        msg.cancelButton.hide()
+        msg.exec()
 
 
 
@@ -487,6 +877,10 @@ class Window(MSFluentWindow):
             pass
         try:
             self.settingsInterface.run_update_on_launch_if_enabled()
+        except Exception:
+            pass
+        try:
+            self.settingsInterface.run_app_update_check_on_launch_if_enabled()
         except Exception:
             pass
         # Disable tab highlight when switching to navigation items
@@ -636,7 +1030,7 @@ class Window(MSFluentWindow):
         w = MessageBox(
             'Pycro Station',
             (
-                    "Version : 0.0.1"
+                    f"Version : {APP_VERSION}"
                     + "\n" + "\n" + "\n" + "Welcome aboard Pycronauts!" + "\n" + "This is the hub to store and launch Pycros" + "\n" + "\n" + "\n" +
                     "Made with 💚 By Ris Peng"
             ),
