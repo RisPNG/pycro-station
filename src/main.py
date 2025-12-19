@@ -1,7 +1,8 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "0.0.1"
+APP_VERSION = "1.0.0"
+SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
 import os
@@ -164,7 +165,7 @@ class Settings(QWidget):
         main_layout.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
 
         # Title
-        self.remote_settings_title = QLabel("remote pycros settings", self)
+        self.remote_settings_title = QLabel("Remote Pycros", self)
         self.remote_settings_title.setStyleSheet(
             "color: #dcdcdc; background: transparent; font-size: 18px; font-weight: 600;"
         )
@@ -339,6 +340,20 @@ class Settings(QWidget):
         app_row6_layout.addWidget(self.force_update_btn)
         app_row6_layout.addStretch(1)
         main_layout.addLayout(app_row6_layout)
+
+        if not SHOW_REPO_FIELDS_IN_SETTINGS:
+            for w in (
+                self.app_repo_url_label,
+                self.app_repo_url_field,
+                self.app_repo_url_btn,
+                self.app_branch_label,
+                self.app_branch_field,
+                self.app_branch_btn,
+                self.app_directory_label,
+                self.app_directory_field,
+                self.app_directory_btn,
+            ):
+                w.hide()
 
     def _load_settings(self):
         """Load settings from settings.json"""

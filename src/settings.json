@@ -6,7 +6,7 @@
     "app_repo_url": "https://github.com/RisPNG/pycro-station.git",
     "app_repo_branch": "main",
     "app_repo_directory": "src",
-    "app_update_on_launch": false,
+    "app_update_on_launch": true,
     "hub_sort_mode": "alphabetical",
     "hub_show_remote_pycros": true,
     "stars_sort_mode": "alphabetical",
