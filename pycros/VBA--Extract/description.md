@@ -1,6 +1,6 @@
-> Duplicate excel copying only data, formulas, and styles
+> Extract VBA code from Excel macro-enabled files.
 > [!info]
-> [Version 0.0.1a](#bae1ffff)
+> [Version 1.0.0](#bae1ffff)
 >
 > [Author](#bae1ffff)
 > Nik Faris Aiman bin Nik Rahiman (faris@sig.com.my)
@@ -12,6 +12,6 @@
 > Nik Faris Aiman bin Nik Rahiman (faris@sig.com.my)
 >
 > [Last updated date](#bae1ffff)
-> 2025/11/25
+> 2025/12/19
 
-Duplicates excel to potentially fix issues and bypass restrictions.
+Extract all VBA modules, classes, and forms from Excel macro-enabled (.xlsm) files and output them beautifully formatted to a text file.
