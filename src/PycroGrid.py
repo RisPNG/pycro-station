@@ -2,21 +2,61 @@ import os
 import sys
 import re
 import html
+import json
 import importlib.util
 from difflib import SequenceMatcher
 from importlib import metadata
 
-from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, QProcess, QEvent
+from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, QProcess, QEvent, QSize, QRect, QPoint, Signal
 from PySide6.QtWidgets import *
-from PySide6.QtGui import QIcon, QCursor
-from qfluentwidgets import PrimaryPushButton, TransparentToolButton, isDarkTheme, FluentIcon as FIF, LineEdit
+from PySide6.QtGui import QIcon, QCursor, QAction
+from qfluentwidgets import (
+    PrimaryPushButton,
+    TransparentToolButton,
+    isDarkTheme,
+    FluentIcon as FIF,
+    LineEdit,
+    RoundMenu,
+)
+from pytablericons import OutlineIcon, FilledIcon
+from PackagesPage import CheckIconButton, ti_icon
+
+
+class ClickableMenuRow(QWidget):
+    clicked = Signal()
+
+    def mousePressEvent(self, event):
+        try:
+            if event.button() == Qt.LeftButton:
+                self.clicked.emit()
+        except Exception:
+            pass
+        return super().mousePressEvent(event)
 
 
 class PycroGrid(QScrollArea):
     """Scrollable grid container for listing Pycros."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, stars_only: bool = False):
         super().__init__(parent)
+
+        self._stars_only = bool(stars_only)
+        self._settings_file = os.path.join(os.path.dirname(__file__), "settings.json")
+        self._sort_mode = "recently_used"
+        self._show_remote_pycros = True
+        self._recently_launched: list[str] = []
+        self._starred_pycros: set[str] = set()
+        self._settings_watcher = QFileSystemWatcher(self)
+        self._settings_watcher.fileChanged.connect(self._on_settings_file_changed)
+        try:
+            if os.path.isfile(self._settings_file):
+                self._settings_watcher.addPath(self._settings_file)
+        except Exception:
+            pass
+        self._reload_preferences_from_disk(apply_filter=False)
+        icon_color = "#FFFFFF" if isDarkTheme() else "#111111"
+        self._star_outline_icon = ti_icon(OutlineIcon.STAR, size=20, color=icon_color, stroke_width=2.0)
+        self._star_filled_icon = ti_icon(FilledIcon.STAR, size=20, color=icon_color, stroke_width=2.0)
 
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
@@ -31,11 +71,27 @@ class PycroGrid(QScrollArea):
 
         # Search bar
         search_row = QHBoxLayout()
+        self._search_row = search_row
         search_row.setContentsMargins(12, 12, 12, 0)
         search_row.setSpacing(8)
         self._search_field = LineEdit(self._content)
         self._search_field.setPlaceholderText("Search pycros...")
         search_row.addWidget(self._search_field)
+
+        self._filter_menu = RoundMenu("", self)
+        self._filter_menu.setMinimumWidth(220)
+        self._sort_cycle_action = QAction("", self)
+        self._sort_cycle_action.triggered.connect(self._cycle_sort_mode)
+        self._filter_menu.addAction(self._sort_cycle_action)
+        self._filter_menu.addSeparator()
+
+        self._remote_toggle = None
+        self._remote_row = None
+        self._build_remote_toggle_row()
+
+        self._filter_action = None
+        self._filter_btn = None
+        self._install_filter_icon()
         self._content_layout.addLayout(search_row)
 
         # Grid host
@@ -69,6 +125,8 @@ class PycroGrid(QScrollArea):
         self._resize_relayout_timer.timeout.connect(self._relayout_on_resize)
 
         self._empty_label = QLabel("Pycros will appear here", self._content)
+        if self._stars_only:
+            self._empty_label.setText("No starred pycros yet")
         self._empty_label.setAlignment(Qt.AlignCenter)
         self._empty_label.setStyleSheet("color: #aaa; font-size: 14px;")
         self._grid.addWidget(self._empty_label, 0, 0)
@@ -97,8 +155,333 @@ class PycroGrid(QScrollArea):
         except Exception:
             pass
         self._search_field.textChanged.connect(lambda _: self._apply_filter())
+        self._sync_filter_menu_state()
 
         QTimer.singleShot(0, self.refresh)
+
+    def _read_settings(self) -> dict:
+        try:
+            if os.path.isfile(self._settings_file):
+                with open(self._settings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+        except Exception:
+            pass
+        return {}
+
+    def _sort_mode_settings_key(self) -> str:
+        return "stars_sort_mode" if self._stars_only else "hub_sort_mode"
+
+    def _show_remote_settings_key(self) -> str:
+        return "stars_show_remote_pycros" if self._stars_only else "hub_show_remote_pycros"
+
+    def _write_settings_updates(self, updates: dict) -> dict:
+        data = self._read_settings()
+        data.update(updates)
+        try:
+            with open(self._settings_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception:
+            pass
+        return data
+
+    def _reload_preferences_from_disk(self, apply_filter: bool = True):
+        data = self._read_settings()
+
+        sort_mode = data.get(self._sort_mode_settings_key(), "recently_used")
+        if sort_mode not in ("recently_used", "alphabetical"):
+            sort_mode = "recently_used"
+        self._sort_mode = sort_mode
+
+        show_remote = data.get(self._show_remote_settings_key(), None)
+        if show_remote is None:
+            # backward compatibility with older single setting
+            show_remote = data.get("show_remote_pycros", True)
+        self._show_remote_pycros = bool(show_remote)
+
+        recently = data.get("recently_launched", [])
+        self._recently_launched = recently if isinstance(recently, list) else []
+
+        starred = data.get("starred_pycros", [])
+        self._starred_pycros = set(starred) if isinstance(starred, list) else set()
+
+        self._sync_filter_menu_state()
+        if apply_filter:
+            self._apply_filter()
+
+    def _on_settings_file_changed(self, path: str):
+        # On some platforms, a file watch is removed after change; re-add it.
+        try:
+            if os.path.isfile(self._settings_file) and self._settings_file not in self._settings_watcher.files():
+                self._settings_watcher.addPath(self._settings_file)
+        except Exception:
+            pass
+        self._reload_preferences_from_disk(apply_filter=True)
+
+    def _sync_filter_menu_state(self):
+        try:
+            mode_label = "Alphabetical" if self._sort_mode == "alphabetical" else "Recently used"
+            self._sort_cycle_action.setText(f"Sort: {mode_label}")
+        except Exception:
+            pass
+        try:
+            if self._remote_toggle is not None:
+                self._remote_toggle.setChecked(bool(self._show_remote_pycros))
+        except Exception:
+            pass
+
+    def _cycle_sort_mode(self):
+        next_mode = "alphabetical" if self._sort_mode == "recently_used" else "recently_used"
+        self._set_sort_mode(next_mode)
+
+    def _install_filter_icon(self):
+        # Prefer embedding the filter icon inside the LineEdit trailing position.
+        icon = QIcon()
+        try:
+            icon = FIF.FILTER.icon()
+        except Exception:
+            try:
+                icon = QIcon(FIF.FILTER)
+            except Exception:
+                icon = QIcon()
+
+        try:
+            pos = getattr(QLineEdit, "TrailingPosition", None)
+            if pos is None:
+                pos = QLineEdit.ActionPosition.TrailingPosition
+            self._filter_action = self._search_field.addAction(icon, pos)
+            self._filter_action.triggered.connect(self._show_filter_menu)
+            return
+        except Exception:
+            self._filter_action = None
+
+        # Fallback: manually place a tool button inside the LineEdit
+        try:
+            self._filter_btn = TransparentToolButton(FIF.FILTER, self._search_field)
+            self._filter_btn.setCursor(Qt.PointingHandCursor)
+            self._filter_btn.setStyleSheet("QToolButton{border:none;}")
+            self._filter_btn.clicked.connect(self._show_filter_menu)
+            try:
+                self._search_field.installEventFilter(self)
+            except Exception:
+                pass
+            self._position_filter_btn()
+        except Exception:
+            self._filter_btn = None
+
+    def _position_filter_btn(self):
+        if self._filter_btn is None or self._filter_btn.parent() is not self._search_field:
+            return
+        try:
+            h = max(20, int(self._search_field.height()))
+            margin = 4
+            btn_size = max(20, min(28, h - (margin * 2)))
+            self._filter_btn.setFixedSize(btn_size, btn_size)
+            self._filter_btn.setIconSize(QSize(max(12, btn_size - 10), max(12, btn_size - 10)))
+            x = max(0, self._search_field.width() - btn_size - margin)
+            y = max(0, (h - btn_size) // 2)
+            self._filter_btn.move(x, y)
+            try:
+                self._filter_btn.raise_()
+            except Exception:
+                pass
+            try:
+                self._search_field.setTextMargins(0, 0, btn_size + (margin * 2), 0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _show_filter_menu(self):
+        try:
+            anchor = self._filter_btn if self._filter_btn is not None else self._search_field
+        except Exception:
+            anchor = self._search_field
+
+        try:
+            self._filter_menu.ensurePolished()
+        except Exception:
+            pass
+
+        try:
+            menu_size = self._filter_menu.sizeHint()
+            if menu_size.width() <= 0 or menu_size.height() <= 0:
+                self._filter_menu.adjustSize()
+                menu_size = self._filter_menu.sizeHint()
+        except Exception:
+            menu_size = None
+
+        try:
+            anchor_br = anchor.mapToGlobal(anchor.rect().bottomRight())
+            anchor_tr = anchor.mapToGlobal(anchor.rect().topRight())
+        except Exception:
+            anchor_br = QCursor.pos()
+            anchor_tr = anchor_br
+
+        x = anchor_br.x()
+        y = anchor_br.y()
+        if menu_size is not None:
+            x = x - menu_size.width()
+            y = y + 2
+
+        # Clamp to the app window so the menu stays "inside" the window bounds.
+        try:
+            w = self.window()
+            if w is not None:
+                tl = w.mapToGlobal(w.rect().topLeft())
+                br = w.mapToGlobal(w.rect().bottomRight())
+                win = QRect(tl, br)
+            else:
+                win = None
+        except Exception:
+            win = None
+
+        if win is not None and menu_size is not None and win.isValid():
+            margin = 8
+            max_x = win.right() - menu_size.width() - margin
+            min_x = win.left() + margin
+            x = max(min_x, min(x, max_x))
+
+            # Prefer below; if it doesn't fit, place above.
+            if y + menu_size.height() > win.bottom() - margin:
+                y = anchor_tr.y() - menu_size.height() - 2
+            max_y = win.bottom() - menu_size.height() - margin
+            min_y = win.top() + margin
+            y = max(min_y, min(y, max_y))
+
+        pos = QPoint(int(x), int(y))
+        try:
+            self._filter_menu.exec(pos)
+        except Exception:
+            try:
+                self._filter_menu.exec_(pos)
+            except Exception:
+                pass
+
+    def _build_remote_toggle_row(self):
+        if self._remote_toggle is not None or self._remote_row is not None:
+            return
+
+        row = ClickableMenuRow(self._filter_menu)
+        try:
+            row.setCursor(Qt.PointingHandCursor)
+        except Exception:
+            pass
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 4, 10, 4)
+        h.setSpacing(0)
+
+        self._remote_toggle = CheckIconButton(row, initially_checked=bool(self._show_remote_pycros))
+        try:
+            self._remote_toggle.setFixedSize(24, 24)
+            self._remote_toggle.setIconSize(QSize(15, 15))
+        except Exception:
+            pass
+        self._remote_toggle.setToolTip("Show/hide remote pycros")
+        label = QLabel("Show remote pycros", row)
+        label.setStyleSheet(
+            "color:#dcdcdc; background:transparent; font-size:13px; font-weight:500;"
+        )
+        try:
+            label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        except Exception:
+            pass
+
+        h.addWidget(self._remote_toggle, 0, Qt.AlignVCenter)
+        h.addWidget(label, 0, Qt.AlignVCenter)
+        h.addStretch(1)
+
+        try:
+            row.setFixedWidth(max(220, int(self._filter_menu.minimumWidth())))
+        except Exception:
+            row.setFixedWidth(220)
+        try:
+            row.setFixedHeight(max(32, int(row.sizeHint().height())))
+        except Exception:
+            row.setFixedHeight(32)
+
+        try:
+            self._filter_menu.addWidget(row, selectable=False)
+        except Exception:
+            # fallback: at least try to add as a regular action (won't embed widget)
+            try:
+                action = QAction("Show remote pycros", self)
+                action.setCheckable(True)
+                action.setChecked(bool(self._show_remote_pycros))
+                action.triggered.connect(lambda c: self._on_show_remote_toggled(bool(c)))
+                self._filter_menu.addAction(action)
+            except Exception:
+                pass
+        self._remote_row = row
+
+        try:
+            self._remote_toggle.toggledManually.connect(self._on_show_remote_toggled)
+        except Exception:
+            pass
+        try:
+            row.clicked.connect(lambda: self._remote_toggle.click())
+        except Exception:
+            pass
+
+    def _on_show_remote_toggled(self, checked: bool):
+        self._show_remote_pycros = bool(checked)
+        self._write_settings_updates({self._show_remote_settings_key(): self._show_remote_pycros})
+        self._refresh_all_grids()
+
+    def _set_sort_mode(self, mode: str):
+        if mode not in ("recently_used", "alphabetical"):
+            mode = "recently_used"
+        if self._sort_mode == mode:
+            return
+        self._sort_mode = mode
+        self._write_settings_updates({self._sort_mode_settings_key(): self._sort_mode})
+        self._refresh_all_grids()
+
+    def _refresh_all_grids(self):
+        """Refresh Hub + Stars grids (in this process) after settings changes."""
+        window = self.window()
+        if window is None:
+            self._reload_preferences_from_disk(apply_filter=True)
+            return
+
+        for attr in ("hubGrid", "starsGrid"):
+            grid = getattr(window, attr, None)
+            if grid is None:
+                continue
+            reload_fn = getattr(grid, "_reload_preferences_from_disk", None)
+            if callable(reload_fn):
+                try:
+                    reload_fn(apply_filter=True)
+                except Exception:
+                    continue
+
+    def record_launch(self, info: 'PycroInfo'):
+        """Record a successful launch for 'recently used' sorting."""
+        pid = self._pycro_id(info)
+        recent = [x for x in self._recently_launched if x not in (pid, info.name)]
+        recent.insert(0, pid)
+        # keep the list bounded
+        if len(recent) > 200:
+            recent = recent[:200]
+        self._recently_launched = recent
+        self._write_settings_updates({"recently_launched": list(self._recently_launched)})
+        self._refresh_all_grids()
+
+    def toggle_star(self, info: 'PycroInfo'):
+        pid = self._pycro_id(info)
+        currently_starred = pid in self._starred_pycros or info.name in self._starred_pycros
+        self.set_starred(info, not currently_starred)
+
+    def set_starred(self, info: 'PycroInfo', starred: bool):
+        pid = self._pycro_id(info)
+        # Remove any legacy/bare-name entries first
+        self._starred_pycros.discard(info.name)
+        self._starred_pycros.discard(pid)
+        if starred:
+            self._starred_pycros.add(pid)
+        self._write_settings_updates({"starred_pycros": sorted(self._starred_pycros)})
+        self._refresh_all_grids()
 
     def refresh(self):
         infos = self._scan_pycros()
@@ -178,11 +561,44 @@ class PycroGrid(QScrollArea):
 
     def _apply_filter(self):
         query = (self._search_field.text() or "").strip()
-        if not query:
-            filtered = list(self._all_infos)
-        else:
-            filtered = [info for info in self._all_infos if self._matches_query(info, query)]
+        filtered = list(self._all_infos)
+        if not self._show_remote_pycros:
+            filtered = [info for info in filtered if not info.is_remote]
+        if self._stars_only:
+            filtered = [info for info in filtered if self._is_starred(info)]
+        if query:
+            filtered = [info for info in filtered if self._matches_query(info, query)]
+        filtered = self._sort_infos(filtered)
         self._rebuild(filtered)
+
+    @staticmethod
+    def _pycro_id(info: 'PycroInfo') -> str:
+        prefix = "remote:" if getattr(info, "is_remote", False) else "local:"
+        return prefix + (getattr(info, "name", "") or "")
+
+    def _is_starred(self, info: 'PycroInfo') -> bool:
+        pid = self._pycro_id(info)
+        return pid in self._starred_pycros or info.name in self._starred_pycros
+
+    def _sort_infos(self, infos: list['PycroInfo']) -> list['PycroInfo']:
+        if self._sort_mode == "alphabetical":
+            return sorted(infos, key=lambda i: (i.display_name or i.name).lower())
+
+        order: dict[str, int] = {}
+        for idx, pid in enumerate(self._recently_launched):
+            if isinstance(pid, str) and pid not in order:
+                order[pid] = idx
+
+        def sort_key(i: 'PycroInfo'):
+            pid = self._pycro_id(i)
+            rank = order.get(pid)
+            if rank is None:
+                rank = order.get(i.name)
+            if rank is None:
+                rank = 10**9
+            return (rank, (i.display_name or i.name).lower())
+
+        return sorted(infos, key=sort_key)
 
     def _matches_query(self, info: 'PycroInfo', query: str) -> bool:
         q = query.lower()
@@ -236,7 +652,14 @@ class PycroGrid(QScrollArea):
             self._cards.clear()
 
             for info in infos:
-                card = PycroCard(info, parent=self)
+                try:
+                    card = PycroCard(info, parent=self)
+                except Exception as e:
+                    try:
+                        print(f"Failed to build card for '{getattr(info, 'name', '?')}': {e}")
+                    except Exception:
+                        pass
+                    continue
                 if info.name in self._invalid_pycros:
                     try:
                         card.set_invalid(True)
@@ -439,6 +862,8 @@ class PycroGrid(QScrollArea):
         self._show_info_popup(txt, anchor, duration=0)
 
     def eventFilter(self, obj, event):
+        if obj is getattr(self, "_search_field", None) and event.type() in (QEvent.Resize, QEvent.Show):
+            self._position_filter_btn()
         # Handle hover over info buttons to show popup quickly
         if isinstance(obj, QWidget) and obj.property("callout_text") is not None:
             if event.type() == QEvent.Enter:
@@ -604,6 +1029,15 @@ class PycroCard(QWidget):
         )
         title_row.addWidget(title, 1)
 
+        self.star_btn = TransparentToolButton(self)
+        self.star_btn.setFixedSize(24, 24)
+        self.star_btn.setIconSize(QSize(20, 20))
+        self.star_btn.setCursor(Qt.PointingHandCursor)
+        self.star_btn.setStyleSheet("QToolButton{border:none;}")
+        self.star_btn.clicked.connect(self._on_star_clicked)
+        self._sync_star_icon()
+        title_row.addWidget(self.star_btn, 0, Qt.AlignVCenter | Qt.AlignRight)
+
         if info.info_lines:
             info_btn = TransparentToolButton(FIF.INFO, self)
             info_btn.setFixedSize(24, 24)
@@ -749,6 +1183,23 @@ class PycroCard(QWidget):
             self.launch_btn.setStyleSheet(self._launch_btn_default_style)
             self.launch_btn.setToolTip('')
 
+    def _sync_star_icon(self):
+        try:
+            starred = self._grid._is_starred(self.info)
+        except Exception:
+            starred = False
+        try:
+            self.star_btn.setIcon(self._grid._star_filled_icon if starred else self._grid._star_outline_icon)
+            self.star_btn.setToolTip("Unstar" if starred else "Star")
+        except Exception:
+            pass
+
+    def _on_star_clicked(self):
+        try:
+            self._grid.toggle_star(self.info)
+        except Exception:
+            self._sync_star_icon()
+
     def _on_launch(self):
         window = self.window()
         page = self._grid._build_page(self.info)
@@ -765,9 +1216,17 @@ class PycroCard(QWidget):
             pass
         try:
             window.addMacroTab(self.info.name, self.info.display_name, QIcon(), page, replace_existing=True)
+            try:
+                self._grid.record_launch(self.info)
+            except Exception:
+                pass
         except Exception:
             widget = _load_pycro_widget(self.info)
             if widget is not None:
                 widget.setWindowTitle(self.info.display_name)
                 widget.resize(800, 600)
                 widget.show()
+                try:
+                    self._grid.record_launch(self.info)
+                except Exception:
+                    pass

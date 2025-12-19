@@ -239,13 +239,24 @@ class Settings(QWidget):
     def _save_settings(self, *_args):
         """Save settings to settings.json"""
         try:
-            settings = {
+            settings = {}
+            try:
+                if os.path.exists(self.settings_file):
+                    with open(self.settings_file, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                        if isinstance(loaded, dict):
+                            settings = loaded
+            except Exception:
+                settings = {}
+
+            settings.update({
                 "repo_url": self.repo_url_field.text(),
                 "repo_branch": self.branch_field.text(),
                 "repo_directory": self.directory_field.text(),
                 "update_remote_on_launch": self.update_remote_toggle.isChecked()
-            }
-            with open(self.settings_file, 'w') as f:
+            })
+
+            with open(self.settings_file, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=4)
         except Exception as e:
             print(f"Error saving settings: {e}")
@@ -440,6 +451,9 @@ class Window(MSFluentWindow):
         # Holds active macro pages mapped by routeKey
         self.macro_pages: dict[str, QWidget] = {}
         self.macro_labels: dict[str, str] = {}
+        # Remember last active sidebar interface (used when closing tabs)
+        self._last_sidebar_widget: QWidget | None = None
+        self._last_sidebar_route_key: str | None = None
 
 
         # create sub interface
@@ -462,6 +476,11 @@ class Window(MSFluentWindow):
 
         self.initNavigation()
         self.initWindow()
+        # Default last sidebar target is Hub
+        try:
+            self._remember_sidebar_interface(self.homeInterface)
+        except Exception:
+            pass
         try:
             self.settingsInterface.updateFinished.connect(self._on_settings_update)
         except Exception:
@@ -487,6 +506,18 @@ class Window(MSFluentWindow):
 
         ))))
         self.addSubInterface(self.homeInterface, hub, 'Hub', hub, NavigationItemPosition.TOP)
+
+        # Stars page under Hub
+        ti_stars = QIcon(QPixmap.fromImage(ImageQt(TablerIcons.load(
+            OutlineIcon.STARS,
+            size=24,
+            color="#FFFFFF",
+            stroke_width=2.0,
+        ))))
+        self.starsGrid = PycroGrid(self, stars_only=True)
+        self.starsGrid.setObjectName("starsInterface")
+        self.addSubInterface(self.starsGrid, ti_stars, 'Stars', ti_stars, NavigationItemPosition.TOP)
+
         # Packages page button under Hub
         ti_pkg = QIcon(QPixmap.fromImage(ImageQt(TablerIcons.load(
             OutlineIcon.PLAYLIST_X,
@@ -498,7 +529,7 @@ class Window(MSFluentWindow):
         self.addSubInterface(self.packagesPage, ti_pkg, 'Packages', ti_pkg, NavigationItemPosition.TOP)
         # revalidate hub grid after uninstall/install changes
         try:
-            self.packagesPage.packagesChanged.connect(lambda: self.hubGrid.refresh())
+            self.packagesPage.packagesChanged.connect(lambda: (self.hubGrid.refresh(), getattr(self, "starsGrid", None) and self.starsGrid.refresh()))
         except Exception:
             pass
         self.addSubInterface(self.settingsInterface, FIF.SETTING, 'Settings', FIF.SETTING, NavigationItemPosition.BOTTOM)
@@ -558,6 +589,48 @@ class Window(MSFluentWindow):
         """Switch to the Hub grid view."""
         self.switchTo(self.homeInterface)
         self.homeInterface.setCurrentWidget(self.hubGrid)
+        try:
+            self.navigationInterface.setCurrentItem(self.homeInterface.objectName())
+        except Exception:
+            pass
+
+    def _remember_sidebar_interface(self, widget: QWidget | None):
+        if widget is None or widget is self.tabsInterface:
+            return
+        try:
+            self._last_sidebar_widget = widget
+            self._last_sidebar_route_key = widget.objectName()
+        except Exception:
+            self._last_sidebar_widget = widget
+
+    def _restore_last_sidebar_interface(self):
+        """Return to the last navigation interface used before entering tabs."""
+        target = self._last_sidebar_widget
+        if target is None or target is self.tabsInterface:
+            target = self.homeInterface
+
+        try:
+            if target is self.homeInterface:
+                self.homeInterface.setCurrentWidget(self.hubGrid)
+        except Exception:
+            pass
+
+        try:
+            self.switchTo(target)
+        except Exception:
+            try:
+                self.switchTo(self.homeInterface)
+            except Exception:
+                pass
+
+        try:
+            self.navigationInterface.setCurrentItem(target.objectName())
+        except Exception:
+            try:
+                if self._last_sidebar_route_key:
+                    self.navigationInterface.setCurrentItem(self._last_sidebar_route_key)
+            except Exception:
+                pass
 
     def showMessageBox(self):
         w = MessageBox(
@@ -847,6 +920,18 @@ class Window(MSFluentWindow):
             pass
 
     def onTabCloseRequested(self, index: int):
+        # Remember current context to decide whether to return to sidebar after closing
+        was_current = False
+        try:
+            was_current = index == self.tabBar.currentIndex()
+        except Exception:
+            was_current = False
+        tabs_were_active = False
+        try:
+            tabs_were_active = self.stackedWidget.currentWidget() is self.tabsInterface
+        except Exception:
+            tabs_were_active = False
+
         # Find routeKey by temporarily selecting the tab or matching text
         routeKey = None
         label = None
@@ -873,12 +958,13 @@ class Window(MSFluentWindow):
                 pass
 
         if routeKey is None:
-            # as a last resort, remove the tab and return to Hub
+            # as a last resort, remove the tab and return to last sidebar view
             try:
                 self.tabBar.removeTab(index)
             except Exception:
                 pass
-            self.showHub()
+            if tabs_were_active and was_current:
+                self._restore_last_sidebar_interface()
             return
 
         # Dispose content widget
@@ -897,8 +983,18 @@ class Window(MSFluentWindow):
         except Exception:
             pass
 
-        # Show Hub
-        self.showHub()
+        remaining_tabs = 0
+        try:
+            remaining_tabs = len(self.macro_pages)
+        except Exception:
+            try:
+                remaining_tabs = self.tabBar.count()
+            except Exception:
+                remaining_tabs = 0
+
+        # Return to last sidebar item only when closing the active tab (or when no tabs remain)
+        if tabs_were_active and (was_current or remaining_tabs == 0):
+            self._restore_last_sidebar_interface()
         # unlock packages if no tabs remain
         try:
             self.packagesPage.setLocked(len(self.macro_pages) > 0)
@@ -929,6 +1025,11 @@ class Window(MSFluentWindow):
             self.hubGrid.refresh()
         except Exception:
             pass
+        try:
+            if hasattr(self, "starsGrid"):
+                self.starsGrid.refresh()
+        except Exception:
+            pass
 
     def _deselect_navigation(self):
         """Clear selection on navigation sidebar when tabs are active."""
@@ -948,6 +1049,10 @@ class Window(MSFluentWindow):
         else:
             # A navigation item is active - disable tab highlight
             self.titleBar.setTabsSelectionHighlightEnabled(False)
+            try:
+                self._remember_sidebar_interface(w)
+            except Exception:
+                pass
 
     def _has_text_editor(self) -> bool:
         """Return True if the current view is a text editor-like widget."""

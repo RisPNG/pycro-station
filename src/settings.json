@@ -2,5 +2,11 @@
     "repo_url": "https://github.com/RisPNG/pycro-station.git",
     "repo_branch": "main",
     "repo_directory": "pycros",
-    "update_remote_on_launch": true
+    "update_remote_on_launch": true,
+    "hub_sort_mode": "alphabetical",
+    "hub_show_remote_pycros": true,
+    "stars_sort_mode": "alphabetical",
+    "stars_show_remote_pycros": true,
+    "recently_launched": [],
+    "starred_pycros": []
 }

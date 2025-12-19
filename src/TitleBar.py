@@ -10,6 +10,7 @@ class CustomTitleBar(MSFluentTitleBar):
 
     def __init__(self, parent):
         super().__init__(parent)
+        self._window = parent
 
         # add buttons
         self.toolButtonLayout = QHBoxLayout()
@@ -79,8 +80,8 @@ class CustomTitleBar(MSFluentTitleBar):
         self.menu = RoundMenu("Menu", self)
         self.menu.setStyleSheet("QMenu{color : red;}")
 
-        close_current_action = Action(FIF.CLOSE, 'Close selected tab')
-        close_all_action = Action(FIF.DELETE, 'Close all tabs')
+        self.close_current_action = Action(FIF.CLOSE, 'Close selected tab')
+        self.close_all_action = Action(FIF.DELETE, 'Close all tabs')
 
         def _close_current_tab():
             try:
@@ -105,17 +106,44 @@ class CustomTitleBar(MSFluentTitleBar):
                     except Exception:
                         pass
 
-        close_current_action.triggered.connect(_close_current_tab)
-        close_all_action.triggered.connect(_close_all_tabs)
+        self.close_current_action.triggered.connect(_close_current_tab)
+        self.close_all_action.triggered.connect(_close_all_tabs)
 
-        self.menu.addAction(close_current_action)
-        self.menu.addAction(close_all_action)
+        self.menu.addAction(self.close_current_action)
+        self.menu.addAction(self.close_all_action)
 
         # Create the menuButton
         self.menuButton.clicked.connect(self.showMenu)
+        self._sync_menu_actions_enabled()
+        try:
+            self.tabBar.currentChanged.connect(lambda *_: self._sync_menu_actions_enabled())
+        except Exception:
+            pass
+
+    def _sync_menu_actions_enabled(self):
+        """Enable/disable menu actions depending on whether any tabs exist."""
+        try:
+            count = self.tabBar.count()
+        except Exception:
+            count = 0
+        has_tabs = bool(count and count > 0)
+
+        try:
+            self.close_all_action.setEnabled(has_tabs)
+        except Exception:
+            pass
+        try:
+            idx = self.tabBar.currentIndex()
+            self.close_current_action.setEnabled(has_tabs and idx >= 0)
+        except Exception:
+            try:
+                self.close_current_action.setEnabled(has_tabs)
+            except Exception:
+                pass
 
     def showMenu(self):
         # Show the prebuilt menu at the bottom-left of the button
+        self._sync_menu_actions_enabled()
         self.menu.exec(self.menuButton.mapToGlobal(self.menuButton.rect().bottomLeft()))
 
     # --- Helpers for Window to control tab selection highlight ---
