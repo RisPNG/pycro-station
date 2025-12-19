@@ -9,7 +9,7 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 ' Work from the folder where this .vbs lives
 cwd = fso.GetParentFolderName(WScript.ScriptFullName)
 sh.CurrentDirectory = cwd
-ps1 = cwd & "\run.ps1"
+ps1 = cwd & "\ps_script.ps1"
 silentExe = cwd & "\src\SilentCMD\SilentCMD.exe"
 
 ' Pick the right PowerShell (handles 32-bit wscript on 64-bit Windows)
