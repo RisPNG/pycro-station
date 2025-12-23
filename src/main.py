@@ -1,13 +1,14 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -636,8 +637,8 @@ class Settings(QWidget):
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        later_btn = QPushButton("Later", dialog)
-        disable_btn = QPushButton("Disable update check", dialog)
+        later_btn = PushButton("Later", dialog)
+        disable_btn = PushButton("Disable update check", dialog)
         update_btn = PrimaryPushButton("Update now", dialog)
         buttons.addWidget(later_btn)
         buttons.addWidget(disable_btn)
@@ -792,13 +793,13 @@ class Settings(QWidget):
                     shutil.copy2(src_file, tmp_file)
                     os.replace(tmp_file, dst_file)
 
-                msg = "Updated app source files. Please restart Pycro Station."
+                msg = "Updated app source files."
                 try:
                     main_py = os.path.join(source_path, "main.py")
                     with open(main_py, "r", encoding="utf-8", errors="ignore") as f:
                         remote_version = self._extract_version_from_text(f.read())
                     if remote_version:
-                        msg = f"Updated to {remote_version}. Please restart Pycro Station."
+                        msg = f"Updated to {remote_version}."
                 except Exception:
                     pass
 
@@ -818,6 +819,43 @@ class Settings(QWidget):
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
+    def _relaunch_app(self) -> bool:
+        """Launch a new instance and quit the current one."""
+        program = sys.executable
+        main_py = os.path.realpath(__file__)
+        args = [main_py] + sys.argv[1:]
+        workdir = os.path.abspath(os.path.join(os.path.dirname(main_py), ".."))
+
+        ok = False
+        try:
+            result = QProcess.startDetached(program, args, workdir)
+            ok = result[0] if isinstance(result, tuple) else bool(result)
+        except Exception:
+            ok = False
+
+        if not ok:
+            import subprocess
+
+            try:
+                kwargs = {"cwd": workdir, "close_fds": True}
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                subprocess.Popen([program] + args, **kwargs)
+                ok = True
+            except Exception as e:
+                MessageBox("Relaunch failed", str(e), self).exec()
+                return False
+
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.closeAllWindows()
+        except Exception:
+            pass
+
+        QTimer.singleShot(0, QCoreApplication.quit)
+        return True
+
     def _finish_app_update(self, success: bool, message: str):
         self.force_update_btn.setEnabled(True)
         self.force_update_btn.setText("Force Update")
@@ -828,8 +866,21 @@ class Settings(QWidget):
                 print(f"Silent app update failed: {message}")
             return
 
-        title = "Success" if success else "Update failed"
-        msg = MessageBox(title, message or "", self)
+        if success:
+            details = (message or "").strip()
+            text = f"{details}\n\nRelaunch Pycro Station now?" if details else "Relaunch Pycro Station now?"
+            prompt = MessageBox(
+                "Update complete",
+                text,
+                self,
+            )
+            prompt.yesButton.setText("Relaunch")
+            prompt.cancelButton.setText("Later")
+            if prompt.exec():
+                self._relaunch_app()
+            return
+
+        msg = MessageBox("Update failed", message or "", self)
         msg.yesButton.setText("OK")
         msg.cancelButton.hide()
         msg.exec()
