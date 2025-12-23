@@ -1,7 +1,7 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
@@ -872,7 +872,7 @@ class Settings(QWidget):
                 subprocess.Popen([program] + args, **kwargs)
                 ok = True
             except Exception as e:
-                MessageBox("Relaunch failed", str(e), self).exec()
+                MessageBox("Relaunch failed", str(e), self.window() or self).exec()
                 return False
 
         try:
@@ -898,10 +898,11 @@ class Settings(QWidget):
         if success:
             details = (message or "").strip()
             text = f"{details}\n\nRelaunch Pycro Station now?" if details else "Relaunch Pycro Station now?"
+            parent = self.window() or self
             prompt = MessageBox(
                 "Update complete",
                 text,
-                self,
+                parent,
             )
             prompt.yesButton.setText("Relaunch")
             prompt.cancelButton.setText("Later")
@@ -909,7 +910,7 @@ class Settings(QWidget):
                 self._relaunch_app()
             return
 
-        msg = MessageBox("Update failed", message or "", self)
+        msg = MessageBox("Update failed", message or "", self.window() or self)
         msg.yesButton.setText("OK")
         msg.cancelButton.hide()
         msg.exec()
