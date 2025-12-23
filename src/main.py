@@ -609,49 +609,54 @@ class Settings(QWidget):
 
     def _prompt_app_update(self, remote_version: str):
         """Show update prompt with later/disable/update-now options."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Update Available")
-        dialog.setModal(True)
+        parent = self.window() or self
+        text = f"An update is available for version {remote_version}.\nCurrent version: {APP_VERSION}"
 
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        msg = MessageBox("Update Available", text, parent)
+        msg.yesButton.setText("Update now")
+        msg.cancelButton.setText("Later")
 
-        title = QLabel("Update Available", dialog)
-        title.setStyleSheet("color: #dcdcdc; background: transparent; font-size: 16px; font-weight: 600;")
+        disable_btn = QPushButton("Disable update check", msg.buttonGroup)
+        disable_btn.setObjectName("cancelButton")
+        try:
+            disable_btn.setAttribute(Qt.WA_LayoutUsesWidgetRect)
+        except Exception:
+            pass
 
-        content = QLabel(
-            f"An update is available for version {remote_version}.\nCurrent version: {APP_VERSION}",
-            dialog,
-        )
-        content.setWordWrap(True)
-        content.setStyleSheet("color: #dcdcdc; background: transparent;")
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        later_btn = PushButton("Later", dialog)
-        disable_btn = PushButton("Disable update check", dialog)
-        update_btn = PrimaryPushButton("Update now", dialog)
-        buttons.addWidget(later_btn)
-        buttons.addWidget(disable_btn)
-        buttons.addWidget(update_btn)
-
-        layout.addWidget(title)
-        layout.addWidget(content)
-        layout.addLayout(buttons)
+        # Prefer button order: Later / Disable / Update now
+        try:
+            msg.buttonLayout.removeWidget(msg.yesButton)
+            msg.buttonLayout.removeWidget(msg.cancelButton)
+            msg.buttonLayout.addWidget(msg.cancelButton, 1, Qt.AlignVCenter)
+            msg.buttonLayout.addWidget(disable_btn, 1, Qt.AlignVCenter)
+            msg.buttonLayout.addWidget(msg.yesButton, 1, Qt.AlignVCenter)
+        except Exception:
+            try:
+                msg.buttonLayout.insertWidget(1, disable_btn, 1, Qt.AlignVCenter)
+            except Exception:
+                pass
 
         choice = {"value": "later"}
 
         def choose(value: str):
             choice["value"] = value
-            dialog.accept()
 
-        later_btn.clicked.connect(lambda: choose("later"))
-        disable_btn.clicked.connect(lambda: choose("disable"))
-        update_btn.clicked.connect(lambda: choose("update"))
+        def on_disable_clicked():
+            choose("disable")
+            try:
+                msg.reject()
+            except Exception:
+                try:
+                    msg.close()
+                except Exception:
+                    pass
+
+        msg.cancelButton.clicked.connect(lambda: choose("later"))
+        msg.yesButton.clicked.connect(lambda: choose("update"))
+        disable_btn.clicked.connect(on_disable_clicked)
 
         try:
-            dialog.exec()
+            msg.exec()
         except Exception:
             return
 
