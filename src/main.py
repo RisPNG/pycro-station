@@ -1,7 +1,7 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
@@ -10,6 +10,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -496,14 +497,7 @@ class Settings(QWidget):
                 archive_file = os.path.join(temp_dir, "repo.zip")
 
                 # Download archive (no git dependency)
-                try:
-                    req = urllib.request.Request(archive_url, headers={"User-Agent": "pycro-station"})
-                    with urllib.request.urlopen(req, timeout=60) as resp, open(archive_file, "wb") as out:
-                        shutil.copyfileobj(resp, out)
-                except urllib.error.HTTPError as e:
-                    raise RuntimeError(f"Failed to download archive (HTTP {e.code}).")
-                except urllib.error.URLError as e:
-                    raise RuntimeError(f"Failed to download archive: {e.reason}")
+                self._download_url_to_file(archive_url, archive_file)
 
                 # Extract safely
                 os.makedirs(clone_dir, exist_ok=True)
@@ -582,9 +576,7 @@ class Settings(QWidget):
                 archive_url = self._build_archive_url(repo_url, branch)
                 archive_file = os.path.join(temp_dir, "repo.zip")
 
-                req = urllib.request.Request(archive_url, headers={"User-Agent": "pycro-station"})
-                with urllib.request.urlopen(req, timeout=60) as resp, open(archive_file, "wb") as out:
-                    shutil.copyfileobj(resp, out)
+                self._download_url_to_file(archive_url, archive_file)
 
                 os.makedirs(clone_dir, exist_ok=True)
                 with zipfile.ZipFile(archive_file, "r") as zf:
@@ -678,6 +670,45 @@ class Settings(QWidget):
         return f"{base}/archive/refs/heads/{branch}.zip"
 
     @staticmethod
+    def _download_url_to_file(url: str, dst_path: str, *, timeout: int = 60, attempts: int = 3):
+        """Download a URL to a local file with retry/backoff for transient network failures."""
+        headers = {"User-Agent": "pycro-station"}
+        attempts = max(1, int(attempts))
+        last_err: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp, open(dst_path, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+                return
+            except urllib.error.HTTPError as e:
+                last_err = e
+                code = int(getattr(e, "code", 0) or 0)
+                # Retry 5xx errors; surface others immediately.
+                if not (500 <= code < 600 and attempt < attempts):
+                    raise RuntimeError(f"Failed to download archive (HTTP {e.code}).") from e
+            except (urllib.error.URLError, ConnectionResetError, TimeoutError, OSError) as e:
+                last_err = e
+            except Exception as e:
+                last_err = e
+
+            if attempt < attempts:
+                time.sleep(min(2**attempt, 8))
+
+        detail = ""
+        if isinstance(last_err, urllib.error.URLError) and getattr(last_err, "reason", None):
+            detail = str(last_err.reason)
+        elif last_err is not None:
+            detail = str(last_err)
+
+        msg = "Failed to download update archive."
+        if detail:
+            msg = f"{msg} ({detail})"
+        msg = f"{msg} Please check your internet/VPN and try again."
+        raise RuntimeError(msg) from last_err
+
+    @staticmethod
     def _safe_extract(zip_file: zipfile.ZipFile, target_dir: str):
         target_dir_abs = os.path.abspath(target_dir)
         for member in zip_file.infolist():
@@ -766,9 +797,7 @@ class Settings(QWidget):
                 archive_url = self._build_archive_url(repo_url, branch)
                 archive_file = os.path.join(temp_dir, "repo.zip")
 
-                req = urllib.request.Request(archive_url, headers={"User-Agent": "pycro-station"})
-                with urllib.request.urlopen(req, timeout=60) as resp, open(archive_file, "wb") as out:
-                    shutil.copyfileobj(resp, out)
+                self._download_url_to_file(archive_url, archive_file)
 
                 os.makedirs(clone_dir, exist_ok=True)
                 with zipfile.ZipFile(archive_file, "r") as zf:
