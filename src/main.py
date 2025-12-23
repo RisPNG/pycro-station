@@ -659,8 +659,8 @@ class Settings(QWidget):
             self.app_update_toggle.setChecked(False)
             self._save_settings()
         elif choice["value"] == "update":
-            self._start_app_update(show_dialog=True)
-
+            # Let the dialog fully close before kicking off the update.
+            QTimer.singleShot(0, lambda: self._start_app_update(show_dialog=True))
     @staticmethod
     def _build_archive_url(repo_url: str, branch: str) -> str:
         base = (repo_url or "").strip()
