@@ -1,7 +1,7 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
@@ -615,6 +615,13 @@ class Settings(QWidget):
         msg = MessageBox("Update Available", text, parent)
         msg.yesButton.setText("Update now")
         msg.cancelButton.setText("Later")
+
+        # Make the dialog a bit wider for readability
+        try:
+            min_width = 520
+            msg.widget.setFixedWidth(max(msg.widget.width(), min_width))
+        except Exception:
+            pass
 
         disable_btn = QPushButton("Disable update check", msg.buttonGroup)
         disable_btn.setObjectName("cancelButton")
