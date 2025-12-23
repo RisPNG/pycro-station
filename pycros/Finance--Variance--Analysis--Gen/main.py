@@ -117,6 +117,21 @@ MONTH_TO_NUM = {
 # Items to exclude for Higher General Administrative Expenses
 GAE_EXCLUDE = ["Bonus", "Performance Incentives", "Charity & Donations", "Write-Off Fixed Asset", "Office Rental"]
 
+# Page 7 (General Administrative Expenses) payroll-related items to display as a single group.
+PAGE7_PAYROLL_ITEMS = {
+    "Salaries, Wages & Related Cost",
+    "Allowance",
+    "Bonus",
+    "Performance Incentives",
+    "E.P.F.",
+    "EIS (SIP)",
+    "Gratuity Payment",
+    "Overtime",
+    "Red Packets",
+    "Socso",
+}
+PAGE7_PAYROLL_ITEMS_NORM = {item.strip().casefold() for item in PAGE7_PAYROLL_ITEMS}
+
 
 def _emit(log_emit, text: str):
     if callable(log_emit):
@@ -126,6 +141,28 @@ def _emit(log_emit, text: str):
         except Exception:
             pass
     print(text)
+
+
+def header_matches_cell(cell_text: Any, header: str) -> bool:
+    """
+    Return True if a MA header cell matches the desired header.
+    Supports whitespace variants like 'NOV 2025' vs 'NOV2025'.
+    """
+    if cell_text is None or header is None:
+        return False
+
+    cell_upper = str(cell_text).strip().upper()
+    header_upper = str(header).strip().upper()
+
+    if not cell_upper or not header_upper:
+        return False
+
+    if header_upper in cell_upper:
+        return True
+
+    cell_compact = re.sub(r"\s+", "", cell_upper)
+    header_compact = re.sub(r"\s+", "", header_upper)
+    return header_compact in cell_compact
 
 
 def get_cell_displayed_value(cell) -> str:
@@ -303,56 +340,102 @@ def get_values_for_production_overhead(ma_workbooks: List[Tuple[str, UnifiedWork
     """
     Get production overhead values from Page 5 and Page 6.
     Returns list of (description, left_sum, right_sum).
+    Only reads each header from ONE source file to avoid double-counting.
     """
     from openpyxl.utils import column_index_from_string
 
-    results = {}  # description -> [left_values, right_values]
+    results = {}  # description -> [left_value, right_value]
+
+    # Track which headers have been processed per sheet to avoid double-counting
+    processed_headers = {
+        "Page 5": {"left": set(), "right": set()},
+        "Page 6": {"left": set(), "right": set()}
+    }
 
     for sheet_name in ["Page 5", "Page 6"]:
+        sheet_items_count = 0
         for fname, wb in ma_workbooks:
             if sheet_name not in wb.sheetnames:
+                _emit(log_emit, f"      [{sheet_name}] Sheet not found in {fname}")
                 continue
             ws = wb[sheet_name]
+            _emit(log_emit, f"      [{sheet_name}] Processing from {fname}")
 
             # Find column for each header
             for is_left, headers in [(True, left_headers), (False, right_headers)]:
+                side_key = "left" if is_left else "right"
+
                 for header in headers:
+                    # Skip if this header was already processed from another file for this sheet
+                    if header in processed_headers[sheet_name][side_key]:
+                        continue
+
                     col_idx = None
                     header_row = None
 
                     for col_letter in search_cols:
                         c_idx = column_index_from_string(col_letter)
-                        for row in range(1, min(20, ws.max_row + 1)):
-                            cell_val = ws.cell_displayed_value(row, c_idx).strip().upper()
-                            if header.upper() in cell_val:
+                        for row in range(1, min(50, ws.max_row + 1)):
+                            cell_val = ws.cell_displayed_value(row, c_idx)
+                            if header_matches_cell(cell_val, header):
                                 col_idx = c_idx
                                 header_row = row
+                                _emit(log_emit, f"      [{sheet_name}] Found header '{header}' at row {row}, col {col_letter}")
                                 break
                         if col_idx:
                             break
 
                     if not col_idx:
+                        _emit(log_emit, f"      [{sheet_name}] Header '{header}' not found")
                         continue
 
-                    # Find PRODUCTION OVERHEAD section
-                    po_start_row = None
-                    for row in range(header_row + 1, ws.max_row + 1):
+                    # Mark this header as processed for this sheet
+                    processed_headers[sheet_name][side_key].add(header)
+
+                    # Check if page title (before header row) contains "PRODUCTION OVERHEAD"
+                    # This handles Page 6 where A2 = "COST OF PRODUCTION - PRODUCTION OVERHEADS"
+                    is_page_level_overhead = False
+                    for row in range(1, header_row):
                         col_a_val = ws.cell_displayed_value(row, 1).strip().upper()
                         if "PRODUCTION OVERHEAD" in col_a_val:
-                            po_start_row = row
+                            is_page_level_overhead = True
+                            _emit(log_emit, f"      [{sheet_name}] Page-level overhead detected at row {row}: {col_a_val[:50]}")
                             break
 
-                    if not po_start_row:
-                        continue
+                    if is_page_level_overhead:
+                        # Page 6 style: entire page is production overhead, start after header row
+                        # Skip the currency row (RM) by starting from header_row + 2
+                        data_start_row = header_row + 2
+                        _emit(log_emit, f"      [{sheet_name}] Reading items from row {data_start_row} (page-level)")
+                    else:
+                        # Page 5 style: find PRODUCTION OVERHEAD section marker
+                        po_start_row = None
+                        for row in range(header_row + 1, ws.max_row + 1):
+                            col_a_val = ws.cell_displayed_value(row, 1).strip().upper()
+                            if "PRODUCTION OVERHEAD" in col_a_val:
+                                po_start_row = row
+                                _emit(log_emit, f"      [{sheet_name}] Found section marker at row {row}: {col_a_val[:50]}")
+                                break
+
+                        if not po_start_row:
+                            _emit(log_emit, f"      [{sheet_name}] No PRODUCTION OVERHEAD section found after header row")
+                            continue
+                        data_start_row = po_start_row + 1
+                        _emit(log_emit, f"      [{sheet_name}] Reading items from row {data_start_row} (section)")
 
                     # Get values under PRODUCTION OVERHEAD
-                    for row in range(po_start_row + 1, ws.max_row + 1):
+                    items_found = 0
+                    for row in range(data_start_row, ws.max_row + 1):
                         col_a_val = ws.cell_displayed_value(row, 1).strip()
                         cell_val = ws.cell_value(row, col_idx)
 
-                        # Stop at next major section
-                        if col_a_val and not col_a_val.startswith(" ") and "TOTAL" in col_a_val.upper():
-                            break
+                        # Stop at next major section (but not at Sub-Total carry-forward rows)
+                        col_a_upper = col_a_val.upper()
+                        if col_a_val and not col_a_val.startswith(" ") and "TOTAL" in col_a_upper:
+                            # Skip "Sub-Total" rows - these are carry-forwards, not section endings
+                            if "SUB-TOTAL" not in col_a_upper and "SUB TOTAL" not in col_a_upper and "SUBTOTAL" not in col_a_upper:
+                                _emit(log_emit, f"      [{sheet_name}] Stopped at TOTAL row {row}: {col_a_val[:30]}")
+                                break
 
                         if cell_val is not None and cell_val != "" and col_a_val:
                             try:
@@ -364,8 +447,14 @@ def get_values_for_production_overhead(ma_workbooks: List[Tuple[str, UnifiedWork
                                     results[key][0] += numeric_val
                                 else:
                                     results[key][1] += numeric_val
+                                items_found += 1
                             except (ValueError, TypeError):
                                 pass
+
+                    sheet_items_count += items_found
+                    _emit(log_emit, f"      [{sheet_name}] Found {items_found} items for header '{header}'")
+
+        _emit(log_emit, f"      [{sheet_name}] Total items from this sheet: {sheet_items_count}")
 
     return [(k, v[0], v[1]) for k, v in results.items() if v[0] != 0 or v[1] != 0]
 
@@ -378,11 +467,15 @@ def get_values_for_page8_section(ma_workbooks: List[Tuple[str, UnifiedWorkbook]]
     """
     Get values from Page 8 for a specific section (A or B).
     Returns list of (description, left_sum, right_sum).
+    Only reads each header from ONE source file to avoid double-counting.
     """
     from openpyxl.utils import column_index_from_string
 
-    results = {}
+    results = {}  # description -> [left_value, right_value]
     next_section = "B" if section_letter == "A" else None
+
+    # Track which headers have been processed to avoid double-counting
+    processed_headers = {"left": set(), "right": set()}
 
     for fname, wb in ma_workbooks:
         if "Page 8" not in wb.sheetnames:
@@ -390,15 +483,21 @@ def get_values_for_page8_section(ma_workbooks: List[Tuple[str, UnifiedWorkbook]]
         ws = wb["Page 8"]
 
         for is_left, headers in [(True, left_headers), (False, right_headers)]:
+            side_key = "left" if is_left else "right"
+
             for header in headers:
+                # Skip if this header was already processed from another file
+                if header in processed_headers[side_key]:
+                    continue
+
                 col_idx = None
                 header_row = None
 
                 for col_letter in search_cols:
                     c_idx = column_index_from_string(col_letter)
                     for row in range(1, min(20, ws.max_row + 1)):
-                        cell_val = ws.cell_displayed_value(row, c_idx).strip().upper()
-                        if header.upper() in cell_val:
+                        cell_val = ws.cell_displayed_value(row, c_idx)
+                        if header_matches_cell(cell_val, header):
                             col_idx = c_idx
                             header_row = row
                             break
@@ -407,6 +506,9 @@ def get_values_for_page8_section(ma_workbooks: List[Tuple[str, UnifiedWorkbook]]
 
                 if not col_idx:
                     continue
+
+                # Mark this header as processed
+                processed_headers[side_key].add(header)
 
                 # Find section start (row starting with section_letter)
                 section_start = None
@@ -452,35 +554,54 @@ def get_values_for_page7(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
     """
     Get values from Page 7 for General Administrative Expenses.
     Returns list of (description, left_sum, right_sum).
+    Only reads each header from ONE source file to avoid double-counting.
     """
     from openpyxl.utils import column_index_from_string
 
     results = {}
 
+    # Track which headers have been processed to avoid double-counting
+    processed_headers = {"left": set(), "right": set()}
+
+    items_count = 0
     for fname, wb in ma_workbooks:
         if "Page 7" not in wb.sheetnames:
+            _emit(log_emit, f"      [Page 7] Sheet not found in {fname}")
             continue
         ws = wb["Page 7"]
+        _emit(log_emit, f"      [Page 7] Processing from {fname}, max_row={ws.max_row}")
 
         for is_left, headers in [(True, left_headers), (False, right_headers)]:
+            side_key = "left" if is_left else "right"
+
             for header in headers:
+                # Skip if this header was already processed from another file
+                if header in processed_headers[side_key]:
+                    continue
+
                 col_idx = None
                 header_row = None
 
                 for col_letter in search_cols:
                     c_idx = column_index_from_string(col_letter)
                     for row in range(1, min(20, ws.max_row + 1)):
-                        cell_val = ws.cell_displayed_value(row, c_idx).strip().upper()
-                        if header.upper() in cell_val:
+                        cell_val = ws.cell_displayed_value(row, c_idx)
+                        if header_matches_cell(cell_val, header):
                             col_idx = c_idx
                             header_row = row
+                            _emit(log_emit, f"      [Page 7] Found header '{header}' at row {row}, col {col_letter}")
                             break
                     if col_idx:
                         break
 
                 if not col_idx:
+                    _emit(log_emit, f"      [Page 7] Header '{header}' not found")
                     continue
 
+                # Mark this header as processed
+                processed_headers[side_key].add(header)
+
+                header_items = 0
                 for row in range(header_row + 1, ws.max_row + 1):
                     col_b_val = ws.cell_displayed_value(row, 2).strip()
                     cell_val = ws.cell_value(row, col_idx)
@@ -504,8 +625,19 @@ def get_values_for_page7(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
                                 results[key][0] += numeric_val
                             else:
                                 results[key][1] += numeric_val
+                            header_items += 1
                         except (ValueError, TypeError):
                             pass
+
+                _emit(log_emit, f"      [Page 7] Found {header_items} items for header '{header}'")
+                items_count += header_items
+
+    _emit(log_emit, f"      [Page 7] Total unique items collected: {len(results)}")
+
+    # Log top 5 by absolute difference
+    sorted_results = sorted(results.items(), key=lambda x: abs(x[1][0] - x[1][1]), reverse=True)[:5]
+    for desc, (left, right) in sorted_results:
+        _emit(log_emit, f"      [Page 7] Top item: {desc[:30]} = {left:.2f} - {right:.2f} = {left-right:.2f}")
 
     return [(k, v[0], v[1]) for k, v in results.items() if v[0] != 0 or v[1] != 0]
 
@@ -517,10 +649,14 @@ def get_values_for_page9(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
     """
     Get values from Page 9 for Other Income (section B).
     Returns list of (description, left_sum, right_sum).
+    Only reads each header from ONE source file to avoid double-counting.
     """
     from openpyxl.utils import column_index_from_string
 
     results = {}
+
+    # Track which headers have been processed to avoid double-counting
+    processed_headers = {"left": set(), "right": set()}
 
     for fname, wb in ma_workbooks:
         if "Page 9" not in wb.sheetnames:
@@ -528,15 +664,21 @@ def get_values_for_page9(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
         ws = wb["Page 9"]
 
         for is_left, headers in [(True, left_headers), (False, right_headers)]:
+            side_key = "left" if is_left else "right"
+
             for header in headers:
+                # Skip if this header was already processed from another file
+                if header in processed_headers[side_key]:
+                    continue
+
                 col_idx = None
                 header_row = None
 
                 for col_letter in search_cols:
                     c_idx = column_index_from_string(col_letter)
                     for row in range(1, min(20, ws.max_row + 1)):
-                        cell_val = ws.cell_displayed_value(row, c_idx).strip().upper()
-                        if header.upper() in cell_val:
+                        cell_val = ws.cell_displayed_value(row, c_idx)
+                        if header_matches_cell(cell_val, header):
                             col_idx = c_idx
                             header_row = row
                             break
@@ -545,6 +687,9 @@ def get_values_for_page9(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
 
                 if not col_idx:
                     continue
+
+                # Mark this header as processed
+                processed_headers[side_key].add(header)
 
                 # Find section B start
                 section_start = None
@@ -567,6 +712,10 @@ def get_values_for_page9(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
                         break
 
                     if cell_val is not None and cell_val != "" and col_b_val and not col_b_val.upper().startswith("TOTAL"):
+                        # Skip items starting with "GAIN/(LOSS)"
+                        if col_b_val.upper().startswith("GAIN/(LOSS)"):
+                            continue
+
                         try:
                             numeric_val = float(cell_val) if not isinstance(cell_val, (int, float)) else cell_val
                             key = col_b_val.strip()
@@ -763,7 +912,12 @@ def process_variance_report(
                         ma_workbooks, left_headers, right_headers, search_cols, log_emit
                     )
                     if values:
-                        replacement_value = find_extreme_value(values, not find_lowest)  # Higher = not lowest
+                        replacement_value = find_extreme_value(values, find_lowest)
+                        if (
+                            replacement_value
+                            and replacement_value.strip().casefold() in PAGE7_PAYROLL_ITEMS_NORM
+                        ):
+                            replacement_value = "Payroll & Related Costs"
                         _emit(log_emit, f"    -> Found {len(values)} items, selected: {replacement_value}")
 
                 elif "OTHER INCOME" in displayed_upper:
@@ -772,8 +926,7 @@ def process_variance_report(
                         ma_workbooks, left_headers, right_headers, search_cols, log_emit
                     )
                     if values:
-                        # Determine lowest or highest based on text before Description
-                        replacement_value = find_extreme_value(values, find_lowest if find_lowest else not find_highest)
+                        replacement_value = find_extreme_value(values, find_lowest)
                         _emit(log_emit, f"    -> Found {len(values)} items, selected: {replacement_value}")
 
                 # Replace Description in the formula/value

@@ -2,6 +2,7 @@ import os
 import json
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import List
 
 from PySide6.QtCore import Qt, Signal
@@ -16,6 +17,208 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import PrimaryPushButton, MessageBox
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+try:
+    import xlrd
+except ImportError:  # pragma: no cover
+    xlrd = None
+
+
+def _xlrd_cell_value(book, cell):
+    """Map xlrd cell to Python types that json can encode."""
+    if xlrd is None:  # pragma: no cover
+        return None
+
+    from xlrd import (
+        XL_CELL_DATE,
+        XL_CELL_BOOLEAN,
+        XL_CELL_EMPTY,
+        XL_CELL_BLANK,
+        XL_CELL_ERROR,
+        error_text_from_code,
+        xldate_as_datetime,
+    )
+
+    if cell is None:
+        return None
+
+    if cell.ctype in (XL_CELL_EMPTY, XL_CELL_BLANK):
+        return None
+
+    if cell.ctype == XL_CELL_DATE:
+        try:
+            return xldate_as_datetime(cell.value, book.datemode)
+        except Exception:
+            return cell.value
+
+    if cell.ctype == XL_CELL_BOOLEAN:
+        return bool(cell.value)
+
+    if cell.ctype == XL_CELL_ERROR:
+        return error_text_from_code.get(cell.value, cell.value)
+
+    return cell.value
+
+
+def _extract_detailed_data_xls(file_path: str, log_emit):
+    """
+    Extract detailed cell data from legacy .xls files using xlrd.
+
+    Notes:
+    - xlrd does not expose formula text for cells; `formula` will be `None`.
+    - We still mark merged cells via `is_merged`.
+    """
+    if xlrd is None:
+        raise RuntimeError(
+            "xlrd is required to read .xls files. Click 'Install Requirements' for this pycro (or install xlrd)."
+        )
+
+    log_emit("Detected legacy .xls format; extracting values via xlrd (formula text not available for .xls).")
+
+    book = xlrd.open_workbook(file_path, formatting_info=True)
+    output_data = {}
+
+    for sheet_name in book.sheet_names():
+        sh = book.sheet_by_name(sheet_name)
+        sheet_data = {}
+
+        # --- MERGED CELL LOGIC START ---
+        # xlrd provides merged_cells as tuples of (row_lo, row_hi, col_lo, col_hi),
+        # where hi bounds are exclusive and indexes are 0-based.
+        merged_lookup = {}
+        max_row = sh.nrows
+        max_col = sh.ncols
+        for row_lo, row_hi, col_lo, col_hi in getattr(sh, "merged_cells", []) or []:
+            max_row = max(max_row, row_hi)
+            max_col = max(max_col, col_hi)
+            master = (row_lo + 1, col_lo + 1)  # 1-based
+            for r0 in range(row_lo, row_hi):
+                for c0 in range(col_lo, col_hi):
+                    merged_lookup[(r0 + 1, c0 + 1)] = master
+        # --- MERGED CELL LOGIC END ---
+
+        for r in range(1, max_row + 1):
+            for c in range(1, max_col + 1):
+                coord = f"{get_column_letter(c)}{r}"
+
+                if (r, c) in merged_lookup:
+                    mr, mc = merged_lookup[(r, c)]
+                    try:
+                        master_cell = sh.cell(mr - 1, mc - 1)
+                    except IndexError:
+                        master_cell = None
+                    val = _xlrd_cell_value(book, master_cell)
+                    is_merged = True
+                else:
+                    try:
+                        cell = sh.cell(r - 1, c - 1)
+                    except IndexError:
+                        cell = None
+                    val = _xlrd_cell_value(book, cell)
+                    is_merged = False
+
+                # xlrd doesn't provide formula text for cells, so we store None.
+                has_formula = False
+                formula_str = None
+
+                if val is not None or has_formula or is_merged:
+                    sheet_data[coord] = {
+                        "value": val,
+                        "formula": formula_str,
+                        "type": "formula" if has_formula else "static",
+                        "is_merged": is_merged,
+                    }
+
+        output_data[sheet_name] = sheet_data
+
+    return output_data
+
+
+def _extract_detailed_data_openpyxl(file_path: str):
+    """Extract detailed cell data from .xlsx/.xlsm files using openpyxl."""
+    # 1. Load workbook for VALUES
+    wb_values = load_workbook(file_path, data_only=True)
+    # 2. Load workbook for FORMULAS
+    wb_formulas = load_workbook(file_path, data_only=False)
+
+    output_data = {}
+
+    for sheet_name in wb_values.sheetnames:
+        sheet_values = wb_values[sheet_name]
+        sheet_formulas = wb_formulas[sheet_name]
+
+        sheet_data = {}
+
+        # --- MERGED CELL LOGIC START ---
+        # Create a lookup dictionary: {(row, col): (master_row, master_col)}
+        # This maps every cell in a merged range to its top-left "master" cell.
+        merged_lookup = {}
+
+        # sheet_values.merged_cells.ranges gives a list of all merged ranges (e.g., "A1:B2")
+        for merge_range in sheet_values.merged_cells.ranges:
+            min_col, min_row, max_col, max_row = (
+                merge_range.min_col,
+                merge_range.min_row,
+                merge_range.max_col,
+                merge_range.max_row,
+            )
+            master_coord = (min_row, min_col)
+
+            for r in range(min_row, max_row + 1):
+                for c in range(min_col, max_col + 1):
+                    merged_lookup[(r, c)] = master_coord
+        # --- MERGED CELL LOGIC END ---
+
+        for row in sheet_values.iter_rows():
+            for cell in row:
+                coord = cell.coordinate
+                r, c = cell.row, cell.column
+
+                # Check if this cell is part of a merge
+                if (r, c) in merged_lookup:
+                    # It is merged. Get the master cell coordinates
+                    mr, mc = merged_lookup[(r, c)]
+
+                    # Retrieve value from the MASTER cell in the value-workbook
+                    val = sheet_values.cell(row=mr, column=mc).value
+
+                    # Retrieve formula from the MASTER cell in the formula-workbook
+                    raw_formula_cell = sheet_formulas.cell(row=mr, column=mc)
+                    formula = raw_formula_cell.value
+
+                    is_merged = True
+                else:
+                    # Standard cell
+                    val = cell.value
+
+                    # Direct lookup for formula since coordinates match
+                    raw_formula_cell = sheet_formulas[coord]
+                    formula = raw_formula_cell.value
+
+                    is_merged = False
+
+                # Formula Detection Logic
+                has_formula = False
+                formula_str = None
+
+                if isinstance(formula, str) and formula.startswith("="):
+                    has_formula = True
+                    formula_str = formula
+
+                # Decide whether to save the cell
+                # We save if it has a value, has a formula, OR is part of a merge (even if visually empty, it implies structure)
+                if val is not None or has_formula or is_merged:
+                    sheet_data[coord] = {
+                        "value": val,
+                        "formula": formula_str,
+                        "type": "formula" if has_formula else "static",
+                        "is_merged": is_merged,
+                    }
+
+        output_data[sheet_name] = sheet_data
+
+    return output_data
 
 
 def excel_to_detailed_json(file_path, output_json_path, log_emit):
@@ -23,83 +226,11 @@ def excel_to_detailed_json(file_path, output_json_path, log_emit):
     try:
         log_emit(f"Processing: {os.path.basename(file_path)}")
 
-        # 1. Load workbook for VALUES
-        wb_values = load_workbook(file_path, data_only=True)
-        # 2. Load workbook for FORMULAS
-        wb_formulas = load_workbook(file_path, data_only=False)
-
-        output_data = {}
-
-        for sheet_name in wb_values.sheetnames:
-            sheet_values = wb_values[sheet_name]
-            sheet_formulas = wb_formulas[sheet_name]
-
-            sheet_data = {}
-
-            # --- MERGED CELL LOGIC START ---
-            # Create a lookup dictionary: {(row, col): (master_row, master_col)}
-            # This maps every cell in a merged range to its top-left "master" cell.
-            merged_lookup = {}
-
-            # sheet_values.merged_cells.ranges gives a list of all merged ranges (e.g., "A1:B2")
-            for merge_range in sheet_values.merged_cells.ranges:
-                min_col, min_row, max_col, max_row = merge_range.min_col, merge_range.min_row, merge_range.max_col, merge_range.max_row
-                master_coord = (min_row, min_col)
-
-                for r in range(min_row, max_row + 1):
-                    for c in range(min_col, max_col + 1):
-                        # We map every cell in this range to the master cell
-                        # Note: The master cell maps to itself here too, which is fine
-                        merged_lookup[(r, c)] = master_coord
-            # --- MERGED CELL LOGIC END ---
-
-            for row in sheet_values.iter_rows():
-                for cell in row:
-                    coord = cell.coordinate
-                    r, c = cell.row, cell.column
-
-                    # Check if this cell is part of a merge
-                    if (r, c) in merged_lookup:
-                        # It is merged. Get the master cell coordinates
-                        mr, mc = merged_lookup[(r, c)]
-
-                        # Retrieve value from the MASTER cell in the value-workbook
-                        val = sheet_values.cell(row=mr, column=mc).value
-
-                        # Retrieve formula from the MASTER cell in the formula-workbook
-                        raw_formula_cell = sheet_formulas.cell(row=mr, column=mc)
-                        formula = raw_formula_cell.value
-
-                        is_merged = True
-                    else:
-                        # Standard cell
-                        val = cell.value
-
-                        # Direct lookup for formula since coordinates match
-                        raw_formula_cell = sheet_formulas[coord]
-                        formula = raw_formula_cell.value
-
-                        is_merged = False
-
-                    # Formula Detection Logic
-                    has_formula = False
-                    formula_str = None
-
-                    if isinstance(formula, str) and formula.startswith("="):
-                        has_formula = True
-                        formula_str = formula
-
-                    # Decide whether to save the cell
-                    # We save if it has a value, has a formula, OR is part of a merge (even if visually empty, it implies structure)
-                    if val is not None or has_formula or is_merged:
-                        sheet_data[coord] = {
-                            "value": val,
-                            "formula": formula_str,
-                            "type": "formula" if has_formula else "static",
-                            "is_merged": is_merged
-                        }
-
-            output_data[sheet_name] = sheet_data
+        ext = Path(file_path).suffix.lower()
+        if ext == ".xls":
+            output_data = _extract_detailed_data_xls(file_path, log_emit)
+        else:
+            output_data = _extract_detailed_data_openpyxl(file_path)
 
         with open(output_json_path, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, indent=4, default=str)

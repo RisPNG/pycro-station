@@ -7,9 +7,9 @@ import importlib.util
 from difflib import SequenceMatcher
 from importlib import metadata
 
-from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, QProcess, QEvent, QSize, QRect, QPoint, Signal
+from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, QProcess, QEvent, QSize, QRect, QPoint, Signal, QRectF
 from PySide6.QtWidgets import *
-from PySide6.QtGui import QIcon, QCursor, QAction
+from PySide6.QtGui import QIcon, QCursor, QAction, QPainter
 from qfluentwidgets import (
     PrimaryPushButton,
     TransparentToolButton,
@@ -32,6 +32,35 @@ class ClickableMenuRow(QWidget):
         except Exception:
             pass
         return super().mousePressEvent(event)
+
+
+class IconOffsetToolButton(TransparentToolButton):
+    def __init__(self, *args, icon_offset_y: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._icon_offset_y = int(icon_offset_y)
+
+    def setIconOffsetY(self, offset_y: int):
+        self._icon_offset_y = int(offset_y)
+        self.update()
+
+    def paintEvent(self, event):
+        QToolButton.paintEvent(self, event)
+        icon = getattr(self, "_icon", None)
+        if icon is None:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+
+        if not self.isEnabled():
+            painter.setOpacity(0.43)
+        elif getattr(self, "isPressed", False):
+            painter.setOpacity(0.63)
+
+        w, h = self.iconSize().width(), self.iconSize().height()
+        x = (self.width() - w) / 2
+        y = (self.height() - h) / 2 + self._icon_offset_y
+        self._drawIcon(icon, painter, QRectF(x, y, w, h))
 
 
 class PycroGrid(QScrollArea):
@@ -1029,7 +1058,7 @@ class PycroCard(QWidget):
         )
         title_row.addWidget(title, 1)
 
-        self.star_btn = TransparentToolButton(self)
+        self.star_btn = IconOffsetToolButton(self, icon_offset_y=1)
         self.star_btn.setFixedSize(24, 24)
         self.star_btn.setIconSize(QSize(20, 20))
         self.star_btn.setCursor(Qt.PointingHandCursor)

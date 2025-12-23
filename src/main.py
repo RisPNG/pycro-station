@@ -1,7 +1,7 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
