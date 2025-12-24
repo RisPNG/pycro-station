@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import xlrd
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
 
 # GUI Imports (for Pycro Station)
 from PySide6.QtCore import Qt, Signal
@@ -25,6 +25,22 @@ from qfluentwidgets import PrimaryPushButton, MessageBox, ComboBox
 
 
 # ===== Unified Workbook Wrapper for .xls and .xlsx =====
+
+class MissingRequiredHeadersError(ValueError):
+    def __init__(self, missing_by_sheet: Dict[str, List[str]]):
+        self.missing_by_sheet = missing_by_sheet
+        super().__init__(self.user_message())
+
+    def user_message(self) -> str:
+        lines = [
+            "Cannot continue because the following required header(s) were not found in the selected Management Account file(s):",
+            "",
+        ]
+        for sheet_name in sorted(self.missing_by_sheet.keys()):
+            headers = ", ".join(self.missing_by_sheet[sheet_name])
+            lines.append(f"{sheet_name}: {headers}")
+        return "\n".join(lines)
+
 
 class UnifiedWorksheet:
     """Wrapper to provide a unified interface for xlrd and openpyxl worksheets."""
@@ -775,13 +791,177 @@ def build_headers_from_comparison(comparison: Dict) -> Tuple[List[str], List[str
     return left_headers, right_headers, search_cols
 
 
+def _ma_sheet_contains_header(
+    ws: UnifiedWorksheet,
+    header: str,
+    search_cols: List[str],
+    max_search_rows: int,
+) -> bool:
+    from openpyxl.utils import column_index_from_string
+
+    max_row = min(max_search_rows, ws.max_row or 0)
+    if max_row <= 0:
+        return False
+
+    for col_letter in search_cols:
+        col_idx = column_index_from_string(col_letter)
+        for row in range(1, max_row + 1):
+            cell_val = ws.cell_displayed_value(row, col_idx)
+            if header_matches_cell(cell_val, header):
+                return True
+    return False
+
+
+def _collect_required_ma_header_requirements(
+    ws_data,
+    analytical_reviews: List[Tuple[int, int, str]],
+    selected_month: str,
+    selected_year: int,
+    log_emit=None,
+) -> Dict[Tuple[str, Tuple[str, ...], int], set[str]]:
+    requirements: Dict[Tuple[str, Tuple[str, ...], int], set[str]] = {}
+
+    for i, (ar_row, _ar_col, ar_text) in enumerate(analytical_reviews):
+        bracket_match = re.search(r"\(([^)]+)\)", ar_text)
+        if not bracket_match:
+            continue
+
+        bracket_content = bracket_match.group(1)
+        comparison = parse_analytical_bracket(bracket_content, selected_month, selected_year)
+        if not comparison["type"]:
+            continue
+
+        left_headers, right_headers, search_cols = build_headers_from_comparison(comparison)
+        headers = [*left_headers, *right_headers]
+        if not headers:
+            continue
+
+        end_row = analytical_reviews[i + 1][0] if i + 1 < len(analytical_reviews) else ws_data.max_row + 1
+
+        required_sheets: set[str] = set()
+        for row in range(ar_row + 1, end_row):
+            for col in [1, 2]:  # Column A and B
+                cell_val = get_cell_displayed_value(ws_data.cell(row=row, column=col)).strip()
+                if "Description" not in cell_val:
+                    continue
+
+                displayed_upper = cell_val.upper()
+                if "PRODUCTION OVERHEAD" in displayed_upper:
+                    required_sheets.update({"Page 5", "Page 6"})
+                elif "PURCHASE RELATED COSTS" in displayed_upper or "SALES RELATED COSTS" in displayed_upper:
+                    required_sheets.add("Page 8")
+                elif "GENERAL ADMINISTRATIVE EXPENSES" in displayed_upper:
+                    required_sheets.add("Page 7")
+                elif "OTHER INCOME" in displayed_upper:
+                    required_sheets.add("Page 9")
+
+        for sheet_name in required_sheets:
+            max_search_rows = 50 if sheet_name in {"Page 5", "Page 6"} else 20
+            key = (sheet_name, tuple(search_cols), max_search_rows)
+            requirements.setdefault(key, set()).update(headers)
+
+    return requirements
+
+
+def _validate_required_ma_headers(
+    ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
+    requirements: Dict[Tuple[str, Tuple[str, ...], int], set[str]],
+    log_emit=None,
+) -> None:
+    if not requirements:
+        return
+
+    missing_by_sheet: Dict[str, set[str]] = {}
+
+    for (sheet_name, search_cols, max_search_rows), headers in requirements.items():
+        for header in sorted(headers):
+            header_found = False
+            for fname, wb in ma_workbooks:
+                if sheet_name not in wb.sheetnames:
+                    continue
+
+                ws = wb[sheet_name]
+                if _ma_sheet_contains_header(ws, header, list(search_cols), max_search_rows):
+                    header_found = True
+                    break
+
+            if not header_found:
+                missing_by_sheet.setdefault(sheet_name, set()).add(header)
+                _emit(log_emit, f"[MISSING HEADER] {sheet_name}: {header}")
+
+    if missing_by_sheet:
+        missing_sorted = {k: sorted(v) for k, v in missing_by_sheet.items()}
+        raise MissingRequiredHeadersError(missing_sorted)
+
+
+def _export_values_only_workbook_for_sheet(
+    ws_data,
+    values_overrides: Dict[Tuple[int, int], Any],
+    sheet_name: str,
+    output_file: Path,
+    log_emit=None,
+) -> str:
+    from copy import copy as copy_style
+
+    max_row = ws_data.max_row or 0
+    max_col = ws_data.max_column or 0
+
+    values_wb = Workbook()
+    ws_out = values_wb.active
+    ws_out.title = sheet_name
+
+    ws_out.freeze_panes = ws_data.freeze_panes
+    ws_out.sheet_view.showGridLines = ws_data.sheet_view.showGridLines
+
+    for col_key, dim in ws_data.column_dimensions.items():
+        out_dim = ws_out.column_dimensions[col_key]
+        out_dim.width = dim.width
+        out_dim.hidden = dim.hidden
+        out_dim.outlineLevel = dim.outlineLevel
+        out_dim.collapsed = dim.collapsed
+
+    for row_key, dim in ws_data.row_dimensions.items():
+        out_dim = ws_out.row_dimensions[row_key]
+        out_dim.height = dim.height
+        out_dim.hidden = dim.hidden
+        out_dim.outlineLevel = dim.outlineLevel
+        out_dim.collapsed = dim.collapsed
+
+    for row in range(1, max_row + 1):
+        for col in range(1, max_col + 1):
+            src_cell = ws_data.cell(row=row, column=col)
+            dst_cell = ws_out.cell(row=row, column=col)
+
+            dst_cell.value = values_overrides.get((row, col), src_cell.value)
+
+            if src_cell.has_style:
+                dst_cell.font = copy_style(src_cell.font)
+                dst_cell.fill = copy_style(src_cell.fill)
+                dst_cell.border = copy_style(src_cell.border)
+                dst_cell.alignment = copy_style(src_cell.alignment)
+                dst_cell.number_format = src_cell.number_format
+                dst_cell.protection = copy_style(src_cell.protection)
+                if src_cell.comment:
+                    dst_cell.comment = copy_style(src_cell.comment)
+
+            if src_cell.hyperlink:
+                dst_cell.hyperlink = copy_style(src_cell.hyperlink)
+
+    for merged_range in ws_data.merged_cells.ranges:
+        ws_out.merge_cells(str(merged_range))
+
+    values_wb.save(output_file)
+    _emit(log_emit, f"Values-only sheet saved to: {output_file}")
+    return str(output_file)
+
+
 def process_variance_report(
     report_path: str,
     ma_files: List[str],
     selected_month: str,
     selected_year: int,
     log_emit=None,
-) -> str:
+) -> Tuple[str, str]:
     """
     Main processing function.
     """
@@ -831,8 +1011,15 @@ def process_variance_report(
 
     _emit(log_emit, f"\nFound {len(analytical_reviews)} Analytical Review sections")
 
+    # Validate required MA headers before modifying anything in the report workbook.
+    requirements = _collect_required_ma_header_requirements(
+        ws_data, analytical_reviews, selected_month, selected_year, log_emit
+    )
+    _validate_required_ma_headers(ma_workbooks, requirements, log_emit)
+
     # Process each Analytical Review section
     replacements_made = 0
+    values_overrides: Dict[Tuple[int, int], Any] = {}
 
     for i, (ar_row, ar_col, ar_text) in enumerate(analytical_reviews):
         # Extract bracket content
@@ -864,7 +1051,8 @@ def process_variance_report(
             for col in [1, 2]:  # Column A and B
                 cell = ws.cell(row=row, column=col)
                 cell_data = ws_data.cell(row=row, column=col)
-                displayed_val = get_cell_displayed_value(cell_data).strip()
+                displayed_val_raw = get_cell_displayed_value(cell_data)
+                displayed_val = displayed_val_raw.strip()
                 raw_val = get_cell_raw_value(cell)
 
                 if "Description" not in displayed_val:
@@ -934,6 +1122,7 @@ def process_variance_report(
                     if isinstance(raw_val, str):
                         new_val = raw_val.replace("Description", replacement_value)
                         cell.value = new_val
+                        values_overrides[(row, col)] = displayed_val_raw.replace("Description", replacement_value)
                         replacements_made += 1
                         _emit(log_emit, f"    -> Replaced 'Description' with '{replacement_value}'")
                     else:
@@ -948,23 +1137,34 @@ def process_variance_report(
 
     report_wb.save(output_file)
 
+    safe_sheet = re.sub(r"[^A-Za-z0-9]+", "_", sheet_name).strip("_") or "sheet"
+    values_only_file = output_path.parent / f"{output_path.stem}_{safe_sheet}_values_{timestamp}.xlsx"
+    values_only_out = _export_values_only_workbook_for_sheet(
+        ws_data=ws_data,
+        values_overrides=values_overrides,
+        sheet_name=sheet_name,
+        output_file=values_only_file,
+        log_emit=log_emit,
+    )
+
     _emit(log_emit, f"\n{'='*50}")
     _emit(log_emit, f"Processing complete!")
     _emit(log_emit, f"Total replacements made: {replacements_made}")
     _emit(log_emit, f"Output saved to: {output_file}")
 
-    return str(output_file)
+    return str(output_file), values_only_out
 
 
 # --- UI Class (Pycro Station) ---
 
 class MainWidget(QWidget):
     log_message = Signal(str)
-    processing_done = Signal(str)
+    processing_done = Signal(str, str)
 
     def __init__(self):
         super().__init__()
         self.setObjectName("varanalysis_desc_widget")
+        self._last_error: Optional[Exception] = None
         self._build_ui()
         self._connect_signals()
 
@@ -1147,6 +1347,7 @@ class MainWidget(QWidget):
     def run_process(self):
         report_file = self._get_report_file()
         ma_files = self._get_ma_files()
+        self._last_error = None
 
         if not report_file:
             MessageBox("Warning", "Please select a Variance Analysis Report file.", self).exec()
@@ -1172,16 +1373,22 @@ class MainWidget(QWidget):
 
         def worker():
             try:
-                out_path = process_variance_report(
+                out_report_path, out_values_path = process_variance_report(
                     report_file, ma_files, selected_month, selected_year,
                     log_emit=self.log_message.emit
                 )
-                self.processing_done.emit(out_path)
+                self.processing_done.emit(out_report_path, out_values_path)
+            except MissingRequiredHeadersError as e:
+                self._last_error = e
+                self.log_message.emit("ABORTED: Missing required header(s) in Management Account file(s).")
+                self.log_message.emit(e.user_message())
+                self.processing_done.emit("", "")
             except Exception as e:
+                self._last_error = e
                 self.log_message.emit(f"CRITICAL ERROR: {e}")
                 import traceback
                 self.log_message.emit(traceback.format_exc())
-                self.processing_done.emit("")
+                self.processing_done.emit("", "")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1189,17 +1396,24 @@ class MainWidget(QWidget):
         self.log_box.append(text)
         self.log_box.ensureCursorVisible()
 
-    def on_done(self, out_path: str):
+    def on_done(self, out_path: str, values_only_path: str):
         self.run_btn.setEnabled(True)
         self.select_report_btn.setEnabled(True)
         self.select_ma_btn.setEnabled(True)
 
         if out_path:
             title = "Processing complete"
-            msg_text = f"Output saved to:\n{Path(out_path).name}"
+            lines = [f"Full report:\n{Path(out_path).name}"]
+            if values_only_path:
+                lines.append(f"Values-only sheet:\n{Path(values_only_path).name}")
+            msg_text = "\n\n".join(lines)
         else:
-            title = "Processing failed"
-            msg_text = "An error occurred. Check the logs for details."
+            if isinstance(self._last_error, MissingRequiredHeadersError):
+                title = "Missing required headers"
+                msg_text = self._last_error.user_message()
+            else:
+                title = "Processing failed"
+                msg_text = "An error occurred. Check the logs for details."
 
         msg = MessageBox(title, msg_text, self)
         msg.yesButton.setText("OK")
