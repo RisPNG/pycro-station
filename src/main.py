@@ -1,7 +1,7 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0.0"
 SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
@@ -974,9 +974,8 @@ class Window(MSFluentWindow):
 
         self.initNavigation()
         self.initWindow()
-        # Default last sidebar target is Hub
         try:
-            self._remember_sidebar_interface(self.homeInterface)
+            self._select_start_interface()
         except Exception:
             pass
         try:
@@ -1086,6 +1085,43 @@ class Window(MSFluentWindow):
             avail.x() + (avail.width() - target_w) // 2,
             avail.y() + (avail.height() - target_h) // 2,
         )
+
+    def _select_start_interface(self):
+        """Select the initial navigation interface on launch."""
+        default_widget: QWidget = self.homeInterface
+
+        try:
+            settings_path = os.path.join(os.path.dirname(__file__), "settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        starred = loaded.get("starred_pycros", [])
+                        if isinstance(starred, list) and len(starred) > 0:
+                            default_widget = getattr(self, "starsGrid", None) or self.homeInterface
+        except Exception:
+            default_widget = self.homeInterface
+
+        try:
+            if default_widget is self.homeInterface:
+                self.homeInterface.setCurrentWidget(self.hubGrid)
+        except Exception:
+            pass
+
+        try:
+            self.switchTo(default_widget)
+        except Exception:
+            pass
+
+        try:
+            self.navigationInterface.setCurrentItem(default_widget.objectName())
+        except Exception:
+            pass
+
+        try:
+            self._remember_sidebar_interface(default_widget)
+        except Exception:
+            pass
 
     def showHub(self):
         """Switch to the Hub grid view."""

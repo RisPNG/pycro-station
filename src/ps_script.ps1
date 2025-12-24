@@ -5,11 +5,11 @@ Set-Location $scriptPath
 $ErrorActionPreference = 'Stop'
 
 # Check if MsPy-3_11_14 folder exists and has the binary
-$pythonBinary = "src\win\MsPy-3_11_14\python.exe"
-$mspyFolder = "src\win\MsPy-3_11_14"
+$pythonBinary = "win\MsPy-3_11_14\python.exe"
+$mspyFolder = "win\MsPy-3_11_14"
 
 if (-not (Test-Path $mspyFolder) -or -not (Test-Path $pythonBinary)) {
-    Write-Host "MsPy-3_11_14 not found or binary missing. Downloading..."
+    Write-Host "Downloading Python 3.11.14 for Windows..."
 
     # Delete the folder if it exists but is incomplete
     if (Test-Path $mspyFolder) {
@@ -17,14 +17,14 @@ if (-not (Test-Path $mspyFolder) -or -not (Test-Path $pythonBinary)) {
     }
 
     # Create win directory if it doesn't exist
-    New-Item -ItemType Directory -Force -Path "src\win" | Out-Null
+    New-Item -ItemType Directory -Force -Path "win" | Out-Null
 
     # Download the zip file
     $zipPath = Join-Path $env:TEMP "MsPy-3_11_14-win.zip"
     Invoke-WebRequest -Uri "https://github.com/RisPNG/MsPy/releases/download/3.11.14/MsPy-3_11_14-win.zip" -OutFile $zipPath
 
-    # Extract to src/win directory
-    Expand-Archive -Path $zipPath -DestinationPath "src\win\" -Force
+    # Extract to directory
+    Expand-Archive -Path $zipPath -DestinationPath "win\" -Force
 
     # Clean up zip file
     Remove-Item $zipPath
@@ -35,7 +35,7 @@ if (-not (Test-Path $mspyFolder) -or -not (Test-Path $pythonBinary)) {
         exit 1
     }
 
-    Write-Host "MsPy-3_11_14 successfully downloaded and extracted"
+    Write-Host "Python 3.11.14 for Windows successfully downloaded and extracted"
 }
 
 # Check if venv exists and is valid (to determine if we need to run pip install)
@@ -45,11 +45,11 @@ $venvNeedsRecreation = $false
 # Get the absolute path to our Python binary directory
 $expectedPythonHome = Split-Path -Parent (Resolve-Path $pythonBinary)
 
-if (-not (Test-Path "src\win\venv\Scripts\python.exe")) {
+if (-not (Test-Path "win\venv\Scripts\python.exe")) {
     $venvNeedsRecreation = $true
-} elseif (Test-Path "src\win\venv\pyvenv.cfg") {
+} elseif (Test-Path "win\venv\pyvenv.cfg") {
     # Check if venv points to the correct Python home
-    $pyvenvContent = Get-Content "src\win\venv\pyvenv.cfg" -Raw
+    $pyvenvContent = Get-Content "win\venv\pyvenv.cfg" -Raw
     if ($pyvenvContent -notmatch [regex]::Escape("home = $expectedPythonHome")) {
         Write-Host "Virtual environment points to wrong Python location, recreating..."
         $venvNeedsRecreation = $true
@@ -63,14 +63,14 @@ if ($venvNeedsRecreation) {
     Write-Host "Creating new virtual environment..."
 
     # Remove existing venv if it exists but is incomplete/wrong platform
-    if (Test-Path "src\win\venv") {
-        Remove-Item "src\win\venv" -Recurse -Force
+    if (Test-Path "win\venv") {
+        Remove-Item "win\venv" -Recurse -Force
     }
 
-    & $pythonBinary -m venv "src\win\venv"
+    & $pythonBinary -m venv "win\venv"
 }
 
-$venvPy = Join-Path $scriptPath "src\win\venv\Scripts\python.exe"
+$venvPy = Join-Path $scriptPath "win\venv\Scripts\python.exe"
 
 # Only run pip install if venv was newly created
 if ($venvNewlyCreated) {
@@ -81,4 +81,4 @@ if ($venvNewlyCreated) {
     Write-Host "Using existing virtual environment (skipping pip install)"
 }
 
-& $venvPy "src\main.py"
+& $venvPy "main.py"
