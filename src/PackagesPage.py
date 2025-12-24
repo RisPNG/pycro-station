@@ -3,6 +3,7 @@ import re
 import sys
 from importlib import metadata
 
+from app_paths import REQUIREMENTS_TXT
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 from PySide6.QtWidgets import *
@@ -218,7 +219,7 @@ class PackagesPage(QWidget):
                 w.deleteLater()
 
     def _read_baseline_requirements(self) -> set[str]:
-        path = os.path.join(os.getcwd(), 'requirements.txt')
+        path = os.fspath(REQUIREMENTS_TXT)
         names: set[str] = set()
         if not os.path.isfile(path):
             return names

@@ -7,6 +7,7 @@ import importlib.util
 from difflib import SequenceMatcher
 from importlib import metadata
 
+from app_paths import PYCROS_DIR, REMOTE_PYCROS_DIR
 from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer, QProcess, QEvent, QSize, QRect, QPoint, Signal, QRectF
 from PySide6.QtWidgets import *
 from PySide6.QtGui import QIcon, QCursor, QAction, QPainter
@@ -163,8 +164,8 @@ class PycroGrid(QScrollArea):
         self._grid.setColumnStretch(0, 1)
 
         self._roots = [
-            os.path.join(os.getcwd(), 'pycros'),
-            os.path.join(os.getcwd(), 'remote_pycros'),
+            os.fspath(PYCROS_DIR),
+            os.fspath(REMOTE_PYCROS_DIR),
         ]
         for root in self._roots:
             if os.path.isdir(root):

@@ -71,12 +71,14 @@ if ($venvNeedsRecreation) {
 }
 
 $venvPy = Join-Path $scriptPath "win\venv\Scripts\python.exe"
+$projectRoot = (Resolve-Path (Join-Path $scriptPath "..")).Path
+$requirementsPath = Join-Path $projectRoot "requirements.txt"
 
 # Only run pip install if venv was newly created
 if ($venvNewlyCreated) {
     Write-Host "Installing dependencies..."
     & $venvPy -m pip install --upgrade pip
-    & $venvPy -m pip install -r requirements.txt
+    & $venvPy -m pip install -r $requirementsPath
 } else {
     Write-Host "Using existing virtual environment (skipping pip install)"
 }

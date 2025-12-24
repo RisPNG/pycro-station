@@ -26,6 +26,7 @@ from qfluentwidgets import FluentIcon as FIF
 from pytablericons import TablerIcons, OutlineIcon
 from PIL.ImageQt import ImageQt
 
+from app_paths import REMOTE_PYCROS_DIR
 from PycroGrid import PycroGrid
 from PackagesPage import PackagesPage, CheckIconButton
 from TitleBar import CustomTitleBar
@@ -800,7 +801,7 @@ class Settings(QWidget):
         self.force_update_btn.setText("Updating...")
 
         src_dir = os.path.abspath(os.path.dirname(__file__))
-        targets = ["TitleBar.py", "PycroGrid.py", "PackagesPage.py", "main.py"]
+        targets = ["TitleBar.py", "PycroGrid.py", "PackagesPage.py", "main.py", "app_paths.py"]
 
         def worker():
             temp_dir = tempfile.mkdtemp(prefix="pycro_app_update_")
@@ -1556,7 +1557,7 @@ class Window(MSFluentWindow):
         """Refresh hub when settings update pulls new remote_pycros."""
         if success:
             try:
-                self.hubGrid._last_changed_path = os.path.join(os.getcwd(), "remote_pycros")
+                self.hubGrid._last_changed_path = os.fspath(REMOTE_PYCROS_DIR)
             except Exception:
                 pass
         try:
