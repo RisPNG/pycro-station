@@ -21,7 +21,15 @@ if (-not (Test-Path $mspyFolder) -or -not (Test-Path $pythonBinary)) {
 
     # Download the zip file
     $zipPath = Join-Path $env:TEMP "MsPy-3_11_14-win.zip"
-    Invoke-WebRequest -Uri "https://github.com/RisPNG/MsPy/releases/download/3.11.14/MsPy-3_11_14-win.zip" -OutFile $zipPath
+
+    try {
+        $ProgressPreference = 'SilentlyContinue'  # Speeds up download significantly
+        Invoke-WebRequest -Uri "https://github.com/RisPNG/MsPy/releases/download/3.11.14/MsPy-3_11_14-win.zip" -OutFile $zipPath -UseBasicParsing
+        $ProgressPreference = 'Continue'
+    } catch {
+        Write-Error "Failed to download Python: $_"
+        exit 1
+    }
 
     # Extract to directory
     Expand-Archive -Path $zipPath -DestinationPath "win\" -Force
@@ -50,7 +58,7 @@ if (-not (Test-Path "win\venv\Scripts\python.exe")) {
 } elseif (Test-Path "win\venv\pyvenv.cfg") {
     # Check if venv points to the correct Python home
     $pyvenvContent = Get-Content "win\venv\pyvenv.cfg" -Raw
-    if ($pyvenvContent -notmatch [regex]::Escape("home = $expectedPythonHome")) {
+    if ($pyvenvContent -notmatch "home\s*=\s*$([regex]::Escape($expectedPythonHome))") {
         Write-Host "Virtual environment points to wrong Python location, recreating..."
         $venvNeedsRecreation = $true
     }
@@ -73,6 +81,7 @@ if ($venvNeedsRecreation) {
 $venvPy = Join-Path $scriptPath "win\venv\Scripts\python.exe"
 $projectRoot = (Resolve-Path (Join-Path $scriptPath "..")).Path
 $requirementsPath = Join-Path $projectRoot "requirements.txt"
+$mainScript = "main.py"
 
 # Only run pip install if venv was newly created
 if ($venvNewlyCreated) {
@@ -83,4 +92,4 @@ if ($venvNewlyCreated) {
     Write-Host "Using existing virtual environment (skipping pip install)"
 }
 
-& $venvPy "main.py"
+& $venvPy $mainScript
