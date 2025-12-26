@@ -591,7 +591,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                 # --- Write Output ---
 
                 # 1. PRICE DIFF REMARKS
-                final_remark = "; ".join(remarks) if remarks else ""
+                final_remark = "; ".join(remarks) if remarks else "CORRECT"
 
                 # 2. DPOM - Incorrect FOB
                 final_dpom_val = " / ".join(dpom_errors) if dpom_errors else ""
