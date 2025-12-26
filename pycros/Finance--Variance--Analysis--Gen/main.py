@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import threading
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -718,6 +719,7 @@ def get_values_for_page9(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
                 if not section_start:
                     continue
 
+                skip_rows_remaining = 0
                 for row in range(section_start + 1, ws.max_row + 1):
                     col_a_val = ws.cell_displayed_value(row, 1).strip()
                     col_b_val = ws.cell_displayed_value(row, 2).strip()
@@ -726,6 +728,14 @@ def get_values_for_page9(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
                     # Stop if we hit next section
                     if col_a_val and col_a_val.upper().startswith("C"):
                         break
+
+                    # Ignore any bullet/comment rows (and the row directly below them).
+                    if skip_rows_remaining > 0:
+                        skip_rows_remaining -= 1
+                        continue
+                    if col_b_val.startswith("*"):
+                        skip_rows_remaining = 1
+                        continue
 
                     if cell_val is not None and cell_val != "" and col_b_val and not col_b_val.upper().startswith("TOTAL"):
                         # Skip items starting with "GAIN/(LOSS)"
@@ -766,6 +776,124 @@ def find_extreme_value(values: List[Tuple[str, float, float]], find_lowest: bool
             return desc
 
     return None
+
+
+def _round_half_up(value: float) -> int:
+    if math.isnan(value) or math.isinf(value):
+        return 0
+    return int(math.floor(value + 0.5))
+
+
+def format_rm_variance_amount(amount: float) -> str:
+    """
+    Format an RM variance amount using:
+    - Thousands and above: rounded to nearest thousand, shown as '<n>k' (e.g., 928352 -> 928k)
+    - Hundreds and below: shown as integer (e.g., 123)
+    """
+    amt = abs(float(amount))
+    if amt < 1000:
+        return str(_round_half_up(amt))
+    return f"{_round_half_up(amt / 1000)}k"
+
+
+def build_page9b_variance_summary(values: List[Tuple[str, float, float]]) -> Optional[str]:
+    """
+    Build a single-cell bullet summary for Page 9 Section B (Other Income),
+    comparing x - y (left - right) for each line item.
+    """
+    phrases: List[str] = []
+
+    for desc, left, right in values:
+        desc_clean = str(desc).strip()
+        if not desc_clean:
+            continue
+        if desc_clean.upper().startswith("GAIN/(LOSS)"):
+            continue
+
+        diff = float(left) - float(right)
+        if abs(diff) < 1e-9:
+            continue
+
+        direction = "Higher" if diff > 0 else "Lower"
+        amount_str = format_rm_variance_amount(diff)
+        phrases.append(f"{direction} {desc_clean} by RM{amount_str}")
+
+    if not phrases:
+        return None
+
+    return "*" + ", ".join(phrases)
+
+
+def _find_star_cell_row_in_column_b(
+    ws_data,
+    start_row: int,
+    end_row_exclusive: int,
+    *,
+    anchor_row: Optional[int] = None,
+    max_distance: int = 25,
+) -> Optional[int]:
+    start_row = max(1, start_row)
+    end_row_exclusive = max(1, end_row_exclusive)
+
+    if anchor_row is None:
+        for row in range(start_row, end_row_exclusive):
+            col_b_val = get_cell_displayed_value(ws_data.cell(row=row, column=2)).strip()
+            if col_b_val.startswith("*"):
+                return row
+        return None
+
+    anchor_row = max(start_row, min(anchor_row, end_row_exclusive - 1))
+    window_start = max(start_row, anchor_row - max_distance)
+    window_end_exclusive = min(end_row_exclusive, anchor_row + max_distance + 1)
+
+    star_rows: List[int] = []
+    for row in range(window_start, window_end_exclusive):
+        col_b_val = get_cell_displayed_value(ws_data.cell(row=row, column=2)).strip()
+        if col_b_val.startswith("*"):
+            star_rows.append(row)
+
+    if not star_rows:
+        return None
+    return min(star_rows, key=lambda r: abs(r - anchor_row))
+
+
+def _write_page9b_summary_to_star_cell(
+    ws,
+    ws_data,
+    start_row: int,
+    end_row_exclusive: int,
+    *,
+    anchor_row: int,
+    summary: Optional[str],
+    values_overrides: Dict[Tuple[int, int], Any],
+    log_emit=None,
+) -> bool:
+    """
+    Find the first '*' cell in column B within the given row range, clear it and the row below,
+    then write the provided summary into that '*' cell.
+    """
+    star_row = _find_star_cell_row_in_column_b(
+        ws_data,
+        start_row,
+        end_row_exclusive,
+        anchor_row=anchor_row,
+    )
+    if not star_row:
+        return False
+
+    ws.cell(row=star_row, column=2).value = None
+    values_overrides[(star_row, 2)] = None
+
+    if star_row + 1 <= ws.max_row:
+        ws.cell(row=star_row + 1, column=2).value = None
+        values_overrides[(star_row + 1, 2)] = None
+
+    if summary:
+        ws.cell(row=star_row, column=2).value = summary
+        values_overrides[(star_row, 2)] = summary
+
+    _emit(log_emit, f"    -> Updated Page 9B summary at row {star_row}")
+    return True
 
 
 def build_headers_from_comparison(comparison: Dict) -> Tuple[List[str], List[str], List[str]]:
@@ -1045,6 +1173,8 @@ def process_variance_report(
 
         # Determine the range to search (until next Analytical Review or end)
         end_row = analytical_reviews[i + 1][0] if i + 1 < len(analytical_reviews) else ws.max_row + 1
+        page9_values_cache: Optional[List[Tuple[str, float, float]]] = None
+        page9_summary_written = False
 
         # Find Description cells in this section
         for row in range(ar_row + 1, end_row):
@@ -1110,9 +1240,27 @@ def process_variance_report(
 
                 elif "OTHER INCOME" in displayed_upper:
                     _emit(log_emit, "    -> Processing Other Income (Page 9, Section B)")
-                    values = get_values_for_page9(
-                        ma_workbooks, left_headers, right_headers, search_cols, log_emit
-                    )
+                    if page9_values_cache is None:
+                        page9_values_cache = get_values_for_page9(
+                            ma_workbooks, left_headers, right_headers, search_cols, log_emit
+                        )
+                    values = page9_values_cache
+
+                    if not page9_summary_written:
+                        summary = build_page9b_variance_summary(values)
+                        if not _write_page9b_summary_to_star_cell(
+                            ws=ws,
+                            ws_data=ws_data,
+                            start_row=ar_row + 1,
+                            end_row_exclusive=end_row,
+                            anchor_row=row,
+                            summary=summary,
+                            values_overrides=values_overrides,
+                            log_emit=log_emit,
+                        ):
+                            _emit(log_emit, "    -> No '*' cell found to write Page 9B summary")
+                        page9_summary_written = True
+
                     if values:
                         replacement_value = find_extreme_value(values, find_lowest)
                         _emit(log_emit, f"    -> Found {len(values)} items, selected: {replacement_value}")
