@@ -186,12 +186,298 @@ def get_cell_displayed_value(cell) -> str:
     """Get the displayed value of an openpyxl cell as string."""
     if cell.value is None:
         return ""
-    return str(cell.value)
+    value = cell.value
+
+    if isinstance(value, str):
+        return value
+
+    # Some openpyxl versions can return rich-text wrapper objects (e.g. Text).
+    # Prefer extracting their plain content when available.
+    if hasattr(value, "content"):
+        try:
+            content = value.content
+            if content is not None:
+                return str(content)
+        except Exception:
+            pass
+
+    if hasattr(value, "plain"):
+        try:
+            plain = value.plain
+            if plain is not None:
+                return str(plain)
+        except Exception:
+            pass
+
+    return str(value)
 
 
 def get_cell_raw_value(cell) -> Any:
     """Get the raw value of an openpyxl cell (formula or value)."""
     return cell.value
+
+
+def _normalize_excel_text(value: str) -> str:
+    """
+    Normalize text read from Excel:
+    - convert NBSP to space
+    - remove zero-width spaces
+    - collapse whitespace
+    """
+    if not value:
+        return ""
+    value = value.replace("\u00a0", " ").replace("\u200b", "")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _extract_excel_constant_string_formula(value: str) -> Optional[str]:
+    """
+    If an Excel cell contains a formula that is *exactly* a single string literal
+    like ="Analytical Review (Nov'25 Vs Oct'25)", return that literal.
+    """
+    if not value:
+        return None
+    match = re.fullmatch(r'\s*=\s*"((?:[^"]|"")*)"\s*', value)
+    if not match:
+        return None
+    return match.group(1).replace('""', '"')
+
+
+def _split_excel_concat_expression(expr: str) -> Optional[List[str]]:
+    """
+    Split an Excel string concatenation expression into parts, using & as the separator.
+    Only supports splitting on & outside of quoted string literals.
+    """
+    parts: List[str] = []
+    buf: List[str] = []
+    in_quotes = False
+    i = 0
+
+    while i < len(expr):
+        ch = expr[i]
+        if ch == '"':
+            if in_quotes:
+                # Escaped quote within a string literal is represented as ""
+                if i + 1 < len(expr) and expr[i + 1] == '"':
+                    buf.append('""')
+                    i += 2
+                    continue
+                in_quotes = False
+                buf.append('"')
+                i += 1
+                continue
+            in_quotes = True
+            buf.append('"')
+            i += 1
+            continue
+
+        if ch == "&" and not in_quotes:
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    if in_quotes:
+        return None
+
+    if buf:
+        parts.append("".join(buf).strip())
+
+    return parts
+
+
+def _parse_excel_string_literal(token: str) -> Optional[str]:
+    token = token.strip()
+    if len(token) < 2 or not token.startswith('"') or not token.endswith('"'):
+        return None
+    inner = token[1:-1]
+    return inner.replace('""', '"')
+
+
+def _parse_excel_cell_reference(token: str) -> Optional[Tuple[Optional[str], str]]:
+    """
+    Parse an Excel cell reference like:
+      - AW5
+      - $AW$5
+      - Sheet1!AW5
+      - 'Nov''25'!AW5
+    Returns (sheet_name_or_None, coordinate_without_dollars).
+    """
+    m = re.fullmatch(
+        r"\s*(?:(?:'((?:[^']|'')+)'|([A-Za-z0-9_]+))!)?(\$?[A-Za-z]{1,3}\$?\d+)\s*",
+        token,
+    )
+    if not m:
+        return None
+
+    quoted_sheet = m.group(1)
+    unquoted_sheet = m.group(2)
+    sheet_name: Optional[str]
+    if quoted_sheet is not None:
+        sheet_name = quoted_sheet.replace("''", "'")
+    else:
+        sheet_name = unquoted_sheet
+
+    coord = m.group(3).replace("$", "")
+    return sheet_name, coord
+
+
+def _read_cell_text_best_effort(ws_cell, ws_data_cell, *, depth: int, max_depth: int) -> Optional[str]:
+    displayed = _normalize_excel_text(get_cell_displayed_value(ws_data_cell))
+    if displayed:
+        return displayed
+
+    raw = ws_cell.value
+    if raw is None:
+        return None
+
+    if isinstance(raw, str):
+        constant = _extract_excel_constant_string_formula(raw)
+        if constant:
+            constant_text = _normalize_excel_text(constant)
+            return constant_text or None
+
+        if depth < max_depth:
+            evaluated = _evaluate_excel_concat_formula(
+                raw,
+                ws_cell.parent,
+                ws_data_cell.parent,
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+            if evaluated:
+                evaluated_text = _normalize_excel_text(evaluated)
+                return evaluated_text or None
+
+        # Only use raw text when it's not a formula.
+        if not raw.lstrip().startswith("="):
+            raw_text = _normalize_excel_text(raw)
+            return raw_text or None
+
+        return None
+
+    raw_text = _normalize_excel_text(str(raw))
+    return raw_text or None
+
+
+def _evaluate_excel_concat_formula(
+    formula: str,
+    ws,
+    ws_data,
+    *,
+    depth: int,
+    max_depth: int,
+) -> Optional[str]:
+    """
+    Best-effort evaluation of a very small subset of Excel formulas:
+      - string concatenation using & with string literals and cell references
+
+    This is intended for cases where openpyxl cannot provide cached formula results but
+    the formula is effectively just building a text label (e.g. Analytical Review header).
+    """
+    if not formula:
+        return None
+
+    f = formula.strip()
+    if not f.startswith("="):
+        return None
+
+    expr = f[1:].strip()
+    if "&" not in expr:
+        return None
+
+    parts = _split_excel_concat_expression(expr)
+    if not parts:
+        return None
+
+    out: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+
+        literal = _parse_excel_string_literal(part)
+        if literal is not None:
+            out.append(literal)
+            continue
+
+        ref = _parse_excel_cell_reference(part)
+        if ref is None:
+            return None
+
+        sheet_name, coord = ref
+        ws_ref = ws
+        ws_data_ref = ws_data
+
+        if sheet_name:
+            try:
+                ws_ref = ws.parent[sheet_name]
+                ws_data_ref = ws_data.parent[sheet_name]
+            except Exception:
+                return None
+
+        ws_cell = ws_ref[coord]
+        ws_data_cell = ws_data_ref[coord]
+        text = _read_cell_text_best_effort(ws_cell, ws_data_cell, depth=depth, max_depth=max_depth)
+        if text is None:
+            return None
+
+        out.append(text)
+
+    return "".join(out)
+
+
+def _cell_text_candidates(ws_cell, ws_data_cell) -> List[str]:
+    """
+    Return possible textual representations for a report cell by checking both:
+    - the data_only workbook (displayed value, when cached)
+    - the formula workbook (raw value / formula text)
+
+    Note: avoid returning raw formula strings (e.g. =... with concatenations) because the
+    downstream logic expects final displayed text (for parsing brackets, etc).
+    """
+    candidates: List[str] = []
+
+    displayed = _normalize_excel_text(get_cell_displayed_value(ws_data_cell))
+    if displayed:
+        candidates.append(displayed)
+
+    raw = ws_cell.value
+    if raw is not None:
+        if isinstance(raw, str):
+            constant = _extract_excel_constant_string_formula(raw)
+            if constant:
+                constant_text = _normalize_excel_text(constant)
+                if constant_text:
+                    candidates.insert(0, constant_text)
+
+            evaluated = _evaluate_excel_concat_formula(raw, ws_cell.parent, ws_data_cell.parent, depth=0, max_depth=2)
+            if evaluated:
+                evaluated_text = _normalize_excel_text(evaluated)
+                if evaluated_text:
+                    candidates.insert(0, evaluated_text)
+
+            if not raw.lstrip().startswith("="):
+                raw_text = _normalize_excel_text(raw)
+                if raw_text:
+                    candidates.append(raw_text)
+        else:
+            raw_text = _normalize_excel_text(str(raw))
+            if raw_text:
+                candidates.append(raw_text)
+
+    # De-dupe while preserving order
+    seen = set()
+    unique: List[str] = []
+    for text in candidates:
+        if text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return unique
 
 
 def parse_short_date(s: str) -> Tuple[str, int]:
@@ -991,6 +1277,51 @@ def _collect_required_ma_header_requirements(
     return requirements
 
 
+def _collect_strict_ma_header_requirements(
+    analytical_reviews: List[Tuple[int, int, str]],
+    selected_month: str,
+    selected_year: int,
+    log_emit=None,
+) -> Dict[Tuple[str, Tuple[str, ...], int], set[str]]:
+    """
+    Strict mode: require that every Analytical Review section's left/right headers exist
+    in the MA workbook (for the relevant search columns) across the standard MA pages.
+
+    This intentionally does not depend on whether any 'Description' placeholders remain
+    in the report (e.g. already-processed reports still validate inputs).
+    """
+    requirements: Dict[Tuple[str, Tuple[str, ...], int], set[str]] = {}
+
+    page_max_rows: Dict[str, int] = {
+        "Page 5": 50,
+        "Page 6": 50,
+        "Page 7": 20,
+        "Page 8": 20,
+        "Page 9": 20,
+    }
+
+    for _ar_row, _ar_col, ar_text in analytical_reviews:
+        bracket_match = re.search(r"\(([^)]+)\)", ar_text)
+        if not bracket_match:
+            continue
+
+        bracket_content = bracket_match.group(1)
+        comparison = parse_analytical_bracket(bracket_content, selected_month, selected_year)
+        if not comparison["type"]:
+            continue
+
+        left_headers, right_headers, search_cols = build_headers_from_comparison(comparison)
+        headers = [*left_headers, *right_headers]
+        if not headers:
+            continue
+
+        for sheet_name, max_search_rows in page_max_rows.items():
+            key = (sheet_name, tuple(search_cols), max_search_rows)
+            requirements.setdefault(key, set()).update(headers)
+
+    return requirements
+
+
 def _validate_required_ma_headers(
     ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
     requirements: Dict[Tuple[str, Tuple[str, ...], int], set[str]],
@@ -1125,24 +1456,67 @@ def process_variance_report(
         raise ValueError("No MA files could be loaded.")
 
     # Find all Analytical Review cells
-    analytical_reviews = []
+    analytical_reviews: List[Tuple[int, int, str]] = []
     for row in range(1, ws.max_row + 1):
-        for col in [1, 2]:  # Column A and B
-            cell_data = ws_data.cell(row=row, column=col)
-            cell_val = get_cell_displayed_value(cell_data).strip()
-            if cell_val.upper().startswith("ANALYTICAL REVIEW"):
-                analytical_reviews.append((row, col, cell_val))
-                _emit(log_emit, f"Found Analytical Review at row {row}: {cell_val[:50]}...")
+        for col in (1, 2):  # Column A and B
+            ws_cell = ws.cell(row=row, column=col)
+            ws_data_cell = ws_data.cell(row=row, column=col)
+
+            matched_text: Optional[str] = None
+            for candidate in _cell_text_candidates(ws_cell, ws_data_cell):
+                if candidate.upper().startswith("ANALYTICAL REVIEW"):
+                    matched_text = candidate
+                    break
+
+            if matched_text:
+                analytical_reviews.append((row, col, matched_text))
+                _emit(log_emit, f"Found Analytical Review at row {row}: {matched_text[:50]}...")
 
     if not analytical_reviews:
-        raise ValueError("No 'Analytical Review' cells found in column A or B.")
+        try:
+            import openpyxl as _openpyxl  # type: ignore
+
+            openpyxl_version = getattr(_openpyxl, "__version__", "unknown")
+        except Exception:
+            openpyxl_version = "unknown"
+
+        sample_lines: List[str] = []
+        max_sample_rows = min(ws.max_row or 0, 300)
+        for row in range(1, max_sample_rows + 1):
+            for col in (1, 2):
+                ws_cell = ws.cell(row=row, column=col)
+                ws_data_cell = ws_data.cell(row=row, column=col)
+                displayed = _normalize_excel_text(get_cell_displayed_value(ws_data_cell))
+                raw = ws_cell.value
+                raw_text = _normalize_excel_text(str(raw)) if raw is not None else ""
+
+                if displayed or raw_text:
+                    sample_lines.append(f"  R{row}C{col}: data_only={displayed!r} raw={raw_text!r}")
+
+                if len(sample_lines) >= 10:
+                    break
+            if len(sample_lines) >= 10:
+                break
+
+        message_lines = [
+            "No 'Analytical Review' cells found in column A or B.",
+            f"(openpyxl {openpyxl_version})",
+            "",
+            "This usually happens when the 'Analytical Review' headers are formulas but the workbook has no cached formula results.",
+            "openpyxl cannot calculate formulas, so it may see empty/placeholder values.",
+            "Fix: open the report in Excel, set Calculation to Automatic, press Calculate Now, save the file, then rerun.",
+        ]
+
+        if sample_lines:
+            message_lines.extend(["", "Sample values read from columns A/B:"])
+            message_lines.extend(sample_lines)
+
+        raise ValueError("\n".join(message_lines))
 
     _emit(log_emit, f"\nFound {len(analytical_reviews)} Analytical Review sections")
 
     # Validate required MA headers before modifying anything in the report workbook.
-    requirements = _collect_required_ma_header_requirements(
-        ws_data, analytical_reviews, selected_month, selected_year, log_emit
-    )
+    requirements = _collect_strict_ma_header_requirements(analytical_reviews, selected_month, selected_year, log_emit)
     _validate_required_ma_headers(ma_workbooks, requirements, log_emit)
 
     # Process each Analytical Review section
@@ -1175,6 +1549,44 @@ def process_variance_report(
         end_row = analytical_reviews[i + 1][0] if i + 1 < len(analytical_reviews) else ws.max_row + 1
         page9_values_cache: Optional[List[Tuple[str, float, float]]] = None
         page9_summary_written = False
+
+        # Force Page 9B '*' summary updates even when there are no remaining 'Description' placeholders.
+        star_row_in_section = _find_star_cell_row_in_column_b(ws_data, ar_row + 1, end_row)
+        other_income_anchor_row: Optional[int] = None
+        if star_row_in_section:
+            for scan_row in range(ar_row + 1, end_row):
+                for scan_col in (1, 2):
+                    for candidate in _cell_text_candidates(
+                        ws.cell(row=scan_row, column=scan_col),
+                        ws_data.cell(row=scan_row, column=scan_col),
+                    ):
+                        if "OTHER INCOME" in candidate.upper():
+                            other_income_anchor_row = scan_row
+                            break
+                    if other_income_anchor_row:
+                        break
+                if other_income_anchor_row:
+                    break
+
+        if star_row_in_section and other_income_anchor_row and not page9_summary_written:
+            if page9_values_cache is None:
+                page9_values_cache = get_values_for_page9(ma_workbooks, left_headers, right_headers, search_cols, log_emit)
+
+            summary = build_page9b_variance_summary(page9_values_cache)
+            if not _write_page9b_summary_to_star_cell(
+                ws=ws,
+                ws_data=ws_data,
+                start_row=ar_row + 1,
+                end_row_exclusive=end_row,
+                anchor_row=other_income_anchor_row,
+                summary=summary,
+                values_overrides=values_overrides,
+                log_emit=log_emit,
+            ):
+                _emit(log_emit, "    -> No '*' cell found to write Page 9B summary")
+            page9_summary_written = True
+        elif star_row_in_section and not other_income_anchor_row:
+            _emit(log_emit, "    -> Found '*' cell but no 'Other Income' marker; skipping Page 9B summary update")
 
         # Find Description cells in this section
         for row in range(ar_row + 1, end_row):
