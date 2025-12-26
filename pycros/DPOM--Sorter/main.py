@@ -30,6 +30,9 @@ COLOR_GREEN = "92D050"  # cGreen = 8252325
 COLOR_DARK_GREEN = "506E20"  # cDGreen = 5287936
 COLOR_MAGENTA = "800080"  # cDMagenta = 8388736
 
+# Destination countries that require separating each Material (incl. colorway)
+SPLIT_MATERIAL_BY_DEST_COUNTRY = {"CANADA", "INDONESIA", "MEXICO"}
+
 # Column indices in raw data (0-based)
 COL_VENDOR = 0
 COL_SEASON = 1
@@ -96,12 +99,13 @@ def format_date_val(val) -> str:
 
 
 def parse_ogac_date(val) -> Optional[datetime]:
-    """Parse OGAC date - VBA expects MM/DD/YYYY but input is DD/MM/YYYY
-    We need to replicate VBA's behavior for sorting"""
+    """Parse OGAC date from Excel dates or DD/MM/YYYY strings."""
     if not val:
         return None
     if isinstance(val, datetime):
         return val
+    if isinstance(val, date):
+        return datetime(val.year, val.month, val.day)
     try:
         if "/" in str(val):
             parts = str(val).split("/")
@@ -118,6 +122,50 @@ def parse_ogac_date(val) -> Optional[datetime]:
     except:
         pass
     return None
+
+
+def normalize_country(val: Any) -> str:
+    """Normalize destination country for comparisons"""
+    if val is None:
+        return ""
+    return str(val).strip().upper()
+
+
+def format_afs_category(val: Any, width: int = 5) -> str:
+    """Format AFS Category as a zero-padded numeric string (default width=5)."""
+    if val is None:
+        return ""
+
+    if isinstance(val, bool):
+        return str(val)
+
+    try:
+        if isinstance(val, (int, float)):
+            return str(int(val)).zfill(width)
+
+        s = str(val).strip()
+        if not s:
+            return ""
+
+        if s.isdigit():
+            return s.zfill(width)
+
+        f = float(s)
+        i = int(f)
+        if abs(f - i) < 1e-9:
+            return str(i).zfill(width)
+    except Exception:
+        pass
+
+    return str(val).strip()
+
+
+def format_ship_to_customer_number(val: Any) -> str:
+    """Format Ship To Customer Number; uses '#' when empty (matches Excel output)."""
+    if val is None:
+        return "#"
+    s = str(val).strip()
+    return s if s else "#"
 
 
 # =============================================================================
@@ -245,8 +293,8 @@ class ProcessingLogic:
                 'po': str(raw[COL_PO]),
                 'po_line': str(raw[COL_PO_LINE]),
                 'country': str(raw[COL_COUNTRY]),
-                'ship_no': str(raw[COL_SHIP_NO]),
-                'afs': str(raw[COL_AFS])
+                'ship_no': format_ship_to_customer_number(raw[COL_SHIP_NO]),
+                'afs': format_afs_category(raw[COL_AFS])
             }
             pivoted_rows.append(obj)
 
@@ -255,7 +303,7 @@ class ProcessingLogic:
             x['style_head'],
             x['year'] or 0,
             x['season_rank'],
-            x['ogac_str'],
+            x['ogac_dt'] or datetime.max,
             x['po'],
             x['style_cw'],
             x['po_line'],
@@ -304,111 +352,144 @@ class ProcessingLogic:
         """Build final output structure - each PO gets its own Total OGAC Qty (matching Total PO Qty)"""
         final_rows = []
 
-        # Group by Style only
+        # Group by Style (for selected countries, keep full Material incl. colorway)
         style_groups = defaultdict(list)
+        style_keep_colorway = {}
         for row in pivoted_rows:
-            style_groups[row['style_head']].append(row)
+            country_norm = normalize_country(row.get('country'))
+            keep_colorway = country_norm in SPLIT_MATERIAL_BY_DEST_COUNTRY
+            style_key = row['style_full'] if keep_colorway else row['style_head']
+            style_groups[style_key].append(row)
+            style_keep_colorway[style_key] = style_keep_colorway.get(style_key, False) or keep_colorway
 
         for style_key in sorted(style_groups.keys()):
             style_items = style_groups[style_key]
+            keep_colorway = style_keep_colorway.get(style_key, False)
 
             # Accumulate style totals
             style_totals = defaultdict(int)
             style_money = 0
 
-            # Group by PO within style (each PO is independent)
-            po_groups = defaultdict(list)
+            # Group by OGAC date within style (earliest to latest)
+            ogac_groups = defaultdict(list)
             for item in style_items:
-                po_key = (item['country'], item['po'], item['afs'], item['ship_no'])
-                po_groups[po_key].append(item)
+                ogac_dt = item.get('ogac_dt')
+                ogac_key = ogac_dt.date() if isinstance(ogac_dt, datetime) else None
+                ogac_groups[ogac_key].append(item)
 
-            for po_key, po_items in po_groups.items():
-                # Check for blind buy
-                is_blind_buy = False
-                bb_job = ""
-                for item in po_items:
-                    if item['style_full'].upper() in self.blind_buy_map:
-                        is_blind_buy = True
-                        bb_job = self.blind_buy_map[item['style_full'].upper()]
-                        break
+            for ogac_key in sorted(ogac_groups.keys(), key=lambda d: (d is None, d or date.max)):
+                ogac_items = ogac_groups[ogac_key]
 
-                # Accumulate PO totals
-                po_totals = defaultdict(int)
-                po_money = 0
+                # Accumulate OGAC totals (across POs under this style+OGAC)
+                ogac_totals = defaultdict(int)
 
-                # Add individual item rows
-                for item in po_items:
+                # Group by PO within OGAC (each PO is independent)
+                po_groups = defaultdict(list)
+                split_ship_to_idx = 0
+                for item in ogac_items:
+                    ship_to = item.get('ship_no', '#')
+                    if ship_to != "#":
+                        # If Ship To has an explicit value (not '#'), do not group it with any other line
+                        po_key = (item['country'], item['po'], item['afs'], ship_to, split_ship_to_idx)
+                        split_ship_to_idx += 1
+                    else:
+                        po_key = (item['country'], item['po'], item['afs'], ship_to)
+                    po_groups[po_key].append(item)
+
+                for _, po_items in po_groups.items():
+                    # Check for blind buy
+                    is_blind_buy = False
+                    bb_job = ""
+                    for item in po_items:
+                        if item['style_full'].upper() in self.blind_buy_map:
+                            is_blind_buy = True
+                            bb_job = self.blind_buy_map[item['style_full'].upper()]
+                            break
+
+                    # Accumulate PO totals
+                    po_totals = defaultdict(int)
+                    po_money = 0
+
+                    # Add individual item rows
+                    for item in po_items:
+                        final_rows.append({
+                            'type': 'ITEM',
+                            'data': item,
+                            'label': 'Total Item Qty',
+                            'sizes': item['sizes'],
+                            'total_qty': item['total_qty'],
+                            'keep_colorway': keep_colorway,
+                        })
+
+                        # Accumulate totals
+                        for sz in sorted_sizes:
+                            qty = item['sizes'].get(sz, 0)
+                            po_totals[sz] += qty
+
+                        fob = float(item['fob']) if item['fob'] else 0
+                        po_money += item['total_qty'] * fob
+
+                    # Total PO Qty row
                     final_rows.append({
-                        'type': 'ITEM',
-                        'data': item,
-                        'label': 'Total Item Qty',
-                        'sizes': item['sizes'],
-                        'total_qty': item['total_qty']
+                        'type': 'TOTAL_PO',
+                        'data': po_items[0],
+                        'sizes': po_totals,
+                        'total_qty': sum(po_totals.values()),
+                        'blind_buy': is_blind_buy,
+                        'bb_job': bb_job,
+                        'keep_colorway': keep_colorway,
                     })
 
-                    # Accumulate totals
-                    for sz in sorted_sizes:
-                        qty = item['sizes'].get(sz, 0)
-                        po_totals[sz] += qty
+                    # Net Unit Price row (PO level)
+                    final_rows.append({
+                        'type': 'MONEY_PO',
+                        'label': 'Net Unit Price',
+                        'data': po_items[0],
+                        'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
+                        'sizes': po_totals,
+                        'total_money': po_money,
+                        'keep_colorway': keep_colorway,
+                    })
 
-                    fob = float(item['fob']) if item['fob'] else 0
-                    po_money += item['total_qty'] * fob
+                    # Trading Co Net Unit Price row (PO level)
+                    final_rows.append({
+                        'type': 'MONEY_PO',
+                        'label': 'Trading Co Net Unit Price',
+                        'data': po_items[0],
+                        'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
+                        'sizes': po_totals,
+                        'total_money': po_money,
+                        'keep_colorway': keep_colorway,
+                    })
 
-                # Total PO Qty row
-                final_rows.append({
-                    'type': 'TOTAL_PO',
-                    'data': po_items[0],
-                    'sizes': po_totals,
-                    'total_qty': sum(po_totals.values()),
-                    'blind_buy': is_blind_buy,
-                    'bb_job': bb_job
-                })
+                    # Black separator after PO money rows
+                    final_rows.append({'type': 'SEP_BLACK'})
 
-                # Net Unit Price row (PO level)
-                final_rows.append({
-                    'type': 'MONEY_PO',
-                    'label': 'Net Unit Price',
-                    'data': po_items[0],
-                    'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
-                    'sizes': po_totals,
-                    'total_money': po_money
-                })
+                    # Roll up to OGAC + Style level
+                    for sz, qty in po_totals.items():
+                        ogac_totals[sz] += qty
+                        style_totals[sz] += qty
+                    style_money += po_money
 
-                # Trading Co Net Unit Price row (PO level)
-                final_rows.append({
-                    'type': 'MONEY_PO',
-                    'label': 'Trading Co Net Unit Price',
-                    'data': po_items[0],
-                    'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
-                    'sizes': po_totals,
-                    'total_money': po_money
-                })
-
-                # Black separator after PO money rows
-                final_rows.append({'type': 'SEP_BLACK'})
-
-                # Total OGAC Qty row (duplicates Total PO Qty - one per PO)
+                # Total OGAC Qty row (per OGAC date)
                 final_rows.append({
                     'type': 'TOTAL_OGAC',
-                    'data': po_items[0],
-                    'sizes': po_totals,  # Same as PO totals
-                    'total_qty': sum(po_totals.values())
+                    'data': ogac_items[0],
+                    'sizes': ogac_totals,
+                    'total_qty': sum(ogac_totals.values()),
+                    'keep_colorway': keep_colorway,
                 })
 
                 # Pink separator after OGAC
                 final_rows.append({'type': 'SEP_PINK'})
-
-                # Roll up to Style level
-                for sz, qty in po_totals.items():
-                    style_totals[sz] += qty
-                style_money += po_money
 
             # Total Style Qty row
             final_rows.append({
                 'type': 'TOTAL_STYLE',
                 'data': style_items[0],
                 'sizes': style_totals,
-                'total_qty': sum(style_totals.values())
+                'total_qty': sum(style_totals.values()),
+                'keep_colorway': keep_colorway,
             })
 
             # Net Unit Price row (Style level)
@@ -416,7 +497,8 @@ class ProcessingLogic:
                 'type': 'MONEY_STYLE',
                 'label': 'Net Unit Price',
                 'data': style_items[0],
-                'total_money': style_money
+                'total_money': style_money,
+                'keep_colorway': keep_colorway,
             })
 
             # Trading Co Net Unit Price row (Style level)
@@ -424,7 +506,8 @@ class ProcessingLogic:
                 'type': 'MONEY_STYLE',
                 'label': 'Trading Co Net Unit Price',
                 'data': style_items[0],
-                'total_money': style_money
+                'total_money': style_money,
+                'keep_colorway': keep_colorway,
             })
 
             # Dark green separator after Style
@@ -513,7 +596,7 @@ class ProcessingLogic:
             # Determine style code (strip colorway for total rows)
             style_val = raw[COL_STYLE]
             if row_type in ['TOTAL_STYLE', 'TOTAL_PO', 'TOTAL_OGAC', 'MONEY_STYLE', 'MONEY_PO']:
-                if "-" in str(style_val):
+                if not row_obj.get('keep_colorway') and "-" in str(style_val):
                     style_val = str(style_val).split("-")[0]
 
             # Column 1-3: Vendor, Season, Year
@@ -593,10 +676,7 @@ class ProcessingLogic:
                 ws.cell(curr_row, 25, "")
             elif row_type == 'ITEM' or row_type == 'MONEY_PO' or row_type == 'MONEY_STYLE':
                 # Item and money rows: show customer number or "#"
-                sn = raw[COL_SHIP_NO]
-                if not sn:
-                    sn = "#"
-                ws.cell(curr_row, 25, sn)
+                ws.cell(curr_row, 25, format_ship_to_customer_number(raw[COL_SHIP_NO]))
 
             # Column 26: Empty column
 
@@ -622,8 +702,7 @@ class ProcessingLogic:
                 # Item and Money rows: Show full info
                 ws.cell(curr_row, 28, raw[COL_COUNTRY])
                 # AFS Category: Keep leading zeros for Item rows, strip for others
-                afs_val = str(raw[COL_AFS])
-                # Don't strip leading zeros - VBA keeps "01000" format
+                afs_val = format_afs_category(raw[COL_AFS])
                 ws.cell(curr_row, 29, afs_val)
                 ws.cell(curr_row, 30, raw[COL_CAT_DESC])
                 ws.cell(curr_row, 31, raw[COL_SUB_CAT])
