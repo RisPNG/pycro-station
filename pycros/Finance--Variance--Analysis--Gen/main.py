@@ -245,7 +245,7 @@ def _analytical_review_group_requires_actions(ws, ws_data, start_row: int, end_r
             if "Description" in displayed_val:
                 return True
 
-    # Page 9B '*' placeholder processing is independent of "Description" placeholders.
+    # Page 9B '*' summary processing is independent of "Description" placeholders.
     return _find_star_cell_row_in_column_b(ws, ws_data, start_row, end_row_exclusive) is not None
 
 
@@ -1154,26 +1154,20 @@ def _find_star_cell_row_in_column_b(
     start_row = max(1, start_row)
     end_row_exclusive = max(1, end_row_exclusive)
 
-    def _cell_is_unprocessed_star_placeholder(row: int) -> bool:
+    def _cell_startswith_star(row: int) -> bool:
         ws_cell = ws.cell(row=row, column=2)
         ws_data_cell = ws_data.cell(row=row, column=2)
         for candidate in _cell_text_candidates(ws_cell, ws_data_cell):
             if not candidate:
                 continue
-            # Unprocessed star placeholders start with "* " (or "*<whitespace>").
-            # Processed bullets are written like "*Higher ..." (no whitespace after '*').
             text = candidate.lstrip()
-            if not text.startswith("*"):
-                continue
-            if text == "*":
-                return True
-            if text[1].isspace():
+            if text.startswith("*"):
                 return True
         return False
 
     if anchor_row is None:
         for row in range(start_row, end_row_exclusive):
-            if _cell_is_unprocessed_star_placeholder(row):
+            if _cell_startswith_star(row):
                 return row
         return None
 
@@ -1183,7 +1177,7 @@ def _find_star_cell_row_in_column_b(
 
     star_rows: List[int] = []
     for row in range(window_start, window_end_exclusive):
-        if _cell_is_unprocessed_star_placeholder(row):
+        if _cell_startswith_star(row):
             star_rows.append(row)
 
     if not star_rows:
@@ -1202,11 +1196,12 @@ def _write_page9b_summary_to_star_cell(
     """
     Write the provided summary into the given '*' placeholder cell (column B), and clear the row below.
     """
-    if not summary:
-        return False
+    ws.cell(row=star_row, column=2).value = None
+    values_overrides[(star_row, 2)] = None
 
-    ws.cell(row=star_row, column=2).value = summary
-    values_overrides[(star_row, 2)] = summary
+    if summary:
+        ws.cell(row=star_row, column=2).value = summary
+        values_overrides[(star_row, 2)] = summary
 
     if star_row + 1 <= ws.max_row:
         ws.cell(row=star_row + 1, column=2).value = None
@@ -1604,7 +1599,7 @@ def process_variance_report(
         end_row = analytical_reviews[i + 1][0] if i + 1 < len(analytical_reviews) else ws.max_row + 1
         page9_values_cache: Optional[List[Tuple[str, float, float]]] = None
 
-        # Page 9B '*' summary updates are driven only by an unprocessed "* " placeholder in column B.
+        # Page 9B '*' summary updates are driven by any '*' bullet cell in column B.
         star_row_in_section = _find_star_cell_row_in_column_b(ws, ws_data, ar_row + 1, end_row)
         if star_row_in_section:
             if page9_values_cache is None:
@@ -1613,16 +1608,15 @@ def process_variance_report(
                 )
 
             summary = build_page9b_variance_summary(page9_values_cache)
-            if summary:
-                _write_page9b_summary_to_star_cell(
-                    ws=ws,
-                    star_row=star_row_in_section,
-                    summary=summary,
-                    values_overrides=values_overrides,
-                    log_emit=log_emit,
-                )
-            else:
-                _emit(log_emit, "    -> No Page 9B variance summary generated; leaving '*' placeholder unchanged")
+            _write_page9b_summary_to_star_cell(
+                ws=ws,
+                star_row=star_row_in_section,
+                summary=summary,
+                values_overrides=values_overrides,
+                log_emit=log_emit,
+            )
+            if not summary:
+                _emit(log_emit, "    -> No Page 9B variance summary generated; cleared '*' cell")
 
         # Find Description cells in this section
         for row in range(ar_row + 1, end_row):
