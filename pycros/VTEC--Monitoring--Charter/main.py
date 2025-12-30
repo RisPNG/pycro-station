@@ -1,5 +1,5 @@
 """
-VTEC Monitoring Charter - Python Port v1.8.5
+VTEC Monitoring Charter - Python Port v1.8.9
 
 Converts the VBA MasterStart macro to Python with openpyxl.
 Key fixes:
@@ -9,6 +9,10 @@ Key fixes:
 - v1.8.3: Fixes duplicate group blocks by improving existing-group detection and auto-removing duplicates.
 - v1.8.4: Formats invoice dates as d/m/yyyy (no time).
 - v1.8.5: Fixes payment parsing for numeric sheet names with whitespace (e.g. '1025 ').
+- v1.8.6: When a monitoring workbook is provided, saves output as a timestamped copy instead of overwriting.
+- v1.8.7: Fixes Total formulas after row deletions by rebuilding them from the final sheet layout.
+- v1.8.8: Re-compresses consecutive blank rows between groups (without breaking Total formulas).
+- v1.8.9: Ignores Balance columns when detecting last data row (prevents huge gaps from pre-filled formulas).
 
 Performance optimizations:
 - Uses read_only=True for source files (much faster for large files)
@@ -50,6 +54,7 @@ GREY_FILL = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="sol
 NO_FILL = PatternFill(fill_type=None)
 
 INVOICE_DATE_NUMBER_FORMAT = "d/m/yyyy"
+MONITOR_DATA_MAX_COL = 9  # Only columns A-I determine the "last data row" (ignore Balance J/K which may be pre-filled)
 
 THIN_BORDER = Border(
     left=Side(style='thin'),
@@ -129,6 +134,31 @@ def month_num_to_name(num_str: str) -> str:
 def normalize_group(grp: str) -> str:
     """Normalize group string for comparison."""
     return str(grp).strip().upper().replace(" ", "").replace("-", "")
+
+
+def _has_meaningful_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
+
+
+def _row_has_any_values(row: tuple) -> bool:
+    return any(_has_meaningful_value(v) for v in row)
+
+
+def _ensure_unique_path(path: str) -> str:
+    """Append (n) to path if needed to avoid overwriting existing files."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 1
+    while True:
+        candidate = f"{base} ({n}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
 
 
 class VTECProcessor:
@@ -391,6 +421,98 @@ class VTECProcessor:
         except Exception as e:
             self.log(f"  Error parsing charge file: {e}")
 
+    def _find_last_data_row(self, ws, start_row: int = 5, max_col: int = 11) -> int:
+        """Find the last row containing any value (ignores style-only cells)."""
+        last_data_row = start_row - 1
+        for r, row in enumerate(
+            ws.iter_rows(min_row=start_row, max_col=max_col, values_only=True),
+            start=start_row,
+        ):
+            if row and _row_has_any_values(row):
+                last_data_row = r
+        return max(last_data_row, 4)
+
+    def _rebuild_total_row_formulas(self, ws):
+        """Rebuild per-group Total row formulas based on current row positions."""
+        last_row = self._find_last_data_row(ws, start_row=4, max_col=MONITOR_DATA_MAX_COL)
+        rows = list(ws.iter_rows(min_row=5, max_row=last_row, max_col=7, values_only=True))
+        row_offset = 5
+
+        rebuilt = 0
+        idx = 0
+        while idx < len(rows):
+            col_a, col_b, col_c, col_d, _, col_f, col_g = rows[idx]
+            group = str(col_a or "").strip()
+            b_str = str(col_b or "").strip()
+            c_str = str(col_c or "").strip()
+            header_marker = (
+                _has_meaningful_value(col_d)
+                or _has_meaningful_value(col_f)
+                or _has_meaningful_value(col_g)
+            )
+
+            # Header row: group in A, blank B/C, and some header fields filled (PI Month / PI totals).
+            # (Avoids confusing the debit placeholder row with the group header.)
+            if group and (not b_str) and (not c_str) and header_marker:
+                header_row = idx + row_offset
+                first_job_row = header_row + 1
+                last_job_row = first_job_row - 1
+                exch_row = None
+
+                scan = idx + 1
+                while scan < len(rows):
+                    sa, sb, sc, sd, _, sf, sg = rows[scan]
+                    sa_str = str(sa or "").strip()
+                    sb_str = str(sb or "").strip()
+                    sc_str = str(sc or "").strip()
+                    sb_u = sb_str.upper()
+
+                    # If we hit another header row before Total, stop this block.
+                    next_header_marker = (
+                        _has_meaningful_value(sd)
+                        or _has_meaningful_value(sf)
+                        or _has_meaningful_value(sg)
+                    )
+                    if sa_str and sa_str != group and (not sb_str) and (not sc_str) and next_header_marker:
+                        break
+
+                    if sb_u == "EXCHANGE GAIN OR LOSS":
+                        exch_row = scan + row_offset
+                    elif sb_u == "TOTAL":
+                        total_row = scan + row_offset
+                        exch_for_formula = exch_row or (total_row - 1)
+                        if last_job_row < first_job_row:
+                            last_job_row = first_job_row
+
+                        ws.cell(row=total_row, column=6).value = f"=F{header_row}"
+                        ws.cell(row=total_row, column=6).number_format = "#,##0"
+                        ws.cell(row=total_row, column=7).value = f"=ROUND(SUM(G{header_row}:G{exch_for_formula}),2)"
+                        ws.cell(row=total_row, column=7).number_format = "#,##0.00"
+                        ws.cell(row=total_row, column=8).value = f"=SUM(H{first_job_row}:H{last_job_row})"
+                        ws.cell(row=total_row, column=8).number_format = "#,##0"
+                        ws.cell(row=total_row, column=9).value = f"=ROUND(SUM(I{first_job_row}:I{exch_for_formula}),2)"
+                        ws.cell(row=total_row, column=9).number_format = "#,##0.00"
+                        ws.cell(row=total_row, column=10).value = f"=ROUND(G{total_row}-I{total_row},2)"
+                        ws.cell(row=total_row, column=10).number_format = "#,##0.00"
+                        ws.cell(row=total_row, column=11).value = f"=ROUND(F{total_row}-H{total_row},2)"
+                        ws.cell(row=total_row, column=11).number_format = "#,##0"
+                        for col in range(1, 12):
+                            ws.cell(row=total_row, column=col).font = ITALIC_FONT
+
+                        rebuilt += 1
+                        idx = scan + 1
+                        break
+
+                    if sc_str:
+                        last_job_row = scan + row_offset
+                    scan += 1
+                else:
+                    idx += 1
+            else:
+                idx += 1
+
+        self.log(f"Rebuilt Total formulas for {rebuilt:,} group(s)")
+
     def process_monitoring_workbook(self, wb: Workbook) -> Workbook:
         """
         Process the monitoring workbook - create/update VTEC Monitoring Chart.
@@ -427,14 +549,32 @@ class VTECProcessor:
         else:
             last_row = ws.max_row
 
+            # OPTIMIZATION: Read all data in bulk first (much faster than cell-by-cell)
+            # This creates a list of tuples for all rows
+            self.log("Caching existing sheet values for faster scanning...")
+            cache_t0 = time.perf_counter()
+            all_rows_data = list(ws.iter_rows(min_row=5, max_row=last_row, max_col=MONITOR_DATA_MAX_COL, values_only=True))
+            row_offset = 5  # Starting row number
+            last_data_row = row_offset - 1
+            for i in range(len(all_rows_data) - 1, -1, -1):
+                if all_rows_data[i] and _row_has_any_values(all_rows_data[i]):
+                    last_data_row = i + row_offset
+                    all_rows_data = all_rows_data[: i + 1]
+                    break
+
+            self.log(
+                f"Cached {len(all_rows_data):,} rows in {time.perf_counter() - cache_t0:.1f}s "
+                f"(last data row: {last_data_row:,})"
+            )
+
             # Clear previous-run green highlights (match VBA behavior).
-            self.log(f"Clearing previous-run green highlights (rows 5-{last_row})...")
+            self.log(f"Clearing previous-run green highlights (rows 5-{last_data_row})...")
             clear_t0 = time.perf_counter()
             last_progress = time.monotonic()
-            for row in range(5, last_row + 1):
+            for row in range(5, last_data_row + 1):
                 now = time.monotonic()
                 if now - last_progress >= 5.0:
-                    self.log(f"  ... cleared green up to row {row:,}/{last_row:,}")
+                    self.log(f"  ... cleared green up to row {row:,}/{last_data_row:,}")
                     last_progress = now
                 for col in range(1, 12):
                     cell = ws.cell(row=row, column=col)
@@ -447,15 +587,7 @@ class VTECProcessor:
 
             self.log(f"Cleared green highlights in {time.perf_counter() - clear_t0:.1f}s")
 
-            # OPTIMIZATION: Read all data in bulk first (much faster than cell-by-cell)
-            # This creates a list of tuples for all rows
-            self.log("Caching existing sheet values for faster scanning...")
-            cache_t0 = time.perf_counter()
-            all_rows_data = list(ws.iter_rows(min_row=5, max_row=last_row, max_col=11, values_only=True))
-            self.log(f"Cached {len(all_rows_data):,} rows in {time.perf_counter() - cache_t0:.1f}s")
-
             # Build existing group info by scanning the cached data
-            row_offset = 5  # Starting row number
             row_idx = 1  # Index in all_rows_data (row 6 = index 1)
             self.log("Scanning existing group blocks in monitoring sheet...")
             scan_t0 = time.perf_counter()
@@ -477,9 +609,21 @@ class VTECProcessor:
 
                 cell_a = str(row_data[0] or "").strip()
                 cell_b = str(row_data[1] or "").strip()
+                cell_c = str(row_data[2] or "").strip() if len(row_data) > 2 else ""
+                header_marker = (
+                    (len(row_data) > 3 and _has_meaningful_value(row_data[3]))
+                    or (len(row_data) > 5 and _has_meaningful_value(row_data[5]))
+                    or (len(row_data) > 6 and _has_meaningful_value(row_data[6]))
+                )
 
                 # Check if this is a group header (has group ID in A)
-                if cell_a and cell_a in group_headers:
+                if (
+                    cell_a
+                    and cell_a in group_headers
+                    and (not cell_b)
+                    and (not cell_c)
+                    and header_marker
+                ):
                     group = cell_a
                     header_row = actual_row
 
@@ -506,9 +650,8 @@ class VTECProcessor:
                         scan_b = str(scan_data[1] or "").strip()
                         scan_b_u = scan_b.upper()
 
-                        # Stop at the next group header (allow blank A inside the current group,
-                        # e.g. debit placeholder rows when there is no debit note).
-                        if scan_a and scan_a in group_headers and scan_a != group:
+                        # Stop at the next group block (including groups not in the current PI file).
+                        if scan_a and scan_a != group:
                             break
 
                         if scan_b_u == "CHARGE TO PURCHASE":
@@ -634,8 +777,17 @@ class VTECProcessor:
                 last_row = ws.max_row
                 self.log("Re-scanning monitoring sheet after duplicate cleanup...")
                 cache_t0 = time.perf_counter()
-                all_rows_data = list(ws.iter_rows(min_row=5, max_row=last_row, max_col=11, values_only=True))
-                self.log(f"Re-cached {len(all_rows_data):,} rows in {time.perf_counter() - cache_t0:.1f}s")
+                all_rows_data = list(ws.iter_rows(min_row=5, max_row=last_row, max_col=MONITOR_DATA_MAX_COL, values_only=True))
+                last_data_row = row_offset - 1
+                for i in range(len(all_rows_data) - 1, -1, -1):
+                    if all_rows_data[i] and _row_has_any_values(all_rows_data[i]):
+                        last_data_row = i + row_offset
+                        all_rows_data = all_rows_data[: i + 1]
+                        break
+                self.log(
+                    f"Re-cached {len(all_rows_data):,} rows in {time.perf_counter() - cache_t0:.1f}s "
+                    f"(last data row: {last_data_row:,})"
+                )
 
                 existing_groups.clear()
                 existing_pi_rows.clear()
@@ -645,7 +797,20 @@ class VTECProcessor:
                     actual_row = row_idx + row_offset
 
                     cell_a = str(row_data[0] or "").strip()
-                    if cell_a and cell_a in group_headers:
+                    cell_b = str(row_data[1] or "").strip()
+                    cell_c = str(row_data[2] or "").strip() if len(row_data) > 2 else ""
+                    header_marker = (
+                        (len(row_data) > 3 and _has_meaningful_value(row_data[3]))
+                        or (len(row_data) > 5 and _has_meaningful_value(row_data[5]))
+                        or (len(row_data) > 6 and _has_meaningful_value(row_data[6]))
+                    )
+                    if (
+                        cell_a
+                        and cell_a in group_headers
+                        and (not cell_b)
+                        and (not cell_c)
+                        and header_marker
+                    ):
                         group = cell_a
                         header_row = actual_row
                         first_job_row = actual_row + 1
@@ -662,7 +827,7 @@ class VTECProcessor:
                             scan_b = str(scan_data[1] or "").strip()
                             scan_b_u = scan_b.upper()
 
-                            if scan_a and scan_a in group_headers and scan_a != group:
+                            if scan_a and scan_a != group:
                                 break
                             if scan_b_u == "CHARGE TO PURCHASE":
                                 charge_row = scan_actual_row
@@ -704,7 +869,7 @@ class VTECProcessor:
                         row_idx += 1
 
             # Find next output row (after any de-duplication)
-            out_row = ws.max_row + 3
+            out_row = last_data_row + 3
 
         self.log(f"Found {len(existing_groups)} existing groups to potentially update")
 
@@ -743,7 +908,7 @@ class VTECProcessor:
             # If we inserted rows while updating existing groups, recompute the append position
             # right before adding the first new group.
             if not fresh_sheet and (not out_row_rebased) and group not in existing_groups:
-                out_row = ws.max_row + 3
+                out_row = self._find_last_data_row(ws, start_row=5, max_col=MONITOR_DATA_MAX_COL) + 3
                 out_row_rebased = True
 
             now = time.monotonic()
@@ -1245,10 +1410,10 @@ class VTECProcessor:
         self.log(f"Green highlights applied in {time.perf_counter() - green_t0:.1f}s")
 
         # Apply borders
-        self.log(f"Applying borders to monitoring sheet (rows 4-{ws.max_row})...")
+        last_data_row = self._find_last_data_row(ws, start_row=4, max_col=MONITOR_DATA_MAX_COL)
+        self.log(f"Applying borders to monitoring sheet (rows 4-{last_data_row})...")
         borders_t0 = time.perf_counter()
         last_progress = time.monotonic()
-        last_data_row = ws.max_row
         for row in range(4, last_data_row + 1):
             now = time.monotonic()
             if now - last_progress >= 5.0:
@@ -1270,9 +1435,17 @@ class VTECProcessor:
         self.log("Processing Zero Balance Groups...")
         self._process_zero_balance_groups(wb, ws, group_ranges)
 
-        # Compress blank rows
+        # Compress blank rows (keep only one consecutive blank row between groups)
         self.log("Compressing consecutive blank rows...")
         self._compress_blank_rows(ws)
+
+        # Rebuild Total row formulas after any row deletions (openpyxl does not auto-adjust formulas).
+        self.log("Rebuilding Total formulas after row moves/deletions...")
+        self._rebuild_total_row_formulas(ws)
+
+        # Trim trailing blank rows (safe: does not move data rows)
+        self.log("Trimming trailing blank rows...")
+        self._trim_trailing_blank_rows(ws)
 
         self.log(f"Monitoring workbook update finished in {time.perf_counter() - t0:.1f}s")
         return wb
@@ -1353,13 +1526,26 @@ class VTECProcessor:
         for col in range(1, 12):
             zero_ws.column_dimensions[get_column_letter(col)].auto_size = True
 
-    def _compress_blank_rows(self, ws):
-        """Remove consecutive blank rows, leaving only one."""
-        last_row = ws.max_row
-        blank_count = 0
+    def _trim_trailing_blank_rows(self, ws):
+        """Remove trailing blank rows at the bottom, leaving at most one."""
+        last_data_row = self._find_last_data_row(ws, start_row=4, max_col=MONITOR_DATA_MAX_COL)
+        keep_until = last_data_row + 1  # keep a single blank row for readability
+        if ws.max_row > keep_until:
+            ws.delete_rows(keep_until + 1, ws.max_row - keep_until)
 
+    def _compress_blank_rows(self, ws):
+        """Remove consecutive blank rows, leaving only one (between groups)."""
+        # Use last real data row (avoid ws.max_row inflation from formatting).
+        last_data_row = self._find_last_data_row(ws, start_row=4, max_col=MONITOR_DATA_MAX_COL)
+        last_row = max(last_data_row + 1, 4)  # allow one blank row after last data row
+
+        blank_count = 0
         for row in range(last_row, 4, -1):
-            is_blank = all(ws.cell(row=row, column=col).value is None for col in range(1, 12))
+            is_blank = True
+            for col in range(1, MONITOR_DATA_MAX_COL + 1):
+                if _has_meaningful_value(ws.cell(row=row, column=col).value):
+                    is_blank = False
+                    break
 
             if is_blank:
                 blank_count += 1
@@ -1425,7 +1611,13 @@ def run_process(payment_path: str, pi_path: str, debit_path: str, charge_path: s
 
         # Determine output path
         if monitor_path:
-            output_path = monitor_path
+            # Save beside the original monitoring workbook, but never overwrite it.
+            base_dir = os.path.dirname(monitor_path) or os.getcwd()
+            base_name = os.path.basename(monitor_path)
+            stem, ext = os.path.splitext(base_name)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            candidate = os.path.join(base_dir, f"{stem}_UPDATED_{timestamp}{ext}")
+            output_path = _ensure_unique_path(candidate)
         else:
             # Generate new file in same directory as payment file
             base_dir = os.path.dirname(payment_path)
