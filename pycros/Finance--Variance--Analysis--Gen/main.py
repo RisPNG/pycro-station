@@ -608,7 +608,8 @@ def parse_analytical_bracket(bracket_content: str, selected_month: str, selected
         return result
 
     # Check for Quarter pattern: (Q2-FY26 Vs Q2-FY25) or (Q2-FY26 Vs Q1-FY26)
-    quarter_match = re.match(r"Q(\d)-FY(\d{2})\s+Vs\s+Q(\d)-FY(\d{2})", content, re.IGNORECASE)
+    # Now also matches: Q2 - FY26, Q2- FY26, Q2 -FY26, etc.
+    quarter_match = re.match(r"Q(\d)\s*-\s*FY(\d{2})\s+Vs\s+Q(\d)\s*-\s*FY(\d{2})", content, re.IGNORECASE)
     if quarter_match:
         result["type"] = "quarter"
         q_left = int(quarter_match.group(1))
