@@ -290,16 +290,23 @@ class App:
         output_texts = set()
 
         #Functions
+        def normalize_header_text(value) -> str:
+            if value is None:
+                return ""
+            # Collapse all whitespace (incl. newlines) and normalize case.
+            return " ".join(str(value).split()).strip().lower()
+
         def find_columns_header(sheet, needed_columns):
-            header_row_index = None
+            needed_norm = [normalize_header_text(c) for c in needed_columns]
             for row in sheet.iter_rows(max_col=sheet.max_column):
                 for cell in row:
-                    if cell.value:
-                        for key in needed_columns:
-                            if key in str(cell.value):
-                                if header_row_index is None:
-                                    header_row_index = cell.row
-                                    return header_row_index
+                    cell_norm = normalize_header_text(cell.value)
+                    if not cell_norm:
+                        continue
+                    for key_norm in needed_norm:
+                        if key_norm and key_norm in cell_norm:
+                            return cell.row
+            return None
 
         def find_columns_master(sheet, needed_columns, header):
             column_positions = {column: None for column in needed_columns}
@@ -316,48 +323,54 @@ class App:
             column_positions["Hanger size"] = []
             column_positions["Ratio Qty"] = []
 
+            needed_norm = {key: normalize_header_text(key) for key in needed_columns}
             for row in sheet.iter_rows(min_row=header, max_row=header, max_col=sheet.max_column):
                 for cell in row:
-                    if cell.value:
-                        for key in needed_columns:
-                            if str(key).strip().lower() in str(cell.value).strip().lower():
-                                # self.third_frame_textbox_1.insert("end", f"rn master {str(key).strip().lower()} in {str(cell.value).strip().lower()}...\n\n")
-                                # Append to list if it's the specific multiple columned key
-                                if key == "FINAL FOB (Extended sizes)":
-                                    column_positions[key].append(cell.column)
-                                elif key == "Season":
-                                    column_positions[key].append(cell.column)
-                                elif key == "FG QTY":
-                                    column_positions[key].append(cell.column)
-                                elif key == "Doc Type":
-                                    column_positions[key].append(cell.column)
-                                elif key == "SHIP MODE":
-                                    column_positions[key].append(cell.column)
-                                elif key == "Plant Code":
-                                    column_positions[key].append(cell.column)
-                                elif key == "SHIP-TO":
-                                    column_positions[key].append(cell.column)
-                                elif key == "AFS Cat":
-                                    column_positions[key].append(cell.column)
-                                elif key == "VAS name":
-                                    column_positions[key].append(cell.column)
-                                elif key == "Hanger size":
-                                    column_positions[key].append(cell.column)
-                                elif key == "Ratio Qty":
-                                    column_positions[key].append(cell.column)
-                                else:
-                                    column_positions[key] = cell.column
+                    cell_norm = normalize_header_text(cell.value)
+                    if not cell_norm:
+                        continue
+                    for key, key_norm in needed_norm.items():
+                        if key_norm and key_norm in cell_norm:
+                            # self.third_frame_textbox_1.insert("end", f"rn master {key_norm} in {cell_norm}...\n\n")
+                            # Append to list if it's the specific multiple columned key
+                            if key == "FINAL FOB (Extended sizes)":
+                                column_positions[key].append(cell.column)
+                            elif key == "Season":
+                                column_positions[key].append(cell.column)
+                            elif key == "FG QTY":
+                                column_positions[key].append(cell.column)
+                            elif key == "Doc Type":
+                                column_positions[key].append(cell.column)
+                            elif key == "SHIP MODE":
+                                column_positions[key].append(cell.column)
+                            elif key == "Plant Code":
+                                column_positions[key].append(cell.column)
+                            elif key == "SHIP-TO":
+                                column_positions[key].append(cell.column)
+                            elif key == "AFS Cat":
+                                column_positions[key].append(cell.column)
+                            elif key == "VAS name":
+                                column_positions[key].append(cell.column)
+                            elif key == "Hanger size":
+                                column_positions[key].append(cell.column)
+                            elif key == "Ratio Qty":
+                                column_positions[key].append(cell.column)
+                            else:
+                                column_positions[key] = cell.column
             return column_positions
 
         def find_columns_report(sheet, needed_columns, header):
             column_positions = {column: None for column in needed_columns}
+            needed_norm = {key: normalize_header_text(key) for key in needed_columns}
             for row in sheet.iter_rows(min_row=header, max_row=header, max_col=sheet.max_column):
                 for cell in row:
-                    if cell.value:
-                        for key in needed_columns:
-                            if str(key).strip().lower() in str(cell.value).strip().lower():
-                                # self.third_frame_textbox_1.insert("end", f"rn report {str(cell.value)}...\n\n")
-                                column_positions[key] = cell.column
+                    cell_norm = normalize_header_text(cell.value)
+                    if not cell_norm:
+                        continue
+                    for key, key_norm in needed_norm.items():
+                        if key_norm and key_norm in cell_norm:
+                            # self.third_frame_textbox_1.insert("end", f"rn report {cell_norm}...\n\n")
+                            column_positions[key] = cell.column
             return column_positions
 
         def safe_float(value):
@@ -367,6 +380,12 @@ class App:
                 return float(0)
 
         def letter(n):
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                return "N/A"
+            if n <= 0:
+                return "N/A"
             result = ""
             while n > 0:
                 n -= 1
@@ -374,13 +393,51 @@ class App:
                 n //= 26
             return result
 
+        def col_letter(col_num, offset: int = 0) -> str:
+            try:
+                return letter(int(col_num) + int(offset))
+            except (TypeError, ValueError):
+                return "N/A"
+
+        def row_value(row, col_num, idx_offset: int = 0):
+            if col_num is None:
+                return None
+            try:
+                idx = int(col_num) - 1 + int(idx_offset)
+            except (TypeError, ValueError):
+                return None
+            if idx < 0 or idx >= len(row):
+                return None
+            return row[idx].value
+
+        def report_change_datetime(row, report_cols) -> datetime:
+            """Best-effort report change timestamp (Change Date -> Document Date -> now)."""
+            raw = row_value(row, report_cols.get("Change Date"))
+            if raw is None:
+                raw = row_value(row, report_cols.get("Document Date"))
+
+            if raw is None:
+                return datetime.now()
+
+            if hasattr(raw, "strftime"):
+                return raw
+
+            s_val = str(raw).strip()
+            for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d/%m/%y"):
+                try:
+                    return datetime.strptime(s_val, fmt)
+                except ValueError:
+                    continue
+            return datetime.now()
+
         def append_date_changes(master_row, master_cols, report_cols, row, change_type, report_value):
             ex_date = str(master_row[master_cols[f"{change_type} (Date)"] - 1].value).strip() if not isEmptyCell(master_row[master_cols[f"{change_type} (Date)"] - 1].value) else ""
             ex_change = str(master_row[master_cols[f"{change_type} (Changes)"] - 1].value).strip() if not isEmptyCell(master_row[master_cols[f"{change_type} (Changes)"] - 1].value) else ""
 
-            current_date = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d')).strip()
-            current_date_mmddyy = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d/%y')).strip()
-            current_date_mdyy = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d/%y')).strip().replace('/0', '/').lstrip('0')
+            dt = report_change_datetime(row, report_cols)
+            current_date = str(dt.strftime('%m/%d')).strip()
+            current_date_mmddyy = str(dt.strftime('%m/%d/%y')).strip()
+            current_date_mdyy = str(dt.strftime('%m/%d/%y')).strip().replace('/0', '/').lstrip('0')
             current_change = str(report_value).strip()
 
             if ex_date and ex_change:
@@ -441,9 +498,10 @@ class App:
             ex_date = ori_date[change_type].get(f"{key}", "")
             ex_change = ori_change[change_type].get(f"{key}", "")
 
-            current_date = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d')).strip()
-            current_date_mmddyy = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d/%y')).strip()
-            current_date_mdyy = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d/%y')).strip().replace('/0', '/').lstrip('0')
+            dt = report_change_datetime(row, report_cols)
+            current_date = str(dt.strftime('%m/%d')).strip()
+            current_date_mmddyy = str(dt.strftime('%m/%d/%y')).strip()
+            current_date_mdyy = str(dt.strftime('%m/%d/%y')).strip().replace('/0', '/').lstrip('0')
             current_change = str(report_value).strip()
 
             if ex_date and ex_change:
@@ -523,6 +581,45 @@ class App:
             existingPO = {}
             work_path = ""
             sizes = ["2XS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "2XSS", "XSS", "SS", "MS", "LS", "XLS", "2XLS", "3XLS", "4XLS", "5XLS", "2XSL", "XSL", "SL", "ML", "XLL", "2XLL", "3XLL", "4XLL", "5XLL", "2XST", "XST", "ST", "MT", "LT", "XLT", "2XLT", "3XLT", "4XLT", "5XLT", "2XSTT", "XSTT", "STT", "MTT", "LTT", "XLTT", "2XLTT", "3XLTT", "4XLTT", "5XLTT", "0X", "1X", "2X", "3X", "4X", "5X", "0XT", "1XT", "2XT", "3XT", "4XT", "5XT", "0XTT", "1XTT", "2XTT", "3XTT", "4XTT", "5XTT", "CUST0", "CUST1", "CUST2", "CUST3", "CUST4", "CUST5", "CUST6", "CUST7", "CUST2XS", "CUSTXS", "CUSTS", "CUSTM", "CUSTL", "CUSTXL", "CUST2XL", "CUST3XL", "CUST4XL", "CUST5XL"]
+
+            # Preflight: PPM columns are mandatory. Abort early if any report is missing expected columns.
+            report_header_indicator = ["Purchase Order Number"]
+            for report_path in self.full_report_file_paths:
+                report_name = os.path.basename(report_path)
+                self.third_frame_textbox_1.insert("end", f"Validating PPM report columns: {report_name}\n\n")
+                self.third_frame_textbox_1.see("end")
+
+                report_wb = openpyxl.load_workbook(report_path, read_only=True, data_only=True)
+                try:
+                    report_sheet = report_wb.active
+                    report_header_row = find_columns_header(report_sheet, report_header_indicator)
+                    if not report_header_row:
+                        err = (
+                            f"ERROR: PPM report '{report_name}' header row not found. "
+                            f"Expected to find column: '{report_header_indicator[0]}'."
+                        )
+                        self.third_frame_textbox_1.insert("end", f"{err}\n\n")
+                        self.third_frame_textbox_1.see("end")
+                        return err, 0, total_inputs
+
+                    report_cols = find_columns_report(report_sheet, ppm_columns_needed, report_header_row)
+                    missing_cols = [c for c in ppm_columns_needed if report_cols.get(c) is None]
+                    if missing_cols:
+                        missing_list = "\n".join(f"- {c}" for c in missing_cols)
+                        err = (
+                            f"ERROR: PPM report '{report_name}' is missing required column(s):\n"
+                            f"{missing_list}\n"
+                            f"\nAborted. Please comeplete the PPM template."
+                        )
+                        self.third_frame_textbox_1.insert("end", f"{err}\n\n")
+                        self.third_frame_textbox_1.see("end")
+                        return err, 0, total_inputs
+                finally:
+                    try:
+                        report_wb.close()
+                    except Exception:
+                        pass
+
             for master_path in self.full_master_file_path:
                 master_current +=1
                 total_master = master_current
@@ -728,36 +825,36 @@ class App:
                     report_text = (
                         f"PPM Report Column Detection Report:\n"
                         f"Header Row: {report_header_row}\n"
-                        f"Purchase Order Number: {letter(report_cols['Purchase Order Number'])}\n"
-                        f"PO Line Item Number: {letter(report_cols['PO Line Item Number'])}\n"
-                        f"Product Code: {letter(report_cols['Product Code'])}\n"
-                        f"Gross Price/FOB currency code: {letter(report_cols['Gross Price/FOB currency code'])}\n"
-                        f"Surcharge Min Mat Main Body currency code: {letter(report_cols['Surcharge Min Mat Main Body currency code'])}\n"
-                        f"Surcharge Min Material Trim currency code: {letter(report_cols['Surcharge Min Material Trim currency code'])}\n"
-                        f"Surcharge Misc currency code: {letter(report_cols['Surcharge Misc currency code'])}\n"
-                        f"Surcharge VAS currency code: {letter(report_cols['Surcharge VAS currency code'])}\n"
-                        f"Gross Price/FOB: {letter(report_cols['Gross Price/FOB']-1)}\n"
-                        f"Surcharge Min Mat Main Body: {letter(report_cols['Surcharge Min Mat Main Body']-1)}\n"
-                        f"Surcharge Min Material Trim: {letter(report_cols['Surcharge Min Material Trim']-1)}\n"
-                        f"Surcharge Misc: {letter(report_cols['Surcharge Misc']-1)}\n"
-                        f"Surcharge VAS: {letter(report_cols['Surcharge VAS']-1)}\n"
-                        f"Size Description: {letter(report_cols['Size Description'])}\n"
-                        f"Planning Season Code: {letter(report_cols['Planning Season Code'])}\n"
-                        f"Planning Season Year: {letter(report_cols['Planning Season Year'])}\n"
-                        f"Total Item Quantity: {letter(report_cols['Total Item Quantity'])}\n"
-                        f"Doc Type: {letter(report_cols['Doc Type']-1)}\n"
-                        f"Mode of Transportation Code: {letter(report_cols['Mode of Transportation Code'])}\n"
-                        f"Plant Code: {letter(report_cols['Plant Code'])}\n"
-                        f"Ship To Customer Number: {letter(report_cols['Ship To Customer Number'])}\n"
-                        f"Inventory Segment Code: {letter(report_cols['Inventory Segment Code'])}\n"
-                        f"VAS name: {letter(report_cols['VAS name'])}\n"
-                        f"Hanger size: {letter(report_cols['Hanger size'])}\n"
-                        f"Ratio quantity: {letter(report_cols['Ratio quantity'])}\n"
-                        f"Customer PO: {letter(report_cols['Customer PO'])}\n"
-                        f"Change Date: {letter(report_cols['Change Date'])}\n"
-                        f"GAC: {letter(report_cols['GAC']+1)}\n"
-                        f"DPOM Line Item Status: {letter(report_cols['DPOM Line Item Status'])}\n"
-                        f"Document Date: {letter(report_cols['Document Date'])}\n"
+                        f"Purchase Order Number: {col_letter(report_cols.get('Purchase Order Number'))}\n"
+                        f"PO Line Item Number: {col_letter(report_cols.get('PO Line Item Number'))}\n"
+                        f"Product Code: {col_letter(report_cols.get('Product Code'))}\n"
+                        f"Gross Price/FOB currency code: {col_letter(report_cols.get('Gross Price/FOB currency code'))}\n"
+                        f"Surcharge Min Mat Main Body currency code: {col_letter(report_cols.get('Surcharge Min Mat Main Body currency code'))}\n"
+                        f"Surcharge Min Material Trim currency code: {col_letter(report_cols.get('Surcharge Min Material Trim currency code'))}\n"
+                        f"Surcharge Misc currency code: {col_letter(report_cols.get('Surcharge Misc currency code'))}\n"
+                        f"Surcharge VAS currency code: {col_letter(report_cols.get('Surcharge VAS currency code'))}\n"
+                        f"Gross Price/FOB: {col_letter(report_cols.get('Gross Price/FOB'), -1)}\n"
+                        f"Surcharge Min Mat Main Body: {col_letter(report_cols.get('Surcharge Min Mat Main Body'), -1)}\n"
+                        f"Surcharge Min Material Trim: {col_letter(report_cols.get('Surcharge Min Material Trim'), -1)}\n"
+                        f"Surcharge Misc: {col_letter(report_cols.get('Surcharge Misc'), -1)}\n"
+                        f"Surcharge VAS: {col_letter(report_cols.get('Surcharge VAS'), -1)}\n"
+                        f"Size Description: {col_letter(report_cols.get('Size Description'))}\n"
+                        f"Planning Season Code: {col_letter(report_cols.get('Planning Season Code'))}\n"
+                        f"Planning Season Year: {col_letter(report_cols.get('Planning Season Year'))}\n"
+                        f"Total Item Quantity: {col_letter(report_cols.get('Total Item Quantity'))}\n"
+                        f"Doc Type: {col_letter(report_cols.get('Doc Type'), -1)}\n"
+                        f"Mode of Transportation Code: {col_letter(report_cols.get('Mode of Transportation Code'))}\n"
+                        f"Plant Code: {col_letter(report_cols.get('Plant Code'))}\n"
+                        f"Ship To Customer Number: {col_letter(report_cols.get('Ship To Customer Number'))}\n"
+                        f"Inventory Segment Code: {col_letter(report_cols.get('Inventory Segment Code'))}\n"
+                        f"VAS name: {col_letter(report_cols.get('VAS name'))}\n"
+                        f"Hanger size: {col_letter(report_cols.get('Hanger size'))}\n"
+                        f"Ratio quantity: {col_letter(report_cols.get('Ratio quantity'))}\n"
+                        f"Customer PO: {col_letter(report_cols.get('Customer PO'))}\n"
+                        f"Change Date: {col_letter(report_cols.get('Change Date'))}\n"
+                        f"GAC: {col_letter(report_cols.get('GAC'), 1)}\n"
+                        f"DPOM Line Item Status: {col_letter(report_cols.get('DPOM Line Item Status'))}\n"
+                        f"Document Date: {col_letter(report_cols.get('Document Date'))}\n"
                         f"\n"
                     )
 
@@ -768,9 +865,9 @@ class App:
                     # for row in report_sheet.iter_rows(min_row=report_header_row + 1, max_row=report_sheet.max_row):
                     for row_index, row in enumerate(report_sheet.iter_rows(min_row=report_header_row + 1, max_row=report_sheet.max_row), start=report_header_row + 1):
                         if report_date_bfr == 0:
-                            report_date_bfr = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d')).strip()
+                            report_date_bfr = report_change_datetime(row, report_cols).strftime('%m/%d').strip()
                         if row_index == (report_header_row + 1):
-                            report_date_now = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d')).strip()
+                            report_date_now = report_change_datetime(row, report_cols).strftime('%m/%d').strip()
 
                         total_data += 1
                         report_po_num = str(row[report_cols["Purchase Order Number"] - 1].value).strip()
@@ -825,10 +922,15 @@ class App:
                                     master_ratio_qty = str(master_row_data[master_cols["Ratio Qty"][0] - 1].value)
 
                                 # Assign Ratio Qty Designation
-                                if isEmptyCell(row[report_cols["Ratio quantity"] - 1].value):
-                                    report_ratio_qty = "0"
+                                ratio_col = report_cols.get("Ratio quantity")
+                                if ratio_col is None:
+                                    report_ratio_qty = None
                                 else:
-                                    report_ratio_qty = str(row[report_cols["Ratio quantity"] - 1].value)
+                                    ratio_val = row_value(row, ratio_col)
+                                    if isEmptyCell(ratio_val):
+                                        report_ratio_qty = "0"
+                                    else:
+                                        report_ratio_qty = str(ratio_val)
 
                                 # Assign FG QTY Designation
                                 total_master_fg_qty = 0
@@ -929,37 +1031,44 @@ class App:
                                         empty_date_changes(master_row, master_cols, report_cols, row, "AFS Cat", f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
 
                                 # VAS Name Check
-                                if row[report_cols["VAS name"] - 1].value != master_row_data[master_cols["VAS name"][0] - 1].value:
-                                    noDiscrepancy = False
-                                    output_text = f"VAS name diff found for PO {report_po_num} Line {report_po_line} Size {row[report_cols['Size Description'] - 1].value}:\nPPM VAS name {row[report_cols['VAS name'] - 1].value} vs OCCC VAS name {master_row_data[master_cols['VAS name'][0] - 1].value}\n\n"
-                                    append_date_changes(master_row, master_cols, report_cols, row, "VAS name", row[report_cols["VAS name"] - 1].value)
-                                else:
-                                    keep_date_changes(master_row, master_cols, report_cols, row, "VAS name", row[report_cols["VAS name"] - 1].value, f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
-                                    matching_rows["VAS name"].append(i)
-                                    if report_path == self.full_report_file_paths[-1] and i == matching_rows["VAS name"][-1]:
-                                        empty_date_changes(master_row, master_cols, report_cols, row, "VAS name", f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
+                                vas_col = report_cols.get("VAS name")
+                                if vas_col is not None:
+                                    report_vas = row_value(row, vas_col)
+                                    if report_vas != master_row_data[master_cols["VAS name"][0] - 1].value:
+                                        noDiscrepancy = False
+                                        output_text = f"VAS name diff found for PO {report_po_num} Line {report_po_line} Size {row[report_cols['Size Description'] - 1].value}:\nPPM VAS name {report_vas} vs OCCC VAS name {master_row_data[master_cols['VAS name'][0] - 1].value}\n\n"
+                                        append_date_changes(master_row, master_cols, report_cols, row, "VAS name", report_vas)
+                                    else:
+                                        keep_date_changes(master_row, master_cols, report_cols, row, "VAS name", report_vas, f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
+                                        matching_rows["VAS name"].append(i)
+                                        if report_path == self.full_report_file_paths[-1] and i == matching_rows["VAS name"][-1]:
+                                            empty_date_changes(master_row, master_cols, report_cols, row, "VAS name", f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
 
                                 # Hanger size Check
-                                if row[report_cols["Hanger size"] - 1].value != master_row_data[master_cols["Hanger size"][0] - 1].value:
-                                    noDiscrepancy = False
-                                    output_text = f"Hanger size diff found for PO {report_po_num} Line {report_po_line} Size {row[report_cols['Size Description'] - 1].value}:\nPPM Hanger size {row[report_cols['Hanger size'] - 1].value} vs OCCC Hanger size {master_row_data[master_cols['Hanger size'][0] - 1].value}\n\n"
-                                    append_date_changes(master_row, master_cols, report_cols, row, "Hanger size", row[report_cols["Hanger size"] - 1].value)
-                                else:
-                                    keep_date_changes(master_row, master_cols, report_cols, row, "Hanger size", row[report_cols["Hanger size"] - 1].value, f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
-                                    matching_rows["Hanger size"].append(i)
-                                    if report_path == self.full_report_file_paths[-1] and i == matching_rows["Hanger size"][-1]:
-                                        empty_date_changes(master_row, master_cols, report_cols, row, "Hanger size", f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
+                                hanger_col = report_cols.get("Hanger size")
+                                if hanger_col is not None:
+                                    report_hanger = row_value(row, hanger_col)
+                                    if report_hanger != master_row_data[master_cols["Hanger size"][0] - 1].value:
+                                        noDiscrepancy = False
+                                        output_text = f"Hanger size diff found for PO {report_po_num} Line {report_po_line} Size {row[report_cols['Size Description'] - 1].value}:\nPPM Hanger size {report_hanger} vs OCCC Hanger size {master_row_data[master_cols['Hanger size'][0] - 1].value}\n\n"
+                                        append_date_changes(master_row, master_cols, report_cols, row, "Hanger size", report_hanger)
+                                    else:
+                                        keep_date_changes(master_row, master_cols, report_cols, row, "Hanger size", report_hanger, f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
+                                        matching_rows["Hanger size"].append(i)
+                                        if report_path == self.full_report_file_paths[-1] and i == matching_rows["Hanger size"][-1]:
+                                            empty_date_changes(master_row, master_cols, report_cols, row, "Hanger size", f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
 
                                 # Ratio Qty Check
-                                if report_ratio_qty != master_ratio_qty:
-                                    noDiscrepancy = False
-                                    output_text = f"Ratio Qty diff found for PO {report_po_num} Line {report_po_line} Size {row[report_cols['Size Description'] - 1].value}:\nPPM Ratio quantity {report_ratio_qty} vs OCCC Ratio Qty {master_ratio_qty}\n\n"
-                                    append_date_changes(master_row, master_cols, report_cols, row, "Ratio Qty", report_ratio_qty)
-                                else:
-                                    keep_date_changes(master_row, master_cols, report_cols, row, "Ratio Qty", report_ratio_qty, f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
-                                    matching_rows["Ratio Qty"].append(i)
-                                    if report_path == self.full_report_file_paths[-1] and i == matching_rows["Ratio Qty"][-1]:
-                                        empty_date_changes(master_row, master_cols, report_cols, row, "Ratio Qty", f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
+                                if report_ratio_qty is not None:
+                                    if report_ratio_qty != master_ratio_qty:
+                                        noDiscrepancy = False
+                                        output_text = f"Ratio Qty diff found for PO {report_po_num} Line {report_po_line} Size {row[report_cols['Size Description'] - 1].value}:\nPPM Ratio quantity {report_ratio_qty} vs OCCC Ratio Qty {master_ratio_qty}\n\n"
+                                        append_date_changes(master_row, master_cols, report_cols, row, "Ratio Qty", report_ratio_qty)
+                                    else:
+                                        keep_date_changes(master_row, master_cols, report_cols, row, "Ratio Qty", report_ratio_qty, f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
+                                        matching_rows["Ratio Qty"].append(i)
+                                        if report_path == self.full_report_file_paths[-1] and i == matching_rows["Ratio Qty"][-1]:
+                                            empty_date_changes(master_row, master_cols, report_cols, row, "Ratio Qty", f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}")
 
                                 # Customer PO (Deichmann Group only) Check
                                 if row[report_cols["Customer PO"] - 1].value != master_row_data[master_cols["Customer PO (Deichmann Group only)"] - 1].value and any(group in str(master_row_data[master_cols["VAS name"][0] - 1].value).lower() for group in ("deichmann", "dechmann")):
@@ -1103,11 +1212,21 @@ class App:
                                     master_row[master_cols["Latest CM Change Date"] - 1].value = ori_cm_date[f"{report_po_num}{report_po_line}{master_row_data[master_cols['JOB NO'] - 1].value}"]
 
                         elif key not in master_dict[master_current]:
-                            if (report_po_style, report_po_num, report_po_line, row[report_cols["GAC"]-3].value, row[report_cols["DPOM Line Item Status"]-1].value, row[report_cols["Doc Type"] - 2].value, row[report_cols["Document Date"]-1].value, row[report_cols["Change Date"] - 1].value) not in newPO:
-                                newPO[(report_po_style, report_po_num, report_po_line, row[report_cols["GAC"]-3].value, row[report_cols["DPOM Line Item Status"]-1].value, row[report_cols["Doc Type"] - 2].value, row[report_cols["Document Date"]-1].value, row[report_cols["Change Date"] - 1].value)] = row
+                            new_key = (
+                                report_po_style,
+                                report_po_num,
+                                report_po_line,
+                                row_value(row, report_cols.get("GAC"), idx_offset=-2),
+                                row_value(row, report_cols.get("DPOM Line Item Status")),
+                                row_value(row, report_cols.get("Doc Type"), idx_offset=-1),
+                                row_value(row, report_cols.get("Document Date")),
+                                row_value(row, report_cols.get("Change Date")),
+                            )
+                            if new_key not in newPO:
+                                newPO[new_key] = row
 
                         if row_index == report_sheet.max_row:
-                            report_date_bfr = str(row[report_cols["Change Date"] - 1].value.strftime('%m/%d')).strip()
+                            report_date_bfr = report_change_datetime(row, report_cols).strftime('%m/%d').strip()
 
                 self.third_frame_textbox_1.insert("end", f"Saving file... please wait\n\n")
                 self.third_frame_textbox_1.see("end")
@@ -1470,7 +1589,12 @@ class MainWidget(QWidget):
 
     def on_processing_done(self, ok: int, fail: int, last_file: str):
         self.log_message.emit(f"Done. Success: {ok}, Failed: {fail}")
-        if last_file:
+        error_text = ""
+        if last_file and last_file.startswith("ERROR:"):
+            error_text = last_file
+            last_file = ""
+            self.log_message.emit(error_text)
+        elif last_file:
             self.log_message.emit(f"Last output: {last_file}")
 
         self.run_btn.setEnabled(True)
@@ -1479,6 +1603,8 @@ class MainWidget(QWidget):
 
         title = "Process complete" if fail == 0 else "Process finished with issues"
         lines = [f"Success: {ok}", f"Failed: {fail}"]
+        if error_text:
+            lines.append(error_text)
         if last_file:
             lines.append(f"Last output: {last_file}")
         msg = MessageBox(title, "\n".join(lines), self)
