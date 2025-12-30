@@ -107,21 +107,39 @@ def normalize_date_str(date_val):
 
 def calculate_target_effective_date(buy_mth_str):
     """
-    Converts OCCC 'BUY MTH' (e.g., '25-1E', '26-10M') to PPS Effective Date string.
+    Converts OCCC 'BUY MTH' to PPS Effective Date string.
+
+    Supported formats:
+    - 'YY-M' or 'YY-MM' with optional suffix letters (e.g., '25-1E', '26-10M')
+    - 'MMYYYY' or 'MYYYY' with optional suffix letters (e.g., '042025E', '072025M')
+
     Logic:
     M=1,2,12 -> Dec 1st (Prev year for 1,2; Curr year for 12)
     M=3,4,5 -> Mar 1st
     M=6,7,8 -> Jun 1st
     M=9,10,11 -> Sep 1st
     """
-    match = re.match(r"(\d{2})-(\d{1,2})", str(buy_mth_str).strip())
-    if not match:
+    s_val = str(buy_mth_str).strip().upper()
+    if not s_val:
         return None
 
-    yy = int(match.group(1))
-    m = int(match.group(2))
+    # Format: YY-M (optionally followed by letters, e.g. 25-4E)
+    match = re.match(r"^(\d{2})-(\d{1,2})", s_val)
+    if match:
+        yy = int(match.group(1))
+        m = int(match.group(2))
+        year = 2000 + yy
+    else:
+        # Format: MMYYYY / MYYYY (optionally followed by letters, e.g. 042025E)
+        match = re.match(r"^(\d{1,2})(\d{4})", s_val)
+        if not match:
+            return None
+        m = int(match.group(1))
+        year = int(match.group(2))
 
-    year = 2000 + yy
+    if m < 1 or m > 12:
+        return None
+
     target_month = 1
     target_year = year
 
@@ -139,6 +157,25 @@ def calculate_target_effective_date(buy_mth_str):
         target_month = 9
 
     return f"{target_month:02d}/01/{target_year}"
+
+
+def build_timestamped_copy_path(input_path: str, timestamp: str, label: str = "updated") -> str:
+    """Generate output path beside input file with timestamp prefix (no overwrite)."""
+    base_dir = os.path.dirname(input_path) or os.getcwd()
+    base_name = os.path.basename(input_path)
+    out_name = f"{timestamp}_{label}_{base_name}"
+    out_path = os.path.join(base_dir, out_name)
+
+    if not os.path.exists(out_path):
+        return out_path
+
+    name, ext = os.path.splitext(out_name)
+    counter = 1
+    while True:
+        candidate = os.path.join(base_dir, f"{name} ({counter}){ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
 
 def is_extended_size(ppm_size_str, occc_threshold_str):
     """Determine if a size is extended based on the OCCC threshold or TALL logic."""
@@ -284,6 +321,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
     fail_count = 0
     last_output = ""
     row_emit = report_emit if callable(report_emit) else log_emit
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # --- 1. Parse PPM Files ---
     ppm_lookup = {}
@@ -390,10 +428,11 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
             is_excel = occc_path.lower().endswith(('.xlsx', '.xlsm'))
 
             if is_excel:
-                wb_read = load_workbook(occc_path, data_only=True)
+                keep_vba = occc_path.lower().endswith('.xlsm')
+                wb_read = load_workbook(occc_path, data_only=True, keep_vba=keep_vba)
                 ws_read = wb_read.active
                 rows_read = list(ws_read.values)
-                wb_write = load_workbook(occc_path, data_only=False)
+                wb_write = load_workbook(occc_path, data_only=False, keep_vba=keep_vba)
                 ws_write = wb_write.active
             else:
                 rows_read, _, _ = load_file_data(occc_path, log_emit)
@@ -435,8 +474,8 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
 
             # Init Header for Remarks
             if idx_remarks == -1:
-                ref_col = idx_ave_fob if idx_ave_fob != -1 else len(headers) - 1
-                insert_pos = ref_col + 1
+                # Put it at the end when missing
+                insert_pos = len(headers)
                 if is_excel:
                     ws_write.insert_cols(insert_pos + 1)
                     ws_write.cell(row=header_idx+1, column=insert_pos+1).value = "PRICE DIFF REMARKS"
@@ -460,7 +499,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     idx_dpom_fob = insert_pos
                 else:
                     output_csv_data[header_idx].append("DPOM - Incorrect FOB")
-                    idx_dpom_fob = len(headers) - 1
+                    idx_dpom_fob = len(output_csv_data[header_idx]) - 1
 
             for r_i in range(header_idx + 1, len(rows_read)):
                 row_vals = rows_read[r_i]
@@ -594,7 +633,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                 final_remark = "; ".join(remarks) if remarks else "CORRECT"
 
                 # 2. DPOM - Incorrect FOB
-                final_dpom_val = " / ".join(dpom_errors) if dpom_errors else ""
+                final_dpom_val = " / ".join(dpom_errors) if dpom_errors else "CORRECT"
 
                 if is_excel:
                     # Write Remarks
@@ -614,24 +653,25 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
 
                     # Ensure list is long enough for Remarks
                     while len(output_csv_data[r_i]) <= idx_remarks:
-                         output_csv_data[r_i].append("")
+                        output_csv_data[r_i].append("")
                     output_csv_data[r_i][idx_remarks] = final_remark
 
                     # Ensure list is long enough for DPOM
                     while len(output_csv_data[r_i]) <= idx_dpom_fob:
-                         output_csv_data[r_i].append("")
+                        output_csv_data[r_i].append("")
                     output_csv_data[r_i][idx_dpom_fob] = final_dpom_val
 
+            out_path = build_timestamped_copy_path(occc_path, run_timestamp, label="updated")
             if is_excel:
-                wb_write.save(occc_path)
+                wb_write.save(out_path)
             else:
-                with open(occc_path, mode='w', newline='', encoding='utf-8-sig') as f:
+                with open(out_path, mode='w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f)
                     writer.writerows(output_csv_data)
 
             success_count += 1
-            last_output = occc_path
-            log_emit(f"Updated {os.path.basename(occc_path)}")
+            last_output = out_path
+            log_emit(f"Output saved: {out_path}")
 
         except Exception as e:
             log_emit(f"Failed to process {os.path.basename(occc_path)}: {e}")
