@@ -217,6 +217,50 @@ def get_cell_raw_value(cell) -> Any:
     return cell.value
 
 
+def _is_excel_row_hidden(ws, row: int) -> bool:
+    if row not in ws.row_dimensions:
+        return False
+
+    dim = ws.row_dimensions[row]
+    if bool(getattr(dim, "hidden", False)):
+        return True
+
+    height = getattr(dim, "height", None)
+    if isinstance(height, (int, float)) and height <= 0:
+        return True
+
+    if bool(getattr(dim, "zeroHeight", False)):
+        return True
+
+    return False
+
+
+def _analytical_review_group_requires_actions(ws, ws_data, start_row: int, end_row_exclusive: int) -> bool:
+    start_row = max(1, start_row)
+    end_row_exclusive = max(start_row, end_row_exclusive)
+
+    for row in range(start_row, end_row_exclusive):
+        for col in (1, 2):
+            displayed_val = get_cell_displayed_value(ws_data.cell(row=row, column=col)).strip()
+            if "Description" in displayed_val:
+                return True
+
+    star_row_in_section = _find_star_cell_row_in_column_b(ws_data, start_row, end_row_exclusive)
+    if not star_row_in_section:
+        return False
+
+    for scan_row in range(start_row, end_row_exclusive):
+        for scan_col in (1, 2):
+            for candidate in _cell_text_candidates(
+                ws.cell(row=scan_row, column=scan_col),
+                ws_data.cell(row=scan_row, column=scan_col),
+            ):
+                if "OTHER INCOME" in candidate.upper():
+                    return True
+
+    return False
+
+
 def _normalize_excel_text(value: str) -> str:
     """
     Normalize text read from Excel:
@@ -1470,7 +1514,8 @@ def process_variance_report(
 
             if matched_text:
                 analytical_reviews.append((row, col, matched_text))
-                _emit(log_emit, f"Found Analytical Review at row {row}: {matched_text[:50]}...")
+                hidden_tag = " (hidden)" if _is_excel_row_hidden(ws, row) else ""
+                _emit(log_emit, f"Found Analytical Review at row {row}{hidden_tag}: {matched_text[:50]}...")
 
     if not analytical_reviews:
         try:
@@ -1516,7 +1561,20 @@ def process_variance_report(
     _emit(log_emit, f"\nFound {len(analytical_reviews)} Analytical Review sections")
 
     # Validate required MA headers before modifying anything in the report workbook.
-    requirements = _collect_strict_ma_header_requirements(analytical_reviews, selected_month, selected_year, log_emit)
+    hidden_analytical_rows = {row for row, _col, _text in analytical_reviews if _is_excel_row_hidden(ws, row)}
+    analytical_reviews_for_validation: List[Tuple[int, int, str]] = []
+    for i, (ar_row, ar_col, ar_text) in enumerate(analytical_reviews):
+        if ar_row in hidden_analytical_rows:
+            continue
+
+        end_row = analytical_reviews[i + 1][0] if i + 1 < len(analytical_reviews) else ws.max_row + 1
+        if not _analytical_review_group_requires_actions(ws, ws_data, ar_row + 1, end_row):
+            continue
+
+        analytical_reviews_for_validation.append((ar_row, ar_col, ar_text))
+    requirements = _collect_strict_ma_header_requirements(
+        analytical_reviews_for_validation, selected_month, selected_year, log_emit
+    )
     _validate_required_ma_headers(ma_workbooks, requirements, log_emit)
 
     # Process each Analytical Review section
@@ -1524,6 +1582,13 @@ def process_variance_report(
     values_overrides: Dict[Tuple[int, int], Any] = {}
 
     for i, (ar_row, ar_col, ar_text) in enumerate(analytical_reviews):
+        if ar_row in hidden_analytical_rows:
+            _emit(
+                log_emit,
+                f"\n[SKIP] Analytical Review row {ar_row} is hidden; leaving this group untouched.",
+            )
+            continue
+
         # Extract bracket content
         bracket_match = re.search(r"\(([^)]+)\)", ar_text)
         if not bracket_match:
