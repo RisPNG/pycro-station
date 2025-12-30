@@ -245,20 +245,8 @@ def _analytical_review_group_requires_actions(ws, ws_data, start_row: int, end_r
             if "Description" in displayed_val:
                 return True
 
-    star_row_in_section = _find_star_cell_row_in_column_b(ws_data, start_row, end_row_exclusive)
-    if not star_row_in_section:
-        return False
-
-    for scan_row in range(start_row, end_row_exclusive):
-        for scan_col in (1, 2):
-            for candidate in _cell_text_candidates(
-                ws.cell(row=scan_row, column=scan_col),
-                ws_data.cell(row=scan_row, column=scan_col),
-            ):
-                if "OTHER INCOME" in candidate.upper():
-                    return True
-
-    return False
+    # Page 9B '*' placeholder processing is independent of "Description" placeholders.
+    return _find_star_cell_row_in_column_b(ws, ws_data, start_row, end_row_exclusive) is not None
 
 
 def _normalize_excel_text(value: str) -> str:
@@ -1069,7 +1057,7 @@ def get_values_for_page9(ma_workbooks: List[Tuple[str, UnifiedWorkbook]],
 
                     if cell_val is not None and cell_val != "" and col_b_val and not col_b_val.upper().startswith("TOTAL"):
                         # Skip items starting with "GAIN/(LOSS)"
-                        if col_b_val.upper().startswith("GAIN/(LOSS)"):
+                        if col_b_val.upper().startswith("GAIN/(LOSS) ON FOREX"):
                             continue
 
                         try:
@@ -1137,7 +1125,7 @@ def build_page9b_variance_summary(values: List[Tuple[str, float, float]]) -> Opt
         desc_clean = str(desc).strip()
         if not desc_clean:
             continue
-        if desc_clean.upper().startswith("GAIN/(LOSS)"):
+        if desc_clean.upper().startswith("GAIN/(LOSS) ON FOREX"):
             continue
 
         diff = float(left) - float(right)
@@ -1155,6 +1143,7 @@ def build_page9b_variance_summary(values: List[Tuple[str, float, float]]) -> Opt
 
 
 def _find_star_cell_row_in_column_b(
+    ws,
     ws_data,
     start_row: int,
     end_row_exclusive: int,
@@ -1165,10 +1154,26 @@ def _find_star_cell_row_in_column_b(
     start_row = max(1, start_row)
     end_row_exclusive = max(1, end_row_exclusive)
 
+    def _cell_is_unprocessed_star_placeholder(row: int) -> bool:
+        ws_cell = ws.cell(row=row, column=2)
+        ws_data_cell = ws_data.cell(row=row, column=2)
+        for candidate in _cell_text_candidates(ws_cell, ws_data_cell):
+            if not candidate:
+                continue
+            # Unprocessed star placeholders start with "* " (or "*<whitespace>").
+            # Processed bullets are written like "*Higher ..." (no whitespace after '*').
+            text = candidate.lstrip()
+            if not text.startswith("*"):
+                continue
+            if text == "*":
+                return True
+            if text[1].isspace():
+                return True
+        return False
+
     if anchor_row is None:
         for row in range(start_row, end_row_exclusive):
-            col_b_val = get_cell_displayed_value(ws_data.cell(row=row, column=2)).strip()
-            if col_b_val.startswith("*"):
+            if _cell_is_unprocessed_star_placeholder(row):
                 return row
         return None
 
@@ -1178,8 +1183,7 @@ def _find_star_cell_row_in_column_b(
 
     star_rows: List[int] = []
     for row in range(window_start, window_end_exclusive):
-        col_b_val = get_cell_displayed_value(ws_data.cell(row=row, column=2)).strip()
-        if col_b_val.startswith("*"):
+        if _cell_is_unprocessed_star_placeholder(row):
             star_rows.append(row)
 
     if not star_rows:
@@ -1189,38 +1193,24 @@ def _find_star_cell_row_in_column_b(
 
 def _write_page9b_summary_to_star_cell(
     ws,
-    ws_data,
-    start_row: int,
-    end_row_exclusive: int,
     *,
-    anchor_row: int,
+    star_row: int,
     summary: Optional[str],
     values_overrides: Dict[Tuple[int, int], Any],
     log_emit=None,
 ) -> bool:
     """
-    Find the first '*' cell in column B within the given row range, clear it and the row below,
-    then write the provided summary into that '*' cell.
+    Write the provided summary into the given '*' placeholder cell (column B), and clear the row below.
     """
-    star_row = _find_star_cell_row_in_column_b(
-        ws_data,
-        start_row,
-        end_row_exclusive,
-        anchor_row=anchor_row,
-    )
-    if not star_row:
+    if not summary:
         return False
 
-    ws.cell(row=star_row, column=2).value = None
-    values_overrides[(star_row, 2)] = None
+    ws.cell(row=star_row, column=2).value = summary
+    values_overrides[(star_row, 2)] = summary
 
     if star_row + 1 <= ws.max_row:
         ws.cell(row=star_row + 1, column=2).value = None
         values_overrides[(star_row + 1, 2)] = None
-
-    if summary:
-        ws.cell(row=star_row, column=2).value = summary
-        values_overrides[(star_row, 2)] = summary
 
     _emit(log_emit, f"    -> Updated Page 9B summary at row {star_row}")
     return True
@@ -1613,45 +1603,26 @@ def process_variance_report(
         # Determine the range to search (until next Analytical Review or end)
         end_row = analytical_reviews[i + 1][0] if i + 1 < len(analytical_reviews) else ws.max_row + 1
         page9_values_cache: Optional[List[Tuple[str, float, float]]] = None
-        page9_summary_written = False
 
-        # Force Page 9B '*' summary updates even when there are no remaining 'Description' placeholders.
-        star_row_in_section = _find_star_cell_row_in_column_b(ws_data, ar_row + 1, end_row)
-        other_income_anchor_row: Optional[int] = None
+        # Page 9B '*' summary updates are driven only by an unprocessed "* " placeholder in column B.
+        star_row_in_section = _find_star_cell_row_in_column_b(ws, ws_data, ar_row + 1, end_row)
         if star_row_in_section:
-            for scan_row in range(ar_row + 1, end_row):
-                for scan_col in (1, 2):
-                    for candidate in _cell_text_candidates(
-                        ws.cell(row=scan_row, column=scan_col),
-                        ws_data.cell(row=scan_row, column=scan_col),
-                    ):
-                        if "OTHER INCOME" in candidate.upper():
-                            other_income_anchor_row = scan_row
-                            break
-                    if other_income_anchor_row:
-                        break
-                if other_income_anchor_row:
-                    break
-
-        if star_row_in_section and other_income_anchor_row and not page9_summary_written:
             if page9_values_cache is None:
-                page9_values_cache = get_values_for_page9(ma_workbooks, left_headers, right_headers, search_cols, log_emit)
+                page9_values_cache = get_values_for_page9(
+                    ma_workbooks, left_headers, right_headers, search_cols, log_emit
+                )
 
             summary = build_page9b_variance_summary(page9_values_cache)
-            if not _write_page9b_summary_to_star_cell(
-                ws=ws,
-                ws_data=ws_data,
-                start_row=ar_row + 1,
-                end_row_exclusive=end_row,
-                anchor_row=other_income_anchor_row,
-                summary=summary,
-                values_overrides=values_overrides,
-                log_emit=log_emit,
-            ):
-                _emit(log_emit, "    -> No '*' cell found to write Page 9B summary")
-            page9_summary_written = True
-        elif star_row_in_section and not other_income_anchor_row:
-            _emit(log_emit, "    -> Found '*' cell but no 'Other Income' marker; skipping Page 9B summary update")
+            if summary:
+                _write_page9b_summary_to_star_cell(
+                    ws=ws,
+                    star_row=star_row_in_section,
+                    summary=summary,
+                    values_overrides=values_overrides,
+                    log_emit=log_emit,
+                )
+            else:
+                _emit(log_emit, "    -> No Page 9B variance summary generated; leaving '*' placeholder unchanged")
 
         # Find Description cells in this section
         for row in range(ar_row + 1, end_row):
@@ -1722,21 +1693,6 @@ def process_variance_report(
                             ma_workbooks, left_headers, right_headers, search_cols, log_emit
                         )
                     values = page9_values_cache
-
-                    if not page9_summary_written:
-                        summary = build_page9b_variance_summary(values)
-                        if not _write_page9b_summary_to_star_cell(
-                            ws=ws,
-                            ws_data=ws_data,
-                            start_row=ar_row + 1,
-                            end_row_exclusive=end_row,
-                            anchor_row=row,
-                            summary=summary,
-                            values_overrides=values_overrides,
-                            log_emit=log_emit,
-                        ):
-                            _emit(log_emit, "    -> No '*' cell found to write Page 9B summary")
-                        page9_summary_written = True
 
                     if values:
                         replacement_value = find_extreme_value(values, find_lowest)
