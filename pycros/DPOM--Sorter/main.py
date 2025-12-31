@@ -168,6 +168,19 @@ def format_ship_to_customer_number(val: Any) -> str:
     return s if s else "#"
 
 
+def ensure_unique_path(path: str) -> str:
+    """Return a non-existing path by appending ' (n)' before the extension if needed."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 1
+    while True:
+        candidate = f"{base} ({n}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
 # =============================================================================
 # MAIN PROCESSING LOGIC
 # =============================================================================
@@ -283,6 +296,7 @@ class ProcessingLogic:
                 'sizes': info['sizes'],
                 'total_qty': info['total_qty'],
                 'fob': info['fob'],
+                'fob_by_size': info.get('fob_by_size', {}),
                 'style_head': style_head,
                 'style_cw': style_cw,
                 'style_full': style_full,
@@ -325,17 +339,20 @@ class ProcessingLogic:
         grouped = {}
 
         for row in data_rows:
-            # Create key from all columns except size-specific ones
+            # Create key from all columns except size-specific ones.
+            # NOTE: FOB can vary by size; it must NOT create a separate group.
             key_list = list(row)
             key_list[COL_SIZE_DESC] = None
             key_list[COL_SIZE_QTY] = None
             key_list[COL_TOTAL_QTY] = None
+            key_list[COL_FOB] = None
             key = tuple(key_list)
 
             if key not in grouped:
                 grouped[key] = {
                     'raw': row,
                     'sizes': {},
+                    'fob_by_size': {},
                     'total_qty': 0,
                     'fob': row[COL_FOB]
                 }
@@ -343,8 +360,24 @@ class ProcessingLogic:
             sz = normalize_size(row[COL_SIZE_DESC])
             qty = row[COL_SIZE_QTY] if isinstance(row[COL_SIZE_QTY], (int, float)) else 0
 
-            grouped[key]['sizes'][sz] = qty
+            prev_qty = grouped[key]['sizes'].get(sz, 0)
+            new_qty = prev_qty + qty
+            grouped[key]['sizes'][sz] = new_qty
             grouped[key]['total_qty'] += qty
+
+            # Track FOB per size (weighted average if same size appears multiple times).
+            if qty:
+                fob_val = row[COL_FOB]
+                try:
+                    fob = float(fob_val) if fob_val not in (None, "") else 0.0
+                except Exception:
+                    fob = 0.0
+
+                prev_fob = grouped[key]['fob_by_size'].get(sz)
+                if prev_fob is None or prev_qty <= 0:
+                    grouped[key]['fob_by_size'][sz] = fob
+                else:
+                    grouped[key]['fob_by_size'][sz] = ((prev_fob * prev_qty) + (fob * qty)) / new_qty
 
         return grouped
 
@@ -408,7 +441,8 @@ class ProcessingLogic:
 
                     # Accumulate PO totals
                     po_totals = defaultdict(int)
-                    po_money = 0
+                    po_money_by_size = defaultdict(float)
+                    po_money = 0.0
 
                     # Add individual item rows
                     for item in po_items:
@@ -421,13 +455,25 @@ class ProcessingLogic:
                             'keep_colorway': keep_colorway,
                         })
 
-                        # Accumulate totals
-                        for sz in sorted_sizes:
-                            qty = item['sizes'].get(sz, 0)
+                        # Accumulate totals + money (FOB can vary by size)
+                        item_fob_by_size = item.get('fob_by_size', {}) or {}
+                        for sz, qty in item.get('sizes', {}).items():
+                            if not qty:
+                                continue
                             po_totals[sz] += qty
+                            fob_val = item_fob_by_size.get(sz, item.get('fob', 0))
+                            try:
+                                fob = float(fob_val) if fob_val not in (None, "") else 0.0
+                            except Exception:
+                                fob = 0.0
+                            money = qty * fob
+                            po_money_by_size[sz] += money
+                            po_money += money
 
-                        fob = float(item['fob']) if item['fob'] else 0
-                        po_money += item['total_qty'] * fob
+                    po_fob_by_size = {}
+                    for sz, qty in po_totals.items():
+                        if qty:
+                            po_fob_by_size[sz] = po_money_by_size.get(sz, 0.0) / qty
 
                     # Total PO Qty row
                     final_rows.append({
@@ -446,6 +492,7 @@ class ProcessingLogic:
                         'label': 'Net Unit Price',
                         'data': po_items[0],
                         'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
+                        'fob_by_size': po_fob_by_size,
                         'sizes': po_totals,
                         'total_money': po_money,
                         'keep_colorway': keep_colorway,
@@ -457,6 +504,7 @@ class ProcessingLogic:
                         'label': 'Trading Co Net Unit Price',
                         'data': po_items[0],
                         'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
+                        'fob_by_size': po_fob_by_size,
                         'sizes': po_totals,
                         'total_money': po_money,
                         'keep_colorway': keep_colorway,
@@ -711,11 +759,12 @@ class ProcessingLogic:
             col_off = 32
             if row_type == 'MONEY_PO':
                 # For money rows at PO level: show FOB in each size column that had qty
-                fob = row_obj.get('fob', 0)
+                fob_by_size = row_obj.get('fob_by_size', {}) or {}
+                default_fob = row_obj.get('fob', 0)
                 for i, sz in enumerate(sorted_sizes):
                     qty = row_obj.get('sizes', {}).get(sz, 0)
                     if qty > 0:
-                        ws.cell(curr_row, col_off + i, fob)
+                        ws.cell(curr_row, col_off + i, fob_by_size.get(sz, default_fob))
             elif row_type == 'MONEY_STYLE':
                 # For money rows at Style level: leave size columns empty
                 pass
@@ -885,10 +934,12 @@ class MainWidget(QWidget):
             try:
                 self.logic.load_references(ref_file)
                 success_count = 0
+                run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 for inp in inputs:
                     if not inp.strip():
                         continue
-                    out = os.path.splitext(inp)[0] + "_processed.xlsx"
+                    out = f"{os.path.splitext(inp)[0]}_processed_{run_timestamp}.xlsx"
+                    out = ensure_unique_path(out)
                     self.logic.process_dpom_file(inp, out)
                     success_count += 1
                 self.processing_done.emit(success_count, 0, f"Processing Complete!\n{success_count} file(s) processed successfully.")
