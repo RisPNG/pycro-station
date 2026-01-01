@@ -403,15 +403,23 @@ class ProcessingLogic:
             style_totals = defaultdict(int)
             style_money = 0
 
-            # Group by OGAC date within style (earliest to latest)
+            # Group by Planning Year + Planning Season + OGAC date within style.
+            # NOTE: We preserve the existing SortRecord ordering (year -> season -> OGAC),
+            #       so we must not re-sort OGAC groups purely by OGAC date here.
             ogac_groups = defaultdict(list)
             for item in style_items:
                 ogac_dt = item.get('ogac_dt')
-                ogac_key = ogac_dt.date() if isinstance(ogac_dt, datetime) else None
-                ogac_groups[ogac_key].append(item)
+                ogac_date = ogac_dt.date() if isinstance(ogac_dt, datetime) else None
+                ogac_group_key = (item.get('year') or 0, item.get('season_rank') or 9, ogac_date)
+                ogac_groups[ogac_group_key].append(item)
 
-            for ogac_key in sorted(ogac_groups.keys(), key=lambda d: (d is None, d or date.max)):
-                ogac_items = ogac_groups[ogac_key]
+            ogac_keys = list(ogac_groups.keys())
+            ogac_none_keys = [k for k in ogac_keys if k[2] is None]
+            if ogac_none_keys:
+                ogac_keys = [k for k in ogac_keys if k[2] is not None] + ogac_none_keys
+
+            for ogac_group_key in ogac_keys:
+                ogac_items = ogac_groups[ogac_group_key]
 
                 # Accumulate OGAC totals (across POs under this style+OGAC)
                 ogac_totals = defaultdict(int)
