@@ -181,6 +181,21 @@ def ensure_unique_path(path: str) -> str:
         n += 1
 
 
+def year_sort_value(val: Any) -> int:
+    """Best-effort year parsing for sorting (handles numbers/strings like '2025'/'2025.0')."""
+    if val in (None, ""):
+        return 0
+    if isinstance(val, bool):
+        return 0
+    try:
+        if isinstance(val, (int, float)):
+            return int(val)
+        s = str(val).strip()
+        return int(float(s)) if s else 0
+    except Exception:
+        return 0
+
+
 # =============================================================================
 # MAIN PROCESSING LOGIC
 # =============================================================================
@@ -312,11 +327,11 @@ class ProcessingLogic:
             }
             pivoted_rows.append(obj)
 
-        # Step 5: Sort records (matches VBA SortRecord)
+        # Step 5: Sort records (Year + Planning Season first)
         pivoted_rows.sort(key=lambda x: (
-            x['style_head'],
-            x['year'] or 0,
+            year_sort_value(x.get('year')),
             x['season_rank'],
+            x['style_head'],
             x['ogac_dt'] or datetime.max,
             x['po'],
             x['style_cw'],
@@ -395,7 +410,20 @@ class ProcessingLogic:
             style_groups[style_key].append(row)
             style_keep_colorway[style_key] = style_keep_colorway.get(style_key, False) or keep_colorway
 
-        for style_key in sorted(style_groups.keys()):
+        def style_group_sort_key(k: str) -> tuple[int, int, str]:
+            items = style_groups.get(k, [])
+            if not items:
+                return (0, 9, k)
+
+            group_year = min(year_sort_value(it.get('year')) for it in items)
+            group_season_rank = min(
+                it.get('season_rank', 9)
+                for it in items
+                if year_sort_value(it.get('year')) == group_year
+            )
+            return (group_year, group_season_rank, k)
+
+        for style_key in sorted(style_groups.keys(), key=style_group_sort_key):
             style_items = style_groups[style_key]
             keep_colorway = style_keep_colorway.get(style_key, False)
 
@@ -441,8 +469,6 @@ class ProcessingLogic:
 
                     # Accumulate PO totals
                     po_totals = defaultdict(int)
-                    po_money_by_size = defaultdict(float)
-                    po_money = 0.0
 
                     # Add individual item rows
                     for item in po_items:
@@ -455,25 +481,19 @@ class ProcessingLogic:
                             'keep_colorway': keep_colorway,
                         })
 
-                        # Accumulate totals + money (FOB can vary by size)
-                        item_fob_by_size = item.get('fob_by_size', {}) or {}
                         for sz, qty in item.get('sizes', {}).items():
                             if not qty:
                                 continue
                             po_totals[sz] += qty
-                            fob_val = item_fob_by_size.get(sz, item.get('fob', 0))
-                            try:
-                                fob = float(fob_val) if fob_val not in (None, "") else 0.0
-                            except Exception:
-                                fob = 0.0
-                            money = qty * fob
-                            po_money_by_size[sz] += money
-                            po_money += money
+
+                    top_fob_val = po_items[0].get('fob', 0)
+                    try:
+                        top_fob = float(top_fob_val) if top_fob_val not in (None, "") else 0.0
+                    except Exception:
+                        top_fob = 0.0
 
                     po_fob_by_size = {}
-                    for sz, qty in po_totals.items():
-                        if qty:
-                            po_fob_by_size[sz] = po_money_by_size.get(sz, 0.0) / qty
+                    po_money = top_fob * sum(po_totals.values())
 
                     # Total PO Qty row
                     final_rows.append({
@@ -491,7 +511,7 @@ class ProcessingLogic:
                         'type': 'MONEY_PO',
                         'label': 'Net Unit Price',
                         'data': po_items[0],
-                        'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
+                        'fob': top_fob,
                         'fob_by_size': po_fob_by_size,
                         'sizes': po_totals,
                         'total_money': po_money,
@@ -503,7 +523,7 @@ class ProcessingLogic:
                         'type': 'MONEY_PO',
                         'label': 'Trading Co Net Unit Price',
                         'data': po_items[0],
-                        'fob': float(po_items[0]['fob']) if po_items[0]['fob'] else 0,
+                        'fob': top_fob,
                         'fob_by_size': po_fob_by_size,
                         'sizes': po_totals,
                         'total_money': po_money,
