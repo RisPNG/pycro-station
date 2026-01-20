@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 import threading
 from datetime import datetime
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, List, Tuple, TYPE_CHECKING
 
@@ -266,6 +268,440 @@ def parse_ocr_to_dataframe(ocr_text: str):
     return pd.DataFrame({"Text": lines})
 
 
+def _strip_markdown_line(line: str) -> str:
+    line = line.strip()
+    if not line:
+        return ""
+
+    # Remove markdown headings ("#", "##", etc.)
+    line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+
+    # Remove common emphasis markers
+    line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+    line = re.sub(r"__(.+?)__", r"\1", line)
+    line = re.sub(r"\*(.+?)\*", r"\1", line)
+    line = re.sub(r"_(.+?)_", r"\1", line)
+
+    return line.strip()
+
+
+def _extract_html_tables(text: str) -> Tuple[str, List[str]]:
+    """
+    Extract <table>...</table> blocks from OCR text.
+
+    Returns (text_without_tables, tables_html).
+    Works even if the last table is truncated (missing </table>).
+    """
+    tables: List[str] = []
+    kept_lines: List[str] = []
+
+    in_table = False
+    buf: List[str] = []
+
+    for raw in (text or "").splitlines():
+        line = raw.rstrip("\n")
+        lower = line.lower()
+
+        if not in_table and "<table" in lower:
+            in_table = True
+            buf = [line]
+            if "</table>" in lower:
+                in_table = False
+                tables.append("\n".join(buf))
+                buf = []
+            continue
+
+        if in_table:
+            buf.append(line)
+            if "</table>" in lower:
+                in_table = False
+                tables.append("\n".join(buf))
+                buf = []
+            continue
+
+        kept_lines.append(line)
+
+    if in_table and buf:
+        tables.append("\n".join(buf))
+
+    return "\n".join(kept_lines), tables
+
+
+def _extract_markdown_tables(text: str) -> Tuple[str, List[List[str]]]:
+    """
+    Extract GitHub/markdown pipe tables from OCR text.
+
+    Returns (text_without_tables, tables_as_lines).
+    """
+    lines = (text or "").splitlines()
+    kept: List[str] = []
+    tables: List[List[str]] = []
+
+    pipe_row = re.compile(r"^\s*\|.*\|\s*$")
+    sep_row = re.compile(r"^\s*\|[-:\s|]+\|\s*$")
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if pipe_row.match(line) and i + 1 < len(lines) and sep_row.match(lines[i + 1]):
+            table_lines = [line]
+            i += 2  # skip separator row
+            while i < len(lines) and pipe_row.match(lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            tables.append(table_lines)
+            continue
+
+        kept.append(line)
+        i += 1
+
+    return "\n".join(kept), tables
+
+
+def _parse_markdown_table(table_lines: List[str]) -> List[List[str]]:
+    if not table_lines:
+        return []
+
+    rows: List[List[str]] = []
+    for line in table_lines:
+        line = line.strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            continue
+        cells = [c.strip() for c in line[1:-1].split("|")]
+        rows.append(cells)
+
+    if not rows:
+        return []
+
+    max_cols = max((len(r) for r in rows), default=0)
+    return [r + [""] * (max_cols - len(r)) for r in rows]
+
+
+class _HTMLTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.rows: List[List[str]] = []
+        self._current_row: List[str] = []
+        self._current_cell: List[str] = []
+        self._in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = (tag or "").lower()
+        if tag == "tr":
+            self._current_row = []
+        elif tag in ("td", "th"):
+            self._in_cell = True
+            self._current_cell = []
+
+    def handle_endtag(self, tag):
+        tag = (tag or "").lower()
+        if tag in ("td", "th"):
+            cell = unescape("".join(self._current_cell)).strip()
+            self._current_row.append(cell)
+            self._current_cell = []
+            self._in_cell = False
+        elif tag == "tr":
+            if any(c.strip() for c in self._current_row):
+                self.rows.append(self._current_row)
+            self._current_row = []
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._current_cell.append(data)
+
+    def handle_entityref(self, name):  # pragma: no cover
+        if self._in_cell:
+            self._current_cell.append(f"&{name};")
+
+    def handle_charref(self, name):  # pragma: no cover
+        if self._in_cell:
+            self._current_cell.append(f"&#{name};")
+
+
+def _parse_html_table(table_html: str) -> List[List[str]]:
+    if not table_html:
+        return []
+
+    parser = _HTMLTableParser()
+    try:
+        parser.feed(table_html)
+        parser.close()
+    except Exception:
+        # Be forgiving: return whatever we could parse.
+        pass
+
+    rows = list(parser.rows)
+
+    # Flush truncated final cell/row if any.
+    if parser._current_cell:
+        cell = unescape("".join(parser._current_cell)).strip()
+        parser._current_row.append(cell)
+        parser._current_cell = []
+    if parser._current_row and any(c.strip() for c in parser._current_row):
+        rows.append(parser._current_row)
+
+    if not rows:
+        return []
+
+    max_cols = max((len(r) for r in rows), default=0)
+    padded = [r + [""] * (max_cols - len(r)) for r in rows]
+    return padded
+
+
+def _split_key_value(line: str) -> Tuple[str, str] | None:
+    """
+    Heuristic split of a line into (key, value).
+    Returns None if the line looks like a heading/paragraph.
+    """
+    if not line:
+        return None
+
+    # Skip page markers like "1/4"
+    if re.fullmatch(r"\s*\d+\s*/\s*\d+\s*", line):
+        return None
+
+    known_keys = (
+        "Payer(s)",
+        "Payer",
+        "Payment Provider",
+        "Payment Reference",
+        "Account Number",
+        "Account Name",
+        "Paid Through",
+        "Status",
+        "Payment Method",
+        "Value Date",
+        "Fees (USD)",
+        "Fees(USD)",
+        "Fee Type",
+        "Invoice Fee",
+    )
+
+    for key in sorted(known_keys, key=len, reverse=True):
+        if line.startswith(key + " "):
+            value = line[len(key) :].strip()
+            if value:
+                return key, value
+
+    # Split on colon
+    if ":" in line and not line.strip().startswith("http"):
+        left, right = line.split(":", 1)
+        if left.strip() and right.strip():
+            return left.strip(), right.strip()
+
+    # Split if the "key" ends with ')' (common for labels like "Payer(s)")
+    m = re.match(r"^(.+?\))\s+(.+)$", line)
+    if m:
+        key = m.group(1).strip()
+        value = m.group(2).strip()
+        if key and value:
+            return key, value
+
+    return None
+
+
+def _ocr_text_to_rows(text: str) -> List[List[str]]:
+    rows: List[List[str]] = []
+    if not text:
+        return rows
+
+    cleaned_lines = []
+    for raw in text.splitlines():
+        line = _strip_markdown_line(raw)
+        if not line:
+            continue
+        if re.fullmatch(r"\d+\s*/\s*\d+", line):
+            continue
+        cleaned_lines.append(line)
+
+    i = 0
+    while i < len(cleaned_lines):
+        line = cleaned_lines[i]
+
+        # If the first two lines look like (timestamp, title), place them on one row.
+        if (
+            i == 0
+            and i + 1 < len(cleaned_lines)
+            and re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2},\s*\d{1,2}:\d{2}\s*[AP]M", line)
+        ):
+            rows.append([line, cleaned_lines[i + 1]])
+            i += 2
+            continue
+
+        kv = _split_key_value(line)
+        if kv:
+            rows.append([kv[0], kv[1]])
+        else:
+            rows.append([line])
+        i += 1
+
+    return rows
+
+
+def _write_rows(ws, rows: List[List[str]], start_row: int = 1, start_col: int = 1):
+    r = start_row
+    for row in rows:
+        c = start_col
+        for val in row:
+            if val is not None and str(val) != "":
+                ws.cell(row=r, column=c, value=val)
+            c += 1
+        r += 1
+
+
+def _normalize_cell_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _is_likely_header_row(row: List[str]) -> bool:
+    if not row:
+        return False
+
+    joined = " ".join(_normalize_cell_text(c) for c in row if c and c.strip())
+    if not joined:
+        return False
+
+    keywords = (
+        "reference number",
+        "invoice number",
+        "amount (in invoice currency)",
+        "settlement amount",
+        "fee type",
+        "contract",
+        "payer",
+        "purchase order",
+        "transaction fees",
+    )
+    if any(k in joined for k in keywords):
+        return True
+
+    alpha_cells = sum(any(ch.isalpha() for ch in (c or "")) for c in row)
+    digit_cells = sum(any(ch.isdigit() for ch in (c or "")) for c in row)
+
+    # Mostly alphabetic header-like row, not mostly numbers.
+    if alpha_cells >= max(2, len(row) // 2) and digit_cells <= max(1, len(row) // 3):
+        return True
+
+    return False
+
+
+def _find_header_row_index(rows: List[List[str]]) -> int | None:
+    for idx, row in enumerate(rows[:5]):  # only scan the top section
+        if _is_likely_header_row(row):
+            return idx
+    return None
+
+
+def _pad_row(row: List[str], target_cols: int) -> List[str]:
+    if len(row) >= target_cols:
+        return row
+    return row + [""] * (target_cols - len(row))
+
+
+def _build_workbook_from_pages(page_texts: List[str]):
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    default = wb.active
+    wb.remove(default)
+
+    metadata_rows: List[List[str]] = []
+    table_accs: List[dict] = []
+
+    for page_idx, ocr_text in enumerate(page_texts, start=1):
+        text_wo_tables, tables = _extract_html_tables(ocr_text or "")
+        text_wo_tables, md_tables = _extract_markdown_tables(text_wo_tables)
+
+        page_rows = _ocr_text_to_rows(text_wo_tables)
+
+        # Light dedupe: repeated headers at the top of subsequent pages.
+        if page_idx > 1 and page_rows:
+            for idx, row in enumerate(page_rows):
+                if idx < 3 and row in metadata_rows:
+                    continue
+                metadata_rows.append(row)
+        else:
+            metadata_rows.extend(page_rows)
+
+        for t in tables:
+            parsed = _parse_html_table(t)
+            if not parsed:
+                continue
+
+            header_idx = _find_header_row_index(parsed)
+            if header_idx is not None:
+                header_row = parsed[header_idx]
+                sig = tuple(_normalize_cell_text(c) for c in header_row)
+
+                data_rows = parsed[header_idx + 1 :]
+                target_cols = len(header_row)
+                data_rows = [_pad_row(r, target_cols) for r in data_rows]
+
+                existing = next((acc for acc in table_accs if acc.get("sig") == sig), None)
+                if existing is None:
+                    table_accs.append({"sig": sig, "rows": [header_row] + data_rows})
+                else:
+                    existing_cols = max((len(r) for r in existing["rows"]), default=0)
+                    target_cols = max(existing_cols, target_cols)
+                    existing["rows"] = [_pad_row(r, target_cols) for r in existing["rows"]]
+                    existing["rows"].extend(_pad_row(r, target_cols) for r in data_rows)
+            else:
+                # No header: treat as continuation of the most recent table.
+                if table_accs:
+                    target_cols = max((len(r) for r in table_accs[-1]["rows"]), default=0)
+                    if target_cols == 0:
+                        table_accs[-1]["rows"].extend(parsed)
+                    else:
+                        table_accs[-1]["rows"].extend(_pad_row(r, target_cols) for r in parsed)
+                else:
+                    table_accs.append({"sig": None, "rows": parsed})
+
+        for md in md_tables:
+            parsed = _parse_markdown_table(md)
+            if not parsed:
+                continue
+
+            header_idx = _find_header_row_index(parsed)
+            if header_idx is not None:
+                header_row = parsed[header_idx]
+                sig = tuple(_normalize_cell_text(c) for c in header_row)
+                data_rows = parsed[header_idx + 1 :]
+                target_cols = len(header_row)
+                data_rows = [_pad_row(r, target_cols) for r in data_rows]
+
+                existing = next((acc for acc in table_accs if acc.get("sig") == sig), None)
+                if existing is None:
+                    table_accs.append({"sig": sig, "rows": [header_row] + data_rows})
+                else:
+                    existing_cols = max((len(r) for r in existing["rows"]), default=0)
+                    target_cols = max(existing_cols, target_cols)
+                    existing["rows"] = [_pad_row(r, target_cols) for r in existing["rows"]]
+                    existing["rows"].extend(_pad_row(r, target_cols) for r in data_rows)
+            else:
+                if table_accs:
+                    target_cols = max((len(r) for r in table_accs[-1]["rows"]), default=0)
+                    if target_cols == 0:
+                        table_accs[-1]["rows"].extend(parsed)
+                    else:
+                        table_accs[-1]["rows"].extend(_pad_row(r, target_cols) for r in parsed)
+                else:
+                    table_accs.append({"sig": None, "rows": parsed})
+
+    # If there are no tables, still create a single sheet with the metadata.
+    ws1 = wb.create_sheet("Table_1")
+    _write_rows(ws1, metadata_rows, start_row=1, start_col=1)
+
+    write_row = len(metadata_rows) + 2 if metadata_rows else 1
+    if table_accs:
+        _write_rows(ws1, table_accs[0]["rows"], start_row=write_row, start_col=1)
+
+        for idx, acc in enumerate(table_accs[1:], start=2):
+            ws = wb.create_sheet(f"Table_{idx}")
+            _write_rows(ws, acc["rows"], start_row=1, start_col=1)
+
+    return wb
+
+
 class OCRModel:
     """Singleton-ish class to manage model loading and inference."""
 
@@ -381,7 +817,6 @@ def process_pdf(
     Returns:
         Path to output Excel file
     """
-    import pandas as pd
     import pypdfium2 as pdfium
 
     _emit(log_emit, f"Processing: {pdf_path.name}")
@@ -395,6 +830,7 @@ def process_pdf(
     _emit(log_emit, f"PDF has {total_pages} page(s)")
 
     all_dataframes = []
+    page_texts: List[str] = []
 
     for page_num in range(total_pages):
         _emit(log_emit, f"Processing page {page_num + 1}/{total_pages}...")
@@ -409,35 +845,19 @@ def process_pdf(
         ocr_text = OCRModel.run_ocr(image, max_tokens)
         _emit(log_emit, f"Page {page_num + 1} OCR complete ({len(ocr_text)} chars)")
 
-        # Parse OCR output to DataFrame
-        df = parse_ocr_to_dataframe(ocr_text)
-        df.insert(0, "_Page", page_num + 1)
-        all_dataframes.append(df)
+        page_texts.append(ocr_text)
 
     if progress_emit:
         progress_emit(total_pages, total_pages)
-
-    # Combine all pages
-    if all_dataframes:
-        # Try to merge DataFrames with same columns
-        if len(all_dataframes) > 1:
-            try:
-                combined_df = pd.concat(all_dataframes, ignore_index=True)
-            except Exception:
-                # If concat fails, just use first DataFrame
-                combined_df = all_dataframes[0]
-        else:
-            combined_df = all_dataframes[0]
-    else:
-        combined_df = pd.DataFrame({"Text": ["No content extracted"]})
 
     # Generate output path
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_name = f"{pdf_path.stem}__ocr__{ts}.xlsx"
     out_path = ensure_unique_path(pdf_path.with_name(out_name))
 
-    # Write to Excel
-    combined_df.to_excel(out_path, index=False, engine="openpyxl")
+    # Write to Excel (structured tables + key/value rows)
+    wb = _build_workbook_from_pages(page_texts)
+    wb.save(out_path)
     _emit(log_emit, f"Saved: {out_path.name}")
 
     return out_path

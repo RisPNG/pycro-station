@@ -4,3 +4,4 @@ pypdfium2
 pillow
 pandas
 openpyxl
+defusedxml
