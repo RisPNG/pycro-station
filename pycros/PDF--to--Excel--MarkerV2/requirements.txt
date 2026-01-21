@@ -1,0 +1,5 @@
+marker-pdf
+pandas
+openpyxl
+torch
+llama-cpp-python
