@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import re
 import threading
+import os
+import platform
+from contextlib import nullcontext
 from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
@@ -78,7 +81,7 @@ def check_dependencies() -> Tuple[bool, str]:
 
     if missing:
         msg = "Missing dependencies:\n" + "\n".join(f"  - {m}" for m in missing)
-        msg += "\n\nInstall with:\n  pip install torch pandas pypdfium2 pillow openpyxl"
+        msg += "\n\nInstall with:\n  pip install torch pandas pypdfium2 pillow openpyxl accelerate defusedxml"
         msg += "\n  pip install git+https://github.com/huggingface/transformers"
         return False, msg
 
@@ -111,12 +114,87 @@ def ensure_unique_path(path: Path) -> Path:
         counter += 1
 
 
-def detect_gpu_info() -> dict:
+def get_total_memory_gb() -> float | None:
+    """Best-effort total physical RAM in GiB."""
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.virtual_memory().total) / (1024**3)
+    except Exception:
+        pass
+
+    # Unix-like (Linux/macOS)
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        return (page_size * phys_pages) / (1024**3)
+    except Exception:
+        pass
+
+    # Windows fallback
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)) == 0:
+                return None
+            return float(stat.ullTotalPhys) / (1024**3)
+        except Exception:
+            return None
+
+    return None
+
+
+def _recommended_cpu_threads() -> int:
+    cpu = os.cpu_count() or 1
+    return min(8, max(1, cpu - 2))
+
+
+def _device_kind(device) -> str:
+    s = str(device or "cpu").lower()
+    return s.split(":", 1)[0]
+
+
+def _recommended_defaults_for_device(device, total_ram_gb: float | None) -> dict:
+    low_ram = total_ram_gb is None or total_ram_gb <= 10.0
+    kind = _device_kind(device)
+
+    if kind == "cpu":
+        return {
+            "max_tokens": 8192,
+            "render_size": 1280,
+            "cpu_threads": _recommended_cpu_threads(),
+        }
+
+    # GPU-ish backends (cuda/mps/directml/privateuseone/etc.)
+    return {
+        "max_tokens": 8192,
+        "render_size": 1280,
+        "cpu_threads": _recommended_cpu_threads(),
+    }
+
+
+def detect_gpu_info(total_ram_gb: float | None = None) -> dict:
     """
     Detect available GPU hardware and return info dict.
 
     Returns dict with:
-        - devices: list of (device_str, display_name, dtype_str, is_discrete)
+        - devices: list of (device, display_name, dtype_str, is_discrete)
         - recommended: index of recommended device
     """
     devices = []
@@ -144,37 +222,51 @@ def detect_gpu_info() -> dict:
         # Use float32 for MPS (bfloat16 support is limited)
         devices.append(("mps", name, "float32", True))
 
+    # Check DirectML (Windows integrated/discrete GPUs; optional)
+    if platform.system() == "Windows":
+        try:
+            import torch_directml  # type: ignore
+
+            dml_device = torch_directml.device()
+            devices.append((dml_device, "DirectML - Windows GPU (experimental)", "float16", False))
+        except Exception:
+            pass
+
     # Always add CPU option
     cpu_name = "CPU - System Processor"
     # Check if this is likely integrated graphics only
     if not devices:
         cpu_name = "CPU - No discrete GPU detected (slower)"
-    devices.append(("cpu", cpu_name, "float32", False))
+    devices.append(("cpu", f"{cpu_name} (bfloat16, low RAM)", "bfloat16", False))
+    devices.append(("cpu", f"{cpu_name} (float32, compatibility)", "float32", False))
 
     # Recommend first discrete GPU if available, otherwise CPU
     for i, (_, _, _, is_discrete) in enumerate(devices):
         if is_discrete:
             recommended_idx = i
             break
+    else:
+        # CPU-only (or integrated/experimental backends): default to CPU bfloat16 for lower RAM usage.
+        for i, (dev, _, dtype, _) in enumerate(devices):
+            if _device_kind(dev) == "cpu" and dtype == "bfloat16":
+                recommended_idx = i
+                break
 
     return {"devices": devices, "recommended": recommended_idx}
 
 
-def render_pdf_page(pdf_path: Path, page_num: int, target_size: int = 1540):
+def render_pdf_page(pdf, page_num: int, target_size: int = 1540):
     """
     Render a PDF page to PIL Image at target longest dimension.
 
     Args:
-        pdf_path: Path to PDF file
+        pdf: Open PdfDocument
         page_num: 0-indexed page number
         target_size: Target size for longest dimension (default 1540px per model recommendation)
 
     Returns:
         PIL Image of the rendered page
     """
-    import pypdfium2 as pdfium
-
-    pdf = pdfium.PdfDocument(pdf_path)
     page = pdf[page_num]
 
     # Get page dimensions at 72 DPI (PDF standard)
@@ -187,6 +279,13 @@ def render_pdf_page(pdf_path: Path, page_num: int, target_size: int = 1540):
     # Render at calculated scale
     bitmap = page.render(scale=scale)
     pil_image = bitmap.to_pil()
+    for obj in (bitmap, page):
+        try:
+            close = getattr(obj, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
 
     return pil_image
 
@@ -710,9 +809,12 @@ class OCRModel:
     _processor = None
     _device = None
     _dtype = None
+    _cpu_threads = None
+
+    _MODEL_ID = "lightonai/LightOnOCR-2-1B"
 
     @classmethod
-    def load(cls, device: str, dtype_str: str, log_emit=None) -> "OCRModel":
+    def load(cls, device, dtype_str: str, log_emit=None, cpu_threads: int | None = None) -> "OCRModel":
         """Load or return cached model."""
         import torch
         from transformers import LightOnOcrForConditionalGeneration, LightOnOcrProcessor
@@ -725,14 +827,55 @@ class OCRModel:
         }
         dtype = dtype_map.get(dtype_str, torch.float32)
 
-        if cls._model is None or cls._device != device:
+        if cls._model is None or cls._device != device or cls._dtype != dtype:
+            cls.unload()
+
+            # Configure CPU threading (best-effort; no-op on GPU)
+            if _device_kind(device) == "cpu":
+                desired_threads = cpu_threads or _recommended_cpu_threads()
+                if cls._cpu_threads != desired_threads:
+                    try:
+                        torch.set_num_threads(int(desired_threads))
+                    except Exception:
+                        pass
+                    try:
+                        torch.set_num_interop_threads(1)
+                    except Exception:
+                        pass
+                    cls._cpu_threads = desired_threads
+
             _emit(log_emit, f"Loading LightOnOCR-2-1B on {device}...")
 
-            cls._processor = LightOnOcrProcessor.from_pretrained("lightonai/LightOnOCR-2-1B")
-            cls._model = LightOnOcrForConditionalGeneration.from_pretrained(
-                "lightonai/LightOnOCR-2-1B",
-                torch_dtype=dtype
-            ).to(device)
+            model_kwargs = {"torch_dtype": dtype}
+            # Reduce peak RAM during load if accelerate is available.
+            try:
+                import accelerate  # type: ignore  # noqa: F401
+
+                model_kwargs["low_cpu_mem_usage"] = True
+            except Exception:
+                pass
+
+            cls._processor = LightOnOcrProcessor.from_pretrained(cls._MODEL_ID)
+            try:
+                cls._model = LightOnOcrForConditionalGeneration.from_pretrained(cls._MODEL_ID, **model_kwargs).to(device)
+            except TypeError:
+                # Be tolerant of older/newer transformers signatures.
+                model_kwargs.pop("low_cpu_mem_usage", None)
+                cls._model = LightOnOcrForConditionalGeneration.from_pretrained(cls._MODEL_ID, **model_kwargs).to(device)
+            except Exception as e:
+                # If reduced precision fails on CPU, fall back to float32 compatibility mode.
+                if _device_kind(device) == "cpu" and dtype != torch.float32:
+                    _emit(
+                        log_emit,
+                        f"Load failed with dtype={dtype_str} on CPU; retrying float32 ({type(e).__name__}: {e})",
+                    )
+                    model_kwargs["torch_dtype"] = torch.float32
+                    model_kwargs.pop("low_cpu_mem_usage", None)
+                    cls._model = LightOnOcrForConditionalGeneration.from_pretrained(cls._MODEL_ID, **model_kwargs).to(device)
+                    dtype = torch.float32
+                else:
+                    raise
+            cls._model.eval()
             cls._device = device
             cls._dtype = dtype
 
@@ -741,10 +884,12 @@ class OCRModel:
         return cls
 
     @classmethod
-    def run_ocr(cls, image, max_tokens: int = 2048) -> str:
+    def run_ocr(cls, image, max_tokens: int = 8192) -> str:
         """Run OCR on a single image."""
         if cls._model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
+
+        import torch
 
         # Prepare conversation format for the model
         conversation = [
@@ -768,8 +913,16 @@ class OCRModel:
             for k, v in inputs.items()
         }
 
-        # Generate output
-        output_ids = cls._model.generate(**inputs, max_new_tokens=max_tokens)
+        device_kind = _device_kind(cls._device)
+        autocast_dtype_ok = cls._dtype in (torch.bfloat16, torch.float16)
+        autocast_cm = (
+            torch.autocast(device_type=device_kind, dtype=cls._dtype)
+            if hasattr(torch, "autocast") and autocast_dtype_ok and device_kind in ("cpu", "cuda")
+            else nullcontext()
+        )
+
+        with torch.inference_mode(), autocast_cm:
+            output_ids = cls._model.generate(**inputs, max_new_tokens=max_tokens)
         generated_ids = output_ids[0, inputs["input_ids"].shape[1]:]
         output_text = cls._processor.decode(generated_ids, skip_special_tokens=True)
 
@@ -797,9 +950,11 @@ class OCRModel:
 
 def process_pdf(
     pdf_path: Path,
-    device: str,
+    device,
     dtype_str: str,
     max_tokens: int,
+    render_size: int,
+    cpu_threads: int | None,
     log_emit=None,
     progress_emit=None,
 ) -> Path:
@@ -822,33 +977,47 @@ def process_pdf(
     _emit(log_emit, f"Processing: {pdf_path.name}")
 
     # Load model
-    OCRModel.load(device, dtype_str, log_emit)
+    OCRModel.load(device, dtype_str, log_emit, cpu_threads=cpu_threads)
 
     # Open PDF and get page count
     pdf = pdfium.PdfDocument(pdf_path)
     total_pages = len(pdf)
     _emit(log_emit, f"PDF has {total_pages} page(s)")
-
-    all_dataframes = []
     page_texts: List[str] = []
+
+    if progress_emit:
+        progress_emit(0, total_pages)
 
     for page_num in range(total_pages):
         _emit(log_emit, f"Processing page {page_num + 1}/{total_pages}...")
 
         if progress_emit:
-            progress_emit(page_num, total_pages)
+            progress_emit(page_num + 1, total_pages)
 
         # Render page to image
-        image = render_pdf_page(pdf_path, page_num)
+        image = render_pdf_page(pdf, page_num, target_size=render_size)
 
         # Run OCR
-        ocr_text = OCRModel.run_ocr(image, max_tokens)
+        try:
+            ocr_text = OCRModel.run_ocr(image, max_tokens)
+        finally:
+            try:
+                image.close()
+            except Exception:
+                pass
         _emit(log_emit, f"Page {page_num + 1} OCR complete ({len(ocr_text)} chars)")
 
         page_texts.append(ocr_text)
 
     if progress_emit:
         progress_emit(total_pages, total_pages)
+
+    try:
+        close = getattr(pdf, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
 
     # Generate output path
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -865,9 +1034,11 @@ def process_pdf(
 
 def process_files(
     files: List[str],
-    device: str,
+    device,
     dtype_str: str,
     max_tokens: int,
+    render_size: int,
+    cpu_threads: int | None,
     log_emit=None,
     progress_emit=None,
 ) -> Tuple[int, int, List[Path]]:
@@ -880,7 +1051,16 @@ def process_files(
         path = Path(raw)
         _emit(log_emit, f"[START] {path.name}")
         try:
-            out = process_pdf(path, device, dtype_str, max_tokens, log_emit, progress_emit)
+            out = process_pdf(
+                path,
+                device,
+                dtype_str,
+                max_tokens,
+                render_size,
+                cpu_threads,
+                log_emit,
+                progress_emit,
+            )
             outputs.append(out)
             ok += 1
             _emit(log_emit, f"[DONE] {path.name}")
@@ -899,7 +1079,8 @@ class MainWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("lightonocr2_pdf_to_excel_widget")
-        self._gpu_info = detect_gpu_info()
+        self._ram_gb = get_total_memory_gb()
+        self._gpu_info = detect_gpu_info(total_ram_gb=self._ram_gb)
         self._build_ui()
         self._connect_signals()
 
@@ -920,7 +1101,7 @@ class MainWidget(QWidget):
         self.select_btn = PrimaryPushButton("Select PDF Files", self)
         self.run_btn = PrimaryPushButton("Run OCR", self)
         self.unload_btn = PrimaryPushButton("Unload Model", self)
-        self.unload_btn.setToolTip("Free GPU memory by unloading the model")
+        self.unload_btn.setToolTip("Free memory by unloading the model")
 
         # Device selection
         self.device_combo = QComboBox(self)
@@ -934,10 +1115,32 @@ class MainWidget(QWidget):
         self.tokens_spin = QSpinBox(self)
         self.tokens_spin.setMinimum(256)
         self.tokens_spin.setMaximum(8192)
-        self.tokens_spin.setValue(2048)
         self.tokens_spin.setSingleStep(256)
         self.tokens_label = QLabel("Max tokens per page", self)
         self.tokens_label.setStyleSheet("color: #dcdcdc; background: transparent; padding-left: 2px;")
+
+        # Render resolution (longest side)
+        self.render_spin = QSpinBox(self)
+        self.render_spin.setMinimum(768)
+        self.render_spin.setMaximum(2048)
+        self.render_spin.setSingleStep(128)
+        self.render_label = QLabel("Render size (px)", self)
+        self.render_label.setStyleSheet("color: #dcdcdc; background: transparent; padding-left: 2px;")
+
+        # CPU threads
+        self.threads_spin = QSpinBox(self)
+        self.threads_spin.setMinimum(1)
+        self.threads_spin.setMaximum(max(1, os.cpu_count() or 1))
+        self.threads_spin.setSingleStep(1)
+        self.threads_label = QLabel("CPU threads", self)
+        self.threads_label.setStyleSheet("color: #dcdcdc; background: transparent; padding-left: 2px;")
+
+        # Apply hardware-aware defaults
+        device_str, _dtype = self.device_combo.currentData()
+        defaults = _recommended_defaults_for_device(device_str, self._ram_gb)
+        self.tokens_spin.setValue(int(defaults["max_tokens"]))
+        self.render_spin.setValue(int(defaults["render_size"]))
+        self.threads_spin.setValue(int(defaults["cpu_threads"]))
 
         # Progress bar
         self.progress_bar = QProgressBar(self)
@@ -990,6 +1193,10 @@ class MainWidget(QWidget):
         grid.addWidget(self.device_combo, 0, 1, Qt.AlignLeft)
         grid.addWidget(self.tokens_label, 1, 0, Qt.AlignLeft)
         grid.addWidget(self.tokens_spin, 1, 1, Qt.AlignLeft)
+        grid.addWidget(self.render_label, 2, 0, Qt.AlignLeft)
+        grid.addWidget(self.render_spin, 2, 1, Qt.AlignLeft)
+        grid.addWidget(self.threads_label, 3, 0, Qt.AlignLeft)
+        grid.addWidget(self.threads_spin, 3, 1, Qt.AlignLeft)
         main_layout.addLayout(grid)
 
         run_row = QHBoxLayout()
@@ -1069,10 +1276,17 @@ class MainWidget(QWidget):
         # Get device configuration
         device_str, dtype_str = self.device_combo.currentData()
         max_tokens = int(self.tokens_spin.value())
+        render_size = int(self.render_spin.value())
+        cpu_threads = int(self.threads_spin.value())
 
         self.log_box.clear()
         self.log_message.emit(f"Starting OCR for {len(files)} file(s)...")
         self.log_message.emit(f"Using device: {self.device_combo.currentText()}")
+        if self._ram_gb:
+            self.log_message.emit(f"Detected RAM: {self._ram_gb:.1f} GB")
+        self.log_message.emit(
+            f"Settings: render={render_size}px, max_tokens={max_tokens}, cpu_threads={cpu_threads}"
+        )
 
         self._set_controls_enabled(False)
         self.progress_bar.setValue(0)
@@ -1085,6 +1299,8 @@ class MainWidget(QWidget):
                     device_str,
                     dtype_str,
                     max_tokens,
+                    render_size,
+                    cpu_threads,
                     log_emit=self.log_message.emit,
                     progress_emit=self.progress_update.emit,
                 )
@@ -1105,6 +1321,8 @@ class MainWidget(QWidget):
         self.select_btn.setEnabled(enabled)
         self.device_combo.setEnabled(enabled)
         self.tokens_spin.setEnabled(enabled)
+        self.render_spin.setEnabled(enabled)
+        self.threads_spin.setEnabled(enabled)
         self.unload_btn.setEnabled(enabled)
 
     def append_log(self, text: str):

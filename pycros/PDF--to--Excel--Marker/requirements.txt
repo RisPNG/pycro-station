@@ -1,4 +1,0 @@
-marker-pdf
-pandas
-openpyxl
-torch
