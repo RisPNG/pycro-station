@@ -193,6 +193,7 @@ def _process_sheet(ws: Worksheet, log: Callable[[str], None]) -> None:
 
     header_row = _find_first_row_by_text(ws, HEADER_MARKER)
     if header_row is not None:
+        _set_freeze_panes(ws, row=header_row + 1, col=COL_B)
         end_row = _last_data_row(ws, max_col=COL_AE)
         if end_row < 1:
             end_row = 1
@@ -206,10 +207,12 @@ def _process_sheet(ws: Worksheet, log: Callable[[str], None]) -> None:
 
     axb_cell = _find_first_cell_by_text(ws, AXB_MARKER)
     if axb_cell is None:
+        _set_freeze_panes(ws, row=2, col=COL_B)
         log('    - Neither "Embellishment Cost" nor "c=axb" found; skipping sheet.')
         return
 
     axb_row, axb_col = axb_cell
+    _set_freeze_panes(ws, row=axb_row + 1, col=COL_B)
     end_row, end_col = _used_extent(ws)
     format_end_col = max(end_col, axb_col + 11, 1)
 
@@ -457,6 +460,19 @@ def _format_gain_row(ws: Worksheet, row: int, end_col: int) -> None:
         cell = ws.cell(row=row, column=c)
         _make_bold(cell)
         _set_top_thin_double_bottom_border(cell)
+
+
+def _set_freeze_panes(ws: Worksheet, row: int, col: int) -> None:
+    try:
+        row = int(row)
+        col = int(col)
+        if row < 1:
+            row = 1
+        if col < 1:
+            col = 1
+        ws.freeze_panes = ws.cell(row=row, column=col).coordinate
+    except Exception:
+        pass
 
 
 def _shade_columns_p_to_u(ws: Worksheet, header_row: int, end_row: int) -> None:
