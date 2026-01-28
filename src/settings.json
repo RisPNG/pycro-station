@@ -2,7 +2,7 @@
     "repo_url": "https://github.com/RisPNG/pycro-station.git",
     "repo_branch": "main",
     "repo_directory": "pycros",
-    "update_remote_on_launch": false,
+    "update_remote_on_launch": true,
     "app_repo_url": "https://github.com/RisPNG/pycro-station.git",
     "app_repo_branch": "main",
     "app_repo_directory": "src",
@@ -12,7 +12,6 @@
     "stars_sort_mode": "alphabetical",
     "stars_show_remote_pycros": true,
     "recently_launched": [
-        "local:Nike--Costing--Formatter"
     ],
     "starred_pycros": []
 }
