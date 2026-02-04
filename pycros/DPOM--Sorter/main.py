@@ -22,10 +22,10 @@ from openpyxl.utils import get_column_letter
 # =============================================================================
 # Excel Colors matching VBA constants
 COLOR_WHITE = "FFFFFF"
-COLOR_BLACK = "000000"
+COLOR_BLACK = "FF000000"
 COLOR_CYAN = "00FFFF"
 COLOR_PINK = "C3C3C3"  # cPink = 12830955
-COLOR_YELLOW = "FFFF00"  # cYellow = 12123902
+COLOR_YELLOW = "FFFEFEB8"
 COLOR_GREEN = "92D050"  # cGreen = 8252325
 COLOR_DARK_GREEN = "506E20"  # cDGreen = 5287936
 COLOR_MAGENTA = "800080"  # cDMagenta = 8388736
@@ -410,18 +410,25 @@ class ProcessingLogic:
             style_groups[style_key].append(row)
             style_keep_colorway[style_key] = style_keep_colorway.get(style_key, False) or keep_colorway
 
-        def style_group_sort_key(k: str) -> tuple[int, int, str]:
+        def style_group_sort_key(k: str) -> tuple:
+            """Preserve SortRecord ordering across style groups (esp. split materials)."""
             items = style_groups.get(k, [])
             if not items:
-                return (0, 9, k)
+                return (0, 9, "", datetime.max, "", "", "", "", "", k)
 
-            group_year = min(year_sort_value(it.get('year')) for it in items)
-            group_season_rank = min(
-                it.get('season_rank', 9)
-                for it in items
-                if year_sort_value(it.get('year')) == group_year
+            first = items[0]
+            return (
+                year_sort_value(first.get('year')),
+                first.get('season_rank', 9),
+                first.get('style_head', ""),
+                first.get('ogac_dt') or datetime.max,
+                first.get('po', ""),
+                first.get('style_cw', ""),
+                first.get('po_line', ""),
+                first.get('country', ""),
+                first.get('ship_no', ""),
+                k,
             )
-            return (group_year, group_season_rank, k)
 
         for style_key in sorted(style_groups.keys(), key=style_group_sort_key):
             style_items = style_groups[style_key]
@@ -671,9 +678,15 @@ class ProcessingLogic:
 
             # Determine style code (strip colorway for total rows)
             style_val = raw[COL_STYLE]
-            if row_type in ['TOTAL_STYLE', 'TOTAL_PO', 'TOTAL_OGAC', 'MONEY_STYLE', 'MONEY_PO']:
-                if not row_obj.get('keep_colorway') and "-" in str(style_val):
-                    style_val = str(style_val).split("-")[0]
+            strip_colorway = (
+                row_type in ['TOTAL_PO', 'MONEY_PO']
+                or (
+                    row_type in ['TOTAL_STYLE', 'TOTAL_OGAC', 'MONEY_STYLE']
+                    and not row_obj.get('keep_colorway')
+                )
+            )
+            if strip_colorway and "-" in str(style_val):
+                style_val = str(style_val).split("-")[0]
 
             # Column 1-3: Vendor, Season, Year
             ws.cell(curr_row, 1, raw[COL_VENDOR])

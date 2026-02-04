@@ -12,13 +12,12 @@ from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QTe
 from qfluentwidgets import ComboBox, MessageBox, PrimaryPushButton
 
 from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
 from openpyxl.utils.datetime import from_excel
+from openpyxl.utils import get_column_letter
 
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
-DATE_FMT_DD_MMM = "dd-mmm"
-MONEY_FMT_USD = "$#,##0.00"
 
 # Default 2026 MY public holidays (editable in UI). These are commonly used national holidays;
 # some Malaysia holidays are state-specific, so users can add/remove as needed.
@@ -117,6 +116,8 @@ def parse_money(val) -> Optional[float]:
     s = str(val).strip()
     if not s:
         return None
+    if s.startswith("="):
+        return None
     neg = False
     if s.startswith("(") and s.endswith(")"):
         neg = True
@@ -210,6 +211,296 @@ def next_business_day(d: date, holidays: set[date]) -> date:
     return candidate
 
 
+def normalize_ref_no(val) -> str:
+    """
+    Normalize a Payment/Ref number so it can be matched between:
+    - Export Bill column J values like 'TC-508801542519'
+    - FEAC chart 'Ref. No.' values like 508801542519
+    """
+    s = normalize_invoice(val)
+    if not s:
+        return ""
+    s = s.strip()
+    if s.upper().startswith("TC-"):
+        s = s[3:].strip()
+    return s
+
+
+def _find_cell_with_value(ws, needle: str, *, max_rows: int = 80, max_cols: int = 30) -> Optional[tuple[int, int]]:
+    target = needle.strip().upper()
+    mr = min(ws.max_row or 0, max_rows)
+    mc = min(ws.max_column or 0, max_cols)
+    for r in range(1, mr + 1):
+        for c in range(1, mc + 1):
+            v = ws.cell(r, c).value
+            if v is None:
+                continue
+            if str(v).strip().upper() == target:
+                return (r, c)
+    return None
+
+
+def read_feac_ref_order(path: str, *, log_emit=None) -> dict[str, int]:
+    """
+    Reads FEAC chart and returns an order map for Ref numbers.
+    For each sheet (in workbook order): find cell 'Ref. No.' and read values under it (same column),
+    appending to one continuous list.
+    """
+    _emit(log_emit, f"[FEAC] Opening: {path}")
+    wb = load_workbook(path, data_only=True, read_only=True)
+    try:
+        order: dict[str, int] = {}
+        seq = 0
+        for ws in wb.worksheets:
+            pos = _find_cell_with_value(ws, "Ref. No.")
+            if not pos:
+                _emit(log_emit, f"[FEAC] '{ws.title}': 'Ref. No.' not found (skipped).")
+                continue
+            header_r, header_c = pos
+            blanks_in_a_row = 0
+            started = False
+            for r in range(header_r + 1, (ws.max_row or header_r) + 1):
+                v = ws.cell(r, header_c).value
+                if v is None or str(v).strip() == "":
+                    blanks_in_a_row += 1
+                    if started and blanks_in_a_row >= 30:
+                        break
+                    continue
+                blanks_in_a_row = 0
+                started = True
+                ref = normalize_ref_no(v)
+                if not ref:
+                    continue
+                if ref not in order:
+                    order[ref] = seq
+                    seq += 1
+        _emit(log_emit, f"[FEAC] Loaded {len(order)} Ref. No. item(s).")
+        return order
+    finally:
+        wb.close()
+
+
+@dataclass
+class _CellSnap:
+    value: object
+    style: object
+    hyperlink: object
+    comment: object
+
+
+@dataclass
+class _RowSnap:
+    origin_row: int
+    cells: list[_CellSnap]
+    height: Optional[float]
+
+
+def _is_formula_cell(cell) -> bool:
+    v = cell.value
+    if getattr(cell, "data_type", None) == "f":
+        return True
+    return isinstance(v, str) and v.strip().startswith("=")
+
+
+def _row_is_blank(cells: Iterable) -> bool:
+    for c in cells:
+        v = c.value
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        return False
+    return True
+
+
+def _snapshot_row(cells: Iterable, row_idx: int, ws) -> _RowSnap:
+    snaps: list[_CellSnap] = []
+    for c in cells:
+        snaps.append(_CellSnap(value=c.value, style=getattr(c, "_style", None), hyperlink=c.hyperlink, comment=c.comment))
+    h = ws.row_dimensions[row_idx].height
+    return _RowSnap(origin_row=row_idx, cells=snaps, height=h)
+
+
+def _apply_row_snapshot(ws, dst_row: int, snap: _RowSnap) -> None:
+    if snap.height is not None:
+        ws.row_dimensions[dst_row].height = snap.height
+    for col_idx, cs in enumerate(snap.cells, start=1):
+        dst = ws.cell(dst_row, col_idx)
+        v = cs.value
+        if isinstance(v, str) and v.startswith("="):
+            origin = f"{get_column_letter(col_idx)}{snap.origin_row}"
+            dest = f"{get_column_letter(col_idx)}{dst_row}"
+            try:
+                v = Translator(v, origin=origin).translate_formula(dest)
+            except Exception:
+                pass
+        dst.value = v
+        if cs.style is not None:
+            dst._style = cs.style
+        if cs.hyperlink:
+            dst.hyperlink = cs.hyperlink
+        if cs.comment:
+            dst.comment = cs.comment
+
+
+def _apply_blank_row(ws, dst_row: int, template: Optional[_RowSnap], max_col: int) -> None:
+    if template and template.height is not None:
+        ws.row_dimensions[dst_row].height = template.height
+    for col_idx in range(1, max_col + 1):
+        dst = ws.cell(dst_row, col_idx)
+        dst.value = None
+        if template and col_idx - 1 < len(template.cells):
+            st = template.cells[col_idx - 1].style
+            if st is not None:
+                dst._style = st
+
+
+def _apply_total_row(
+    ws,
+    dst_row: int,
+    template: Optional[_RowSnap],
+    max_col: int,
+    group_start_row: int,
+    group_end_row: int,
+) -> None:
+    if template and template.height is not None:
+        ws.row_dimensions[dst_row].height = template.height
+    for col_idx in range(1, max_col + 1):
+        dst = ws.cell(dst_row, col_idx)
+        dst.value = None
+        if template and col_idx - 1 < len(template.cells):
+            st = template.cells[col_idx - 1].style
+            if st is not None:
+                dst._style = st
+
+    # Keep any label in column A from template (if present)
+    if template and template.cells:
+        v = template.cells[0].value
+        if v is not None and not (isinstance(v, str) and v.strip().startswith("=")):
+            ws.cell(dst_row, 1).value = v
+
+    if group_end_row >= group_start_row:
+        ws.cell(dst_row, 2).value = f"=SUM(B{group_start_row}:B{group_end_row})"
+    else:
+        ws.cell(dst_row, 2).value = "=0"
+
+
+def _find_first_data_row_export_bill(ws, *, amount_col: int = 2) -> Optional[int]:
+    max_row = ws.max_row or 0
+    for r in range(1, max_row + 1):
+        inv = normalize_invoice(ws.cell(r, 1).value)
+        if not inv:
+            continue
+        if parse_money(ws.cell(r, amount_col).value) is None:
+            continue
+        return r
+    return None
+
+
+def regroup_and_sort_export_bill_sheet(ws, ref_order: dict[str, int], *, log_emit=None) -> None:
+    """
+    Rebuilds the grouped area so that:
+    - Rows with Value Date (col E) are grouped by that date, ascending
+    - Within each date group, rows are sorted by FEAC order of column J (Payment No)
+    - Rows with no Value Date stay in the last group (\"no tradecard\") with its own total
+    """
+    start = _find_first_data_row_export_bill(ws)
+    end = find_last_total_row(ws)
+    if start is None or end is None or end < start:
+        _emit(log_emit, f"[SORT] {ws.title}: unable to locate data region (skipped).")
+        return
+
+    max_col = ws.max_column or 0
+    if max_col <= 0:
+        return
+
+    total_template: Optional[_RowSnap] = None
+    blank_template: Optional[_RowSnap] = None
+    date_groups: dict[date, list[_RowSnap]] = {}
+    unmatched: list[_RowSnap] = []
+
+    for row_idx, row_cells in enumerate(
+        ws.iter_rows(min_row=start, max_row=end, min_col=1, max_col=max_col),
+        start=start,
+    ):
+        b = row_cells[1] if len(row_cells) >= 2 else ws.cell(row_idx, 2)
+        if _is_formula_cell(b):
+            if total_template is None:
+                total_template = _snapshot_row(row_cells, row_idx, ws)
+            continue
+
+        if _row_is_blank(row_cells):
+            if blank_template is None:
+                blank_template = _snapshot_row(row_cells, row_idx, ws)
+            continue
+
+        inv = normalize_invoice(row_cells[0].value if row_cells else ws.cell(row_idx, 1).value)
+        if not inv:
+            continue
+
+        snap = _snapshot_row(row_cells, row_idx, ws)
+
+        e_val = row_cells[4].value if len(row_cells) >= 5 else ws.cell(row_idx, 5).value
+        e_date = parse_date_any(e_val)
+        if e_date:
+            date_groups.setdefault(e_date, []).append(snap)
+        else:
+            unmatched.append(snap)
+
+    if not date_groups and not unmatched:
+        _emit(log_emit, f"[SORT] {ws.title}: no data rows detected (skipped).")
+        return
+
+    def sort_key(s: _RowSnap) -> tuple[int, int]:
+        j_val = s.cells[9].value if len(s.cells) >= 10 else None
+        ref = normalize_ref_no(j_val)
+        return (ref_order.get(ref, 10**9), s.origin_row)
+
+    out_rows: list[tuple[str, object]] = []
+    cursor = start
+
+    for idx, d in enumerate(sorted(date_groups.keys())):
+        group = sorted(date_groups[d], key=sort_key)
+        group_start = cursor
+        for s in group:
+            out_rows.append(("data", s))
+            cursor += 1
+        group_end = cursor - 1
+        out_rows.append(("total", (group_start, group_end)))
+        cursor += 1
+        if idx != len(date_groups) - 1 or unmatched:
+            out_rows.append(("blank", None))
+            cursor += 1
+
+    # Unmatched (no Value Date) group at the end
+    if unmatched:
+        unmatched_start = cursor
+        for s in unmatched:
+            out_rows.append(("data", s))
+            cursor += 1
+        unmatched_end = cursor - 1
+        out_rows.append(("total", (unmatched_start, unmatched_end)))
+        cursor += 1
+
+    # Rewrite region
+    orig_count = end - start + 1
+    new_count = len(out_rows)
+    ws.delete_rows(start, orig_count)
+    ws.insert_rows(start, new_count)
+
+    write_row = start
+    for kind, payload in out_rows:
+        if kind == "data":
+            _apply_row_snapshot(ws, write_row, payload)  # type: ignore[arg-type]
+        elif kind == "blank":
+            _apply_blank_row(ws, write_row, blank_template, max_col)
+        elif kind == "total":
+            group_start, group_end = payload  # type: ignore[misc]
+            _apply_total_row(ws, write_row, total_template, max_col, int(group_start), int(group_end))
+        write_row += 1
+
+    _emit(log_emit, f"[SORT] {ws.title}: regrouped {sum(len(v) for v in date_groups.values())} matched row(s), {len(unmatched)} unmatched.")
+
 def find_header_row_by_value(ws, needle: str, *, max_scan_rows: Optional[int] = None) -> Optional[int]:
     target = needle.strip().upper()
     max_row = ws.max_row or 0
@@ -254,6 +545,16 @@ class ExportRecord:
     amount: float
     exfty: date
     lead_days: int
+
+
+@dataclass(frozen=True)
+class AmountMismatch:
+    trade_card_file: str
+    invoice: str
+    export_bill_sheet: str
+    export_bill_row: int
+    trade_card_amount: float
+    export_bill_amount: float
 
 
 def read_vn_records(path: str, sheet_name: str, *, log_emit=None) -> list[ExportRecord]:
@@ -462,18 +763,12 @@ def insert_export_bill_record(ws, rec: ExportRecord, *, log_emit=None) -> int:
 
     c_amt = ws.cell(new_row, 2)
     c_amt.value = float(rec.amount)
-    c_amt.number_format = MONEY_FMT_USD
 
     c_date = ws.cell(new_row, 3)
     c_date.value = rec.exfty
-    c_date.number_format = DATE_FMT_DD_MMM
 
     c_d = ws.cell(new_row, 4)
     c_d.value = f"=C{new_row}+{int(rec.lead_days)}"
-    c_d.number_format = DATE_FMT_DD_MMM
-
-    for col in (5, 6, 7):
-        ws.cell(new_row, col).number_format = DATE_FMT_DD_MMM
 
     _emit(log_emit, f"[EXPORT BILL] Inserted {rec.invoice} into '{ws.title}' at row {new_row}.")
     return new_row
@@ -587,6 +882,8 @@ def update_export_bill_from_trade_card(
     entries: list[tuple[str, Optional[float]]],
     holidays: set[date],
     invoice_index: Optional[dict[str, tuple[str, int]]] = None,
+    mismatches: Optional[list[AmountMismatch]] = None,
+    trade_card_file: str = "",
     *,
     log_emit=None,
 ) -> tuple[int, int, int]:
@@ -613,15 +910,24 @@ def update_export_bill_from_trade_card(
             if abs(float(tc_amt) - float(eb_amt)) > 0.01:
                 _emit(log_emit, f"[AMOUNT MISMATCH] {inv} ({sheet_name} row {row}): TradeCard={tc_amt} vs ExportBill={eb_amt}")
                 mismatched += 1
+                if mismatches is not None:
+                    mismatches.append(
+                        AmountMismatch(
+                            trade_card_file=trade_card_file,
+                            invoice=inv,
+                            export_bill_sheet=sheet_name,
+                            export_bill_row=row,
+                            trade_card_amount=float(tc_amt),
+                            export_bill_amount=float(eb_amt),
+                        )
+                    )
 
         for col in (5, 6):
             c = ws.cell(row, col)
             c.value = value_date
-            c.number_format = DATE_FMT_DD_MMM
 
         c_g = ws.cell(row, 7)
         c_g.value = next_bd
-        c_g.number_format = DATE_FMT_DD_MMM
 
         if pay_value:
             ws.cell(row, 10).value = pay_value
@@ -630,6 +936,51 @@ def update_export_bill_from_trade_card(
         updated += 1
 
     return updated, missing, mismatched
+
+
+def write_mismatch_log_txt(output_xlsx_path: str, export_wb, mismatches: list[AmountMismatch], *, log_emit=None) -> str:
+    if not mismatches:
+        return ""
+
+    base, _ext = os.path.splitext(output_xlsx_path)
+    out_path = ensure_unique_path(f"{base}_amount_mismatches.txt")
+
+    # Build final invoice->row map per sheet (after sorting/regrouping).
+    sheet_inv_row: dict[tuple[str, str], int] = {}
+    try:
+        for ws in export_wb.worksheets:
+            max_row = ws.max_row or 0
+            for r in range(1, max_row + 1):
+                inv = normalize_invoice(ws.cell(r, 1).value)
+                if not inv:
+                    continue
+                inv_u = inv.strip().upper()
+                if inv_u in {"INV #", "INV#", "INVOICE", "INVOICE #", "INVOICE NO", "INVOICE NO."}:
+                    continue
+                key = (ws.title, inv)
+                if key not in sheet_inv_row:
+                    sheet_inv_row[key] = r
+    except Exception:
+        sheet_inv_row = {}
+
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("Export Bill Sorter - Amount Mismatches\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Output workbook: {output_xlsx_path}\n")
+            f.write("\n")
+            f.write("Columns: trade_card_file | invoice | sheet | row | trade_card_amount | export_bill_amount\n")
+            for m in mismatches:
+                row = sheet_inv_row.get((m.export_bill_sheet, m.invoice), m.export_bill_row)
+                f.write(
+                    f"{m.trade_card_file} | {m.invoice} | {m.export_bill_sheet} | {row} | "
+                    f"{m.trade_card_amount} | {m.export_bill_amount}\n"
+                )
+        _emit(log_emit, f"[MISMATCH LOG] Saved: {out_path}")
+        return out_path
+    except Exception as e:
+        _emit(log_emit, f"[MISMATCH LOG] Failed to write mismatch log: {e}")
+        return ""
 
 
 class ProcessingLogic:
@@ -642,6 +993,7 @@ class ProcessingLogic:
         local_weekly_paths: list[str],
         export_bill_path: str,
         trade_card_paths: list[str],
+        feac_chart_path: str,
         *,
         vn_year: int,
         vn_month_abbrev: str,
@@ -650,7 +1002,7 @@ class ProcessingLogic:
         local_month_abbrev: str,
         local_week: int,
         holidays: set[date],
-    ) -> tuple[str, int, int, int, int, int]:
+    ) -> tuple[str, int, int, int, int, int, str]:
         ensure_olefile_available(self.log_emit)
         vn_sheet_name = format_sheet_name(vn_month_abbrev, vn_year, vn_week)
         local_sheet_name = format_sheet_name(local_month_abbrev, local_year, local_week)
@@ -662,6 +1014,8 @@ class ProcessingLogic:
             records.extend(read_vn_records(p, vn_sheet_name, log_emit=self.log_emit))
         for p in local_weekly_paths:
             records.extend(read_local_records(p, local_sheet_name, log_emit=self.log_emit))
+
+        ref_order = read_feac_ref_order(feac_chart_path, log_emit=self.log_emit)
 
         keep_vba = export_bill_path.lower().endswith(".xlsm")
         _emit(self.log_emit, f"[EXPORT BILL] Opening: {export_bill_path}")
@@ -692,6 +1046,7 @@ class ProcessingLogic:
             updated_total = 0
             missing_total = 0
             mismatched_total = 0
+            mismatch_rows: list[AmountMismatch] = []
             for tc_path in trade_card_paths:
                 value_date, payment_num, tc_entries = read_trade_card(tc_path, log_emit=self.log_emit)
                 updated, missing, mismatched = update_export_bill_from_trade_card(
@@ -701,11 +1056,17 @@ class ProcessingLogic:
                     tc_entries,
                     holidays,
                     invoice_index,
+                    mismatch_rows,
+                    os.path.basename(tc_path),
                     log_emit=self.log_emit,
                 )
                 updated_total += updated
                 missing_total += missing
                 mismatched_total += mismatched
+
+            # Regroup/sort rows by Value Date (col E) then FEAC order of Payment No (col J)
+            for ws in export_wb.worksheets:
+                regroup_and_sort_export_bill_sheet(ws, ref_order, log_emit=self.log_emit)
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             base, ext = os.path.splitext(export_bill_path)
@@ -714,7 +1075,8 @@ class ProcessingLogic:
             out_path = ensure_unique_path(f"{base}_{safe_vn}_{safe_local}_{ts}{ext}")
             _emit(self.log_emit, f"[SAVE] Writing output: {out_path}")
             export_wb.save(out_path)
-            return out_path, inserted, skipped_existing, updated_total, missing_total, mismatched_total
+            mismatch_log_path = write_mismatch_log_txt(out_path, export_wb, mismatch_rows, log_emit=self.log_emit)
+            return out_path, inserted, skipped_existing, updated_total, missing_total, mismatched_total, mismatch_log_path
         finally:
             export_wb.close()
 
@@ -764,6 +1126,12 @@ class MainWidget(QWidget):
         self.trade_box.setReadOnly(True)
         self.trade_box.setMaximumHeight(80)
         self.trade_box.setStyleSheet(shared_box_style)
+
+        self.feac_btn = PrimaryPushButton("Select Foreign Exchange Administrative Control Chart", self)
+        self.feac_box = QTextEdit(self)
+        self.feac_box.setReadOnly(True)
+        self.feac_box.setMaximumHeight(42)
+        self.feac_box.setStyleSheet(shared_box_style)
 
         # Inputs rows: VN and Local Year / Month / Week (separate)
         years: list[str] = []
@@ -866,6 +1234,7 @@ class MainWidget(QWidget):
 
         add_row(self.export_btn, self.export_box)
         add_row(self.trade_btn, self.trade_box)
+        add_row(self.feac_btn, self.feac_box)
 
         layout.addWidget(self.holidays_label)
         layout.addWidget(self.holidays_box)
@@ -877,11 +1246,12 @@ class MainWidget(QWidget):
         self.local_btn.clicked.connect(lambda: self._pick_files(self.local_box, "Select Local Weekly Export Chart(s)"))
         self.export_btn.clicked.connect(lambda: self._pick_file(self.export_box, "Select Export Bill"))
         self.trade_btn.clicked.connect(lambda: self._pick_files(self.trade_box, "Select Trade Card(s)"))
+        self.feac_btn.clicked.connect(lambda: self._pick_file(self.feac_box, "Select Foreign Exchange Administrative Control Chart"))
 
         self.log_message.connect(self._append_log)
         self.processing_done.connect(self._on_done)
 
-        for box in (self.vn_box, self.local_box, self.export_box, self.trade_box):
+        for box in (self.vn_box, self.local_box, self.export_box, self.trade_box, self.feac_box):
             box.textChanged.connect(self._check_ready)
 
         self.run_btn.clicked.connect(self._run)
@@ -902,7 +1272,7 @@ class MainWidget(QWidget):
         def has_any_line(box: QTextEdit) -> bool:
             return any(line.strip() for line in (box.toPlainText() or "").splitlines())
 
-        ready = all(has_any_line(b) for b in (self.vn_box, self.local_box, self.export_box, self.trade_box))
+        ready = all(has_any_line(b) for b in (self.vn_box, self.local_box, self.export_box, self.trade_box, self.feac_box))
         self.run_btn.setEnabled(bool(ready))
 
     def _append_log(self, text: str):
@@ -915,6 +1285,7 @@ class MainWidget(QWidget):
             self.local_btn,
             self.export_btn,
             self.trade_btn,
+            self.feac_btn,
             self.vn_year_combo,
             self.vn_month_combo,
             self.vn_week_combo,
@@ -926,6 +1297,7 @@ class MainWidget(QWidget):
             self.local_box,
             self.export_box,
             self.trade_box,
+            self.feac_box,
         ):
             w.setEnabled(enabled)
         self.run_btn.setEnabled(enabled and self.run_btn.isEnabled())
@@ -938,17 +1310,24 @@ class MainWidget(QWidget):
         local_paths = split_lines(self.local_box.toPlainText())
         export_lines = split_lines(self.export_box.toPlainText())
         trade_paths = split_lines(self.trade_box.toPlainText())
+        feac_lines = split_lines(self.feac_box.toPlainText())
 
         if len(export_lines) != 1:
             MessageBox("Invalid Export Bill", "Please select exactly one Export Bill file.", self).exec()
             return
         export_bill = export_lines[0]
 
+        if len(feac_lines) != 1:
+            MessageBox("Invalid FEAC chart", "Please select exactly one Foreign Exchange Administrative Control Chart file.", self).exec()
+            return
+        feac_chart = feac_lines[0]
+
         for paths, label in (
             (vn_paths, "VN Weekly Export Chart(s)"),
             (local_paths, "Local Weekly Export Chart(s)"),
             ([export_bill], "Export Bill"),
             (trade_paths, "Trade Card(s)"),
+            ([feac_chart], "Foreign Exchange Administrative Control Chart"),
         ):
             if not paths:
                 MessageBox("Missing file", f"Please select at least one file for: {label}", self).exec()
@@ -980,11 +1359,12 @@ class MainWidget(QWidget):
         def worker():
             try:
                 holidays = parse_holiday_lines(self.holidays_box.toPlainText(), log_emit=self.log_message.emit)
-                out_path, inserted, skipped, updated, missing, mismatched = self.logic.run(
+                out_path, inserted, skipped, updated, missing, mismatched, mismatch_log_path = self.logic.run(
                     vn_paths,
                     local_paths,
                     export_bill,
                     trade_paths,
+                    feac_chart,
                     vn_year=vn_year,
                     vn_month_abbrev=vn_month,
                     vn_week=vn_week,
@@ -995,12 +1375,13 @@ class MainWidget(QWidget):
                 )
                 msg = (
                     "Done!\n\n"
-                    f"Output: {out_path}\n"
-                    f"Inserted new invoices: {inserted}\n"
-                    f"Skipped existing invoices: {skipped}\n"
-                    f"Trade card updated invoices: {updated}\n"
-                    f"Trade card missing invoices: {missing}\n"
-                    f"Amount mismatches: {mismatched}"
+                    + f"Output: {out_path}\n"
+                    + (f"Mismatch log: {mismatch_log_path}\n" if mismatch_log_path else "")
+                    + f"Inserted new invoices: {inserted}\n"
+                    + f"Skipped existing invoices: {skipped}\n"
+                    + f"Trade card updated invoices: {updated}\n"
+                    + f"Trade card missing invoices: {missing}\n"
+                    + f"Amount mismatches: {mismatched}"
                 )
                 self.processing_done.emit(True, msg)
             except Exception as e:
