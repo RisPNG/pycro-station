@@ -197,6 +197,12 @@ class MainWidget(QWidget):
         self.run_btn.setEnabled(True)
         self.select_data_btn.setEnabled(True)
         self.select_lookup_btn.setEnabled(True)
+        title = "Processing complete" if fail == 0 else "Processing finished with issues"
+        lines = [f"Success: {ok}", f"Failed: {fail}", "", "Outputs are saved next to the input file(s)."]
+        msg = MessageBox(title, "\n".join(lines), self)
+        msg.yesButton.setText("OK")
+        msg.cancelButton.hide()
+        msg.exec()
 
 
 def get_widget():

@@ -103,6 +103,12 @@ class MainWidget(QWidget):
         self.log_message.emit(f'Completed: {ok} success, {fail} failed.')
         self.run_btn.setEnabled(True)
         self.select_btn.setEnabled(True)
+        title = 'Processing complete' if fail == 0 else 'Processing finished with issues'
+        lines = [f'Success: {ok}', f'Failed: {fail}']
+        msg = MessageBox(title, '\n'.join(lines), self)
+        msg.yesButton.setText('OK')
+        msg.cancelButton.hide()
+        msg.exec()
 
 
 def get_widget():

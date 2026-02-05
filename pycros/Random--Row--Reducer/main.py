@@ -336,6 +336,25 @@ class MainWidget(QWidget):
         self.select_btn.setEnabled(True)
         self.header_spin.setEnabled(True)
         self.keep_spin.setEnabled(True)
+        title = "Processing complete" if fail == 0 else "Processing finished with issues"
+        lines = [f"Success: {ok}", f"Failed: {fail}"]
+        if outputs:
+            try:
+                sample = outputs[:5]
+                lines.append("")
+                lines.append("Outputs:")
+                for p in sample:
+                    name = getattr(p, "name", None) or str(p)
+                    lines.append(f"- {name}")
+                remaining = len(outputs) - len(sample)
+                if remaining > 0:
+                    lines.append(f"... and {remaining} more")
+            except Exception:
+                pass
+        msg = MessageBox(title, "\n".join(lines), self)
+        msg.yesButton.setText("OK")
+        msg.cancelButton.hide()
+        msg.exec()
 
 
 def get_widget():
