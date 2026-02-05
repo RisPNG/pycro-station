@@ -477,43 +477,87 @@ def _autofit_columns(ws: Worksheet, _header_row: int, log: Callable[[str], None]
     """Autofit columns from B to the end based on content width."""
     COL_B = 2
     max_col = ws.max_column
-    max_row = ws.max_row
+    dims = {c: 0 for c in range(COL_B, max_col + 1)}
 
-    for col_idx in range(COL_B, max_col + 1):
-        max_length = 0
-        for row_idx in range(1, max_row + 1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            if cell.value is not None:
-                cell_len = len(str(cell.value))
-                if cell_len > max_length:
-                    max_length = cell_len
+    for cell in _iter_value_cells(ws):
+        c = cell.column
+        if c < COL_B or c > max_col:
+            continue
+        try:
+            dims[c] = max(dims[c], len(str(cell.value)))
+        except Exception:
+            continue
 
-        if max_length > 0:
-            adjusted_width = min(max(max_length + 2, 8), 60)
-            ws.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
+    for col_idx, max_len in dims.items():
+        if max_len <= 0:
+            continue
+        adjusted_width = min(max(max_len + 2, 8), 60)
+        ws.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
 
     log(f"    - Autofit columns B to {get_column_letter(max_col)}")
 
 
+def _iter_value_cells(ws: Worksheet):
+    """Iterate existing (non-empty) worksheet cells without creating blank cells."""
+    cells = getattr(ws, "_cells", None)
+    if not isinstance(cells, dict):
+        return iter(())
+    return (
+        cell
+        for cell in cells.values()
+        if cell is not None
+        and cell.value is not None
+        and not (isinstance(cell.value, str) and cell.value.strip() == "")
+    )
+
+
+def _iter_existing_value_cells_in_column(ws: Worksheet, col: int, start_row: int, end_row: int):
+    """Iterate existing (non-empty) value cells in a single column without creating blanks."""
+    cells = getattr(ws, "_cells", None)
+    if not isinstance(cells, dict):
+        return
+    try:
+        col = int(col)
+        start_row = int(start_row)
+        end_row = int(end_row)
+    except Exception:
+        return
+    if col < 1 or start_row < 1 or end_row < start_row:
+        return
+    for r in range(start_row, end_row + 1):
+        cell = cells.get((r, col))
+        if cell is None:
+            continue
+        v = cell.value
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        yield cell
+
+
 def _find_header_row(ws: Worksheet) -> Optional[int]:
     """Find the row containing 'Embellishment Cost' header."""
-    for row_idx in range(1, ws.max_row + 1):
-        for col_idx in range(1, ws.max_column + 1):
-            cell = ws.cell(row=row_idx, column=col_idx)
-            if _norm(cell.value).lower() == HEADER_MARKER:
-                return row_idx
-    return None
+    found: Optional[Tuple[int, int]] = None
+    for cell in _iter_value_cells(ws):
+        if _norm(cell.value).lower() != HEADER_MARKER:
+            continue
+        candidate = (cell.row, cell.column)
+        if found is None or candidate < found:
+            found = candidate
+    return found[0] if found else None
 
 
 def _find_season_value(ws: Worksheet) -> Optional[str]:
     """Find 'Season :' cell and extract the season value (next 5 characters)."""
-    for row in ws.iter_rows():
-        for cell in row:
-            val = _norm(cell.value)
-            if val.lower().startswith("season :") or val.lower().startswith("season:"):
-                match = re.search(r'season\s*:\s*(.{1,5})', val, re.IGNORECASE)
-                if match:
-                    return match.group(1).strip()
+    for cell in _iter_value_cells(ws):
+        val = _norm(cell.value)
+        lower = val.lower()
+        if not (lower.startswith("season :") or lower.startswith("season:")):
+            continue
+        match = re.search(r"season\s*:\s*(.{1,5})", val, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
     return None
 
 
@@ -541,36 +585,47 @@ def _delete_gain_rows(
 ) -> None:
     """Delete rows where column I (9) has 'Gain' or 'Gain/pc', and empty rows."""
     col_i = 9
-    max_col = ws.max_column
+    max_row = ws.max_row
 
-    gain_rows = []
-    empty_rows = []
+    gain_rows: list[int] = []
+    for cell in _iter_existing_value_cells_in_column(ws, col_i, start_row=header_row + 1, end_row=max_row) or ():
+        if _norm(cell.value).lower() in GAIN_VALUES:
+            gain_rows.append(cell.row)
 
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        cell = ws.cell(row=row_idx, column=col_i)
-        val = _norm(cell.value).lower()
+    nonempty_rows: set[int] = set()
+    for cell in _iter_value_cells(ws):
+        if cell.row > header_row:
+            nonempty_rows.add(cell.row)
 
-        if val in GAIN_VALUES:
-            gain_rows.append(row_idx)
-        else:
-            is_empty = True
-            for col_idx in range(1, max_col + 1):
-                cell_val = ws.cell(row=row_idx, column=col_idx).value
-                if cell_val is not None and str(cell_val).strip() != "":
-                    is_empty = False
-                    break
-            if is_empty:
-                empty_rows.append(row_idx)
+    empty_rows = [r for r in range(header_row + 1, max_row + 1) if r not in nonempty_rows]
 
     rows_to_delete = sorted(set(gain_rows + empty_rows), reverse=True)
 
-    for row_idx in rows_to_delete:
-        ws.delete_rows(row_idx)
+    _delete_rows(ws, rows_to_delete)
 
     if gain_rows:
         log(f"    - Deleted {len(gain_rows)} rows with Gain/Gain/pc values")
     if empty_rows:
         log(f"    - Deleted {len(empty_rows)} empty rows")
+
+
+def _delete_rows(ws: Worksheet, row_indices: list[int]) -> None:
+    """Delete rows using grouped ranges to reduce shifting overhead."""
+    if not row_indices:
+        return
+    rows = sorted({int(r) for r in row_indices if r and int(r) > 0}, reverse=True)
+    if not rows:
+        return
+
+    group_start = rows[0]
+    group_end = rows[0]
+    for r in rows[1:]:
+        if r == group_end - 1:
+            group_end = r
+            continue
+        ws.delete_rows(group_end, amount=(group_start - group_end + 1))
+        group_start = group_end = r
+    ws.delete_rows(group_end, amount=(group_start - group_end + 1))
 
 
 def _insert_new_columns(
@@ -582,96 +637,274 @@ def _insert_new_columns(
     log: Callable[[str], None],
 ) -> None:
     """Insert all new columns with proper values."""
+    season_text = season_value or ""
 
-    new_cols = {}
+    # Pre-merge lookup maps for faster per-row access (preserve first-match semantics).
+    wr_by_season_style: dict[str, Any] = {}
+    ppg_by_season_style: dict[str, str] = {}
+    for pco_data in lookup_data.get("pco2175_sheets", []) or []:
+        for k, v in (pco_data.get("season_style_to_wr") or {}).items():
+            if k not in wr_by_season_style:
+                wr_by_season_style[k] = v
+        for k, v in (pco_data.get("season_style_to_ppg") or {}).items():
+            if k not in ppg_by_season_style:
+                ppg_by_season_style[k] = v
 
-    def insert_column_after(after_col: str, new_header: str, track_key: str, calc_func: Callable) -> Optional[int]:
-        """Helper to insert a column after a specified column."""
-        if after_col not in headers and after_col not in new_cols:
-            return None
+    pid103_by_style: dict[str, Any] = {}
+    for pid_data in lookup_data.get("pid103_sheets", []) or []:
+        for k, v in (pid_data.get("style_to_total") or {}).items():
+            if k not in pid103_by_style:
+                pid103_by_style[k] = v
 
-        base_col = headers.get(after_col) or new_cols.get(after_col)
-        insert_at = base_col + 1
-        ws.insert_cols(insert_at)
+    class _ColSpec:
+        __slots__ = ("after_key", "header", "key")
 
-        for old_key in list(headers.keys()):
-            if headers[old_key] >= insert_at:
-                headers[old_key] += 1
-        for old_key in list(new_cols.keys()):
-            if new_cols[old_key] >= insert_at:
-                new_cols[old_key] += 1
+        def __init__(self, after_key: str, header: str, key: str):
+            self.after_key = after_key
+            self.header = header
+            self.key = key
 
-        ws.cell(row=header_row, column=insert_at).value = new_header
-        _make_bold(ws.cell(row=header_row, column=insert_at))
-        _apply_gray_fill(ws.cell(row=header_row, column=insert_at))
+    blocks: dict[str, list[_ColSpec]] = {}
 
-        new_cols[track_key] = insert_at
-        headers[new_header.lower()] = insert_at
-
-        for row_idx in range(header_row + 1, ws.max_row + 1):
-            row_data = _get_row_data(ws, row_idx, headers)
-            row_data.update({k: ws.cell(row=row_idx, column=v).value for k, v in new_cols.items()})
-            value = calc_func(row_idx, row_data)
-            ws.cell(row=row_idx, column=insert_at).value = value
-
-        log(f"    - Inserted column '{new_header}' after '{after_col}'")
-        return insert_at
+    def add_block(after_key: str, spec: _ColSpec):
+        blocks.setdefault(after_key, []).append(spec)
 
     if "buyer" in headers:
-        insert_column_after("buyer", "Season", "season",
-            lambda r, d: season_value or "")
-
+        add_block("buyer", _ColSpec("buyer", "Season", "season"))
     if "job number" in headers:
-        insert_column_after("job number", "Job Short", "job_short",
-            lambda r, d: _calc_job_short(r, d))
-
+        add_block("job number", _ColSpec("job number", "Job Short", "job_short"))
     if "p.type" in headers:
-        insert_column_after("p.type", "P.Type Group", "p_type_group",
-            lambda r, d: _lookup_prod_type(r, d, headers, lookup_data))
-
+        add_block("p.type", _ColSpec("p.type", "P.Type Group", "p_type_group"))
     if "p.cat" in headers:
-        insert_column_after("p.cat", "P.Cat Group", "p_cat_group",
-            lambda r, d: _lookup_prod_cat(r, d, headers, lookup_data))
-
+        add_block("p.cat", _ColSpec("p.cat", "P.Cat Group", "p_cat_group"))
     if "style #" in headers:
-        insert_column_after("style #", "Season+Style", "season_style",
-            lambda r, d: _calc_season_style(r, d, headers, season_value))
-
-    if "season_style" in new_cols:
-        insert_column_after("season_style", "TS&WR", "ts_wr",
-            lambda r, d: _lookup_ts_wr(r, d, headers, lookup_data, season_value))
-
+        add_block("style #", _ColSpec("style #", "Season+Style", "season_style"))
+        add_block("style #", _ColSpec("style #", "TS&WR", "ts_wr"))
     if "embellishment cost" in headers:
-        insert_column_after("embellishment cost", "Checking", "checking_emb",
-            lambda r, d: _calc_emb_checking(r, d, headers))
-
+        add_block("embellishment cost", _ColSpec("embellishment cost", "Checking", "checking_emb"))
     if "gross cm" in headers:
-        insert_column_after("gross cm", "Checking", "checking_gross",
-            lambda r, d: _calc_gross_cm_checking(r, d, headers))
-
+        add_block("gross cm", _ColSpec("gross cm", "Checking", "checking_gross"))
     if "net cm" in headers:
-        insert_column_after("net cm", "Checking", "checking_net",
-            lambda r, d: _calc_net_cm_checking(r, d, headers))
-
+        add_block("net cm", _ColSpec("net cm", "Checking", "checking_net"))
     if "ntu(min)" in headers:
-        insert_column_after("ntu(min)", "pid103", "pid103",
-            lambda r, d: _lookup_pid103(r, d, headers, lookup_data))
-
-    if "pid103" in new_cols:
-        insert_column_after("pid103", "Checking", "checking_ntu",
-            lambda r, d: _calc_ntu_checking(r, d, headers, new_cols))
-
-    if "checking_ntu" in new_cols:
-        insert_column_after("checking_ntu", "Total NTU", "total_ntu",
-            lambda r, d: _calc_total_ntu(r, d, headers, new_cols))
-
-    if "total_ntu" in new_cols:
-        insert_column_after("total_ntu", "Status", "status",
-            lambda r, d: _calc_status(r, d, headers))
-
+        add_block("ntu(min)", _ColSpec("ntu(min)", "pid103", "pid103"))
+        add_block("ntu(min)", _ColSpec("ntu(min)", "Checking", "checking_ntu"))
+        add_block("ntu(min)", _ColSpec("ntu(min)", "Total NTU", "total_ntu"))
+        add_block("ntu(min)", _ColSpec("ntu(min)", "Status", "status"))
     if "line construct" in headers:
-        insert_column_after("line construct", "PPG", "ppg",
-            lambda r, d: _lookup_ppg(r, d, headers, lookup_data, season_value))
+        add_block("line construct", _ColSpec("line construct", "PPG", "ppg"))
+
+    # Insert blocks from right-to-left to minimize shifting work.
+    insert_plan: list[tuple[int, str]] = []
+    for after_key in blocks.keys():
+        insert_plan.append((headers[after_key], after_key))
+    insert_plan.sort(reverse=True)
+
+    new_cols: dict[str, int] = {}
+    inserted_specs: list[_ColSpec] = []
+
+    def shift_indices(mapping: dict[str, int], insert_at: int, amount: int):
+        for k in list(mapping.keys()):
+            if mapping[k] >= insert_at:
+                mapping[k] += amount
+
+    for _, after_key in insert_plan:
+        specs = blocks.get(after_key) or []
+        if not specs:
+            continue
+        base_col = headers.get(after_key)
+        if not base_col:
+            continue
+        insert_at = base_col + 1
+        amount = len(specs)
+
+        ws.insert_cols(insert_at, amount=amount)
+        shift_indices(headers, insert_at, amount)
+        shift_indices(new_cols, insert_at, amount)
+
+        for offset, spec in enumerate(specs):
+            col_idx = insert_at + offset
+            new_cols[spec.key] = col_idx
+            inserted_specs.append(spec)
+
+    # Write headers + styles (small; safe to do now that insertions are final)
+    for spec in inserted_specs:
+        col_idx = new_cols.get(spec.key)
+        if not col_idx:
+            continue
+        header_cell = ws.cell(row=header_row, column=col_idx)
+        header_cell.value = spec.header
+        _make_bold(header_cell)
+        _apply_gray_fill(header_cell)
+        log(f"    - Inserted column '{spec.header}' after '{spec.after_key}'")
+
+    # Pre-compute frequently used columns and letters for formulas.
+    cell = ws.cell
+    max_row = ws.max_row
+    cells = getattr(ws, "_cells", None)
+    if not isinstance(cells, dict):
+        cells = {}
+
+    def get_value(row: int, col: Optional[int]):
+        if not col:
+            return None
+        c = cells.get((row, col))
+        return c.value if c is not None else None
+
+    job_col = headers.get("job number")
+    p_type_col = headers.get("p.type")
+    p_cat_col = headers.get("p.cat")
+    style_col = headers.get("style #")
+    ntu_col = headers.get("ntu(min)")
+
+    quantity_col = None
+    for header_name, col_idx in headers.items():
+        lower = header_name.lower()
+        if "quantity" in lower or "qty" in lower:
+            quantity_col = col_idx
+            break
+
+    po_vtec_col = None
+    for header_name, col_idx in headers.items():
+        lower = header_name.lower()
+        if "/po-vtec cm" in lower or "po-vtec cm" in lower:
+            po_vtec_col = col_idx
+            break
+
+    po_quo_col = None
+    for header_name, col_idx in headers.items():
+        if "po/quo" in header_name.lower():
+            po_quo_col = col_idx
+            break
+
+    emb_col = headers.get("embellishment cost")
+    gross_col = headers.get("gross cm")
+    net_col = headers.get("net cm")
+
+    sales_col = headers.get("sales usd")
+    material_col = headers.get("material cost")
+    other_col = headers.get("other cost")
+
+    pid103_col = new_cols.get("pid103")
+
+    emb_letter = get_column_letter(emb_col) if emb_col else ""
+    gross_letter = get_column_letter(gross_col) if gross_col else ""
+    ntu_letter = get_column_letter(ntu_col) if ntu_col else ""
+    pid103_letter = get_column_letter(pid103_col) if pid103_col else ""
+    qty_letter = get_column_letter(quantity_col) if quantity_col else ""
+
+    po_vtec_letter = get_column_letter(po_vtec_col) if po_vtec_col else ""
+    net_letter = get_column_letter(net_col) if net_col else ""
+
+    gross_dep_letters: list[str] = []
+    for col in (sales_col, material_col, emb_col, other_col):
+        if col:
+            gross_dep_letters.append(get_column_letter(col))
+
+    emb_component_letters: list[str] = []
+    if emb_col:
+        for comp in EMBELLISHMENT_COMPONENTS:
+            for header_name, col_idx in headers.items():
+                if comp in header_name.lower():
+                    emb_component_letters.append(get_column_letter(col_idx))
+
+    # Fill inserted column values row-by-row.
+    season_col = new_cols.get("season")
+    job_short_col = new_cols.get("job_short")
+    p_type_group_col = new_cols.get("p_type_group")
+    p_cat_group_col = new_cols.get("p_cat_group")
+    season_style_col = new_cols.get("season_style")
+    ts_wr_col = new_cols.get("ts_wr")
+    checking_emb_col = new_cols.get("checking_emb")
+    checking_gross_col = new_cols.get("checking_gross")
+    checking_net_col = new_cols.get("checking_net")
+    checking_ntu_col = new_cols.get("checking_ntu")
+    total_ntu_col = new_cols.get("total_ntu")
+    status_col = new_cols.get("status")
+    ppg_col = new_cols.get("ppg")
+
+    for row_idx in range(header_row + 1, max_row + 1):
+        if season_col:
+            cell(row=row_idx, column=season_col).value = season_text
+
+        job_number = _norm(get_value(row_idx, job_col))
+        if job_short_col:
+            cell(row=row_idx, column=job_short_col).value = job_number[:5] if job_number else ""
+
+        if p_type_group_col:
+            p_type = _norm(get_value(row_idx, p_type_col)).lower()
+            cell(row=row_idx, column=p_type_group_col).value = lookup_data.get("prod_type", {}).get(p_type, "")
+
+        if p_cat_group_col:
+            p_cat = _norm(get_value(row_idx, p_cat_col)).lower()
+            cell(row=row_idx, column=p_cat_group_col).value = lookup_data.get("prod_cat", {}).get(p_cat, "")
+
+        style_norm = _norm(get_value(row_idx, style_col))
+        style_lower = style_norm.lower() if style_norm else ""
+        season_style_val = f"{season_text}{style_norm}" if style_norm else ""
+        season_style_lower = season_style_val.lower() if season_style_val else ""
+
+        if season_style_col:
+            cell(row=row_idx, column=season_style_col).value = season_style_val
+
+        if ts_wr_col:
+            cell(row=row_idx, column=ts_wr_col).value = wr_by_season_style.get(season_style_lower, "")
+
+        if pid103_col:
+            pid_val = pid103_by_style.get(style_lower, "")
+            if pid_val == "" and style_lower and row_idx <= 10 and lookup_data.get("pid103_sheets"):
+                try:
+                    available = list((lookup_data["pid103_sheets"][0].get("style_to_total") or {}).keys())[:3]
+                    print(
+                        f"DEBUG row {row_idx}: Looking for '{style_lower}' (raw: '{style_norm}'), available samples: {available}"
+                    )
+                except Exception:
+                    pass
+            cell(row=row_idx, column=pid103_col).value = pid_val
+
+        if checking_emb_col and emb_col:
+            if not emb_component_letters:
+                formula = f"=ROUND({emb_letter}{row_idx},0)"
+            else:
+                parts = [f"{letter}{row_idx}" for letter in emb_component_letters]
+                formula = f"=ROUND({emb_letter}{row_idx}-" + "-".join(parts) + ",0)"
+            cell(row=row_idx, column=checking_emb_col).value = formula
+
+        if checking_gross_col and gross_col:
+            if not gross_dep_letters:
+                formula = f"={gross_letter}{row_idx}"
+            else:
+                deps = "-".join([f"{letter}{row_idx}" for letter in gross_dep_letters])
+                formula = f"={gross_letter}{row_idx}-({deps})"
+            cell(row=row_idx, column=checking_gross_col).value = formula
+
+        if checking_net_col and gross_col:
+            formula = f"={gross_letter}{row_idx}"
+            if po_vtec_letter:
+                formula += f"-{po_vtec_letter}{row_idx}"
+            if net_letter:
+                formula += f"-{net_letter}{row_idx}"
+            cell(row=row_idx, column=checking_net_col).value = formula
+
+        if checking_ntu_col and ntu_letter and pid103_letter:
+            cell(row=row_idx, column=checking_ntu_col).value = f"={ntu_letter}{row_idx}-{pid103_letter}{row_idx}"
+
+        if total_ntu_col and pid103_letter:
+            if qty_letter:
+                cell(row=row_idx, column=total_ntu_col).value = f"={pid103_letter}{row_idx}*{qty_letter}{row_idx}"
+            else:
+                cell(row=row_idx, column=total_ntu_col).value = f"={pid103_letter}{row_idx}"
+
+        if status_col:
+            po_quo = _norm(get_value(row_idx, po_quo_col)).upper()
+            po_vtec_cm = _to_number(get_value(row_idx, po_vtec_col))
+            if po_quo in ("Q", "PO"):
+                cell(row=row_idx, column=status_col).value = "P" if po_vtec_cm == 0 else "C"
+            else:
+                cell(row=row_idx, column=status_col).value = ""
+
+        if ppg_col:
+            cell(row=row_idx, column=ppg_col).value = ppg_by_season_style.get(season_style_lower, "")
 
 
 def _get_row_data(ws: Worksheet, row_idx: int, headers: Dict[str, int]) -> Dict[str, Any]:
@@ -734,7 +967,7 @@ def _lookup_ts_wr(
 
 
 def _calc_emb_checking(row_idx: int, _row_data: Dict[str, Any], headers: Dict[str, int]) -> str:
-    """Return formula: ROUND(Embellishment Cost - (Emb + Printing + APC + PAD + Laser + Bonding), 3)."""
+    """Return formula: ROUND(Embellishment Cost - (Emb + Printing + APC + PAD + Laser + Bonding), 0)."""
     emb_col = headers.get("embellishment cost")
     if not emb_col:
         return ""
@@ -748,9 +981,9 @@ def _calc_emb_checking(row_idx: int, _row_data: Dict[str, Any], headers: Dict[st
                 component_refs.append(f"{get_column_letter(col_idx)}{row_idx}")
 
     if not component_refs:
-        return f"=ROUND({emb_ref},3)"
+        return f"=ROUND({emb_ref},0)"
 
-    return f"=ROUND({emb_ref}-" + "-".join(component_refs) + ",3)"
+    return f"=ROUND({emb_ref}-" + "-".join(component_refs) + ",0)"
 
 
 def _calc_gross_cm_checking(row_idx: int, _row_data: Dict[str, Any], headers: Dict[str, int]) -> str:
