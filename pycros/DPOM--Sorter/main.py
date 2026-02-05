@@ -414,13 +414,13 @@ class ProcessingLogic:
             """Preserve SortRecord ordering across style groups (esp. split materials)."""
             items = style_groups.get(k, [])
             if not items:
-                return (0, 9, "", datetime.max, "", "", "", "", "", k)
+                return (0, "", 9, datetime.max, "", "", "", "", "", k)
 
             first = items[0]
             return (
                 year_sort_value(first.get('year')),
-                first.get('season_rank', 9),
                 first.get('style_head', ""),
+                first.get('season_rank', 9),
                 first.get('ogac_dt') or datetime.max,
                 first.get('po', ""),
                 first.get('style_cw', ""),
