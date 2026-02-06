@@ -400,13 +400,13 @@ class ProcessingLogic:
         """Build final output structure - each PO gets its own Total OGAC Qty (matching Total PO Qty)"""
         final_rows = []
 
-        # Group by base Style (Material without colorway). Item rows still keep full Material display.
+        # Group by Style (for selected countries, keep full Material incl. colorway).
         style_groups = defaultdict(list)
         style_keep_colorway = {}
         for row in pivoted_rows:
             country_norm = normalize_country(row.get('country'))
             keep_colorway = country_norm in SPLIT_MATERIAL_BY_DEST_COUNTRY
-            style_key = row['style_head']
+            style_key = row['style_full'] if keep_colorway else row['style_head']
             style_groups[style_key].append(row)
             style_keep_colorway[style_key] = style_keep_colorway.get(style_key, False) or keep_colorway
 
@@ -414,13 +414,16 @@ class ProcessingLogic:
             """Preserve SortRecord ordering across style groups (esp. split materials)."""
             items = style_groups.get(k, [])
             if not items:
-                return (0, "", 9, datetime.max, "", "", "", "", "", k)
+                return (0, "", datetime.max, datetime.max, 9, "", "", "", "", "", k)
 
             first = items[0]
+            ogac_vals = [i.get('ogac_dt') for i in items if isinstance(i.get('ogac_dt'), datetime)]
+            max_ogac = max(ogac_vals) if ogac_vals else datetime.max
             return (
                 year_sort_value(first.get('year')),
                 first.get('style_head', ""),
                 first.get('ogac_dt') or datetime.max,
+                max_ogac,
                 first.get('season_rank', 9),
                 first.get('po', ""),
                 first.get('style_cw', ""),
