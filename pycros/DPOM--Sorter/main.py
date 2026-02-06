@@ -327,12 +327,12 @@ class ProcessingLogic:
             }
             pivoted_rows.append(obj)
 
-        # Step 5: Sort records (Year + Planning Season first)
+        # Step 5: Sort records (Year + Style + OGAC first)
         pivoted_rows.sort(key=lambda x: (
             year_sort_value(x.get('year')),
-            x['season_rank'],
             x['style_head'],
             x['ogac_dt'] or datetime.max,
+            x['season_rank'],
             x['po'],
             x['style_cw'],
             x['po_line'],
@@ -400,13 +400,13 @@ class ProcessingLogic:
         """Build final output structure - each PO gets its own Total OGAC Qty (matching Total PO Qty)"""
         final_rows = []
 
-        # Group by Style (for selected countries, keep full Material incl. colorway)
+        # Group by base Style (Material without colorway). Item rows still keep full Material display.
         style_groups = defaultdict(list)
         style_keep_colorway = {}
         for row in pivoted_rows:
             country_norm = normalize_country(row.get('country'))
             keep_colorway = country_norm in SPLIT_MATERIAL_BY_DEST_COUNTRY
-            style_key = row['style_full'] if keep_colorway else row['style_head']
+            style_key = row['style_head']
             style_groups[style_key].append(row)
             style_keep_colorway[style_key] = style_keep_colorway.get(style_key, False) or keep_colorway
 
@@ -420,8 +420,8 @@ class ProcessingLogic:
             return (
                 year_sort_value(first.get('year')),
                 first.get('style_head', ""),
-                first.get('season_rank', 9),
                 first.get('ogac_dt') or datetime.max,
+                first.get('season_rank', 9),
                 first.get('po', ""),
                 first.get('style_cw', ""),
                 first.get('po_line', ""),
@@ -676,15 +676,9 @@ class ProcessingLogic:
             # Get data
             raw = row_obj['data']['raw']
 
-            # Determine style code (strip colorway for total rows)
+            # Determine style code (strip colorway for any non-item summary rows)
             style_val = raw[COL_STYLE]
-            strip_colorway = (
-                row_type in ['TOTAL_PO', 'MONEY_PO']
-                or (
-                    row_type in ['TOTAL_STYLE', 'TOTAL_OGAC', 'MONEY_STYLE']
-                    and not row_obj.get('keep_colorway')
-                )
-            )
+            strip_colorway = row_type != 'ITEM'
             if strip_colorway and "-" in str(style_val):
                 style_val = str(style_val).split("-")[0]
 
@@ -727,14 +721,17 @@ class ProcessingLogic:
 
             # Column 16: Estimate BusWeekDate (calculated from OGAC)
             ogac_dt = row_obj['data'].get('ogac_dt')
-            if ogac_dt:
+            if ogac_dt and row_type not in ['TOTAL_STYLE', 'MONEY_STYLE']:
                 calc_dt = ogac_dt - timedelta(days=GIPT)
                 # Get previous Monday
                 bus_dt = calc_dt - timedelta(days=calc_dt.weekday())
                 ws.cell(curr_row, 16, bus_dt.strftime("%m/%d/%Y"))
 
             # Column 17: OGAC Date
-            ws.cell(curr_row, 17, format_date_val(raw[COL_OGAC]))
+            if row_type in ['TOTAL_STYLE', 'MONEY_STYLE']:
+                ws.cell(curr_row, 17, "")
+            else:
+                ws.cell(curr_row, 17, format_date_val(raw[COL_OGAC]))
 
             # Column 18-20: Purchase Group Code, Name, Plant
             ws.cell(curr_row, 18, raw[COL_PUR_GROUP_CODE])
