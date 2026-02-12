@@ -16,4 +16,4 @@
 
 Duplicates excel to potentially fix issues and bypass restrictions.
 
-Legacy `.xls` files are supported by converting to `.xlsx` (best-effort; formulas/styles may not be fully preserved).
+Legacy `.xls` files are supported by converting to `.xlsx` (streaming values only; formulas/styles/merges may not be preserved).

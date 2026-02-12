@@ -2,6 +2,7 @@ import os
 import threading
 import warnings
 from datetime import datetime
+from time import perf_counter
 from typing import List, Tuple, Any, Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -35,80 +36,139 @@ def _emit(log_emit, text: str):
     print(text)
 
 
-def convert_xls_to_xlsx_workbook(xls_path: str, log_emit=None) -> Workbook:
+def convert_xls_to_xlsx_trimmed(xls_path: str, out_path: str, log_emit=None) -> None:
     """
-    Convert a legacy .xls workbook into an openpyxl Workbook (xlsx-compatible).
+    Convert a legacy .xls workbook into a trimmed .xlsx file.
 
     Notes:
-    - This is a best-effort conversion focused on values + basic structure.
-    - Excel formulas and rich formatting from .xls cannot be reliably preserved
-      with xlrd alone; callers should treat the result as data-focused.
+    - This is a best-effort conversion focused on values (data-focused).
+    - Formulas, styles, and other rich formatting from .xls are not preserved.
+    - Uses openpyxl write-only mode for speed/memory on large files.
     """
     if xlrd is None:
         raise RuntimeError("Missing dependency: xlrd is required to process .xls files.")
 
-    _emit(log_emit, "Legacy .xls detected; converting to .xlsx (best-effort; formulas/styles may not be preserved).")
+    _emit(log_emit, "Legacy .xls detected; converting to .xlsx (streaming; best-effort values only).")
 
-    # Some xlrd features (like merged cell info) may require formatting_info=True.
-    # Try to enable it, but fall back gracefully if the file/library doesn't support it.
+    open_started = perf_counter()
+    # Prefer on_demand + ragged_rows to reduce memory and avoid scanning huge trailing blanks.
     try:
-        book = xlrd.open_workbook(xls_path, formatting_info=True)
-    except Exception:
-        book = xlrd.open_workbook(xls_path)
+        book = xlrd.open_workbook(xls_path, on_demand=True, ragged_rows=True)
+    except TypeError:
+        try:
+            book = xlrd.open_workbook(xls_path, on_demand=True)
+        except TypeError:
+            book = xlrd.open_workbook(xls_path)
 
-    out_wb = Workbook()
-    # Remove the default sheet if we are going to add real sheets.
-    if book.nsheets > 0 and out_wb.worksheets:
-        out_wb.remove(out_wb.worksheets[0])
+    open_elapsed = perf_counter() - open_started
+    _emit(log_emit, f".xls opened in {open_elapsed:.2f}s with {book.nsheets} sheet(s).")
 
-    for sheet in book.sheets():
-        ws = out_wb.create_sheet(title=sheet.name)
+    xldate_as_datetime = getattr(xlrd, "xldate_as_datetime", None)
+    error_text_from_code = getattr(xlrd, "error_text_from_code", {}) or {}
 
-        # Copy cell values
-        for r in range(sheet.nrows):
-            for c in range(sheet.ncols):
+    XL_CELL_DATE = getattr(xlrd, "XL_CELL_DATE", 3)
+    XL_CELL_BOOLEAN = getattr(xlrd, "XL_CELL_BOOLEAN", 4)
+    XL_CELL_ERROR = getattr(xlrd, "XL_CELL_ERROR", 5)
+    XL_CELL_EMPTY = getattr(xlrd, "XL_CELL_EMPTY", 0)
+    XL_CELL_BLANK = getattr(xlrd, "XL_CELL_BLANK", 6)
+
+    out_wb = Workbook(write_only=True)
+
+    try:
+        for sheet_idx in range(book.nsheets):
+            sheet = book.sheet_by_index(sheet_idx)
+            title = sheet.name or f"Sheet{sheet_idx + 1}"
+            ws_out = out_wb.create_sheet(title=title)
+
+            nrows = sheet.nrows or 0
+            ncols = sheet.ncols or 0
+            _emit(log_emit, f"Converting sheet {sheet_idx + 1}/{book.nsheets}: {title} (rows={nrows}, cols={ncols})")
+
+            log_every = max(500, nrows // 20) if nrows else 0
+            pending_blank_rows = 0
+
+            sheet_started = perf_counter()
+            for r in range(nrows):
+                if log_every and r and (r % log_every == 0):
+                    _emit(log_emit, f"  {title}: {r}/{nrows} rows converted...")
+
                 try:
-                    cell = sheet.cell(r, c)
+                    end_col = sheet.row_len(r)
                 except Exception:
+                    end_col = ncols
+
+                if not end_col:
+                    pending_blank_rows += 1
                     continue
 
-                value = cell.value
-                ctype = getattr(cell, "ctype", None)
+                try:
+                    row_values = sheet.row_values(r, 0, end_col)
+                    row_types = sheet.row_types(r, 0, end_col)
+                except Exception:
+                    # Fallback: treat as blank row if row access fails.
+                    pending_blank_rows += 1
+                    continue
 
-                if ctype is not None:
+                # Find the last non-empty cell so we can skip converting/writing trailing blanks.
+                last_non_empty = 0
+                for rev_idx in range(len(row_values) - 1, -1, -1):
+                    value = row_values[rev_idx]
+                    ctype = row_types[rev_idx]
+                    if ctype in (XL_CELL_EMPTY, XL_CELL_BLANK):
+                        continue
+                    if value == "":
+                        continue
+                    last_non_empty = rev_idx + 1
+                    break
+
+                if last_non_empty == 0:
+                    pending_blank_rows += 1
+                    continue
+
+                converted_row: List[Any] = []
+                for value, ctype in zip(row_values[:last_non_empty], row_types[:last_non_empty]):
                     try:
-                        if ctype == xlrd.XL_CELL_DATE:
-                            value = xlrd.xldate_as_datetime(value, book.datemode)
-                        elif ctype == xlrd.XL_CELL_BOOLEAN:
+                        if ctype == XL_CELL_DATE and xldate_as_datetime is not None:
+                            value = xldate_as_datetime(value, book.datemode)
+                        elif ctype == XL_CELL_BOOLEAN:
                             value = bool(value)
-                        elif ctype == xlrd.XL_CELL_ERROR:
-                            value = getattr(xlrd, "error_text_from_code", {}).get(value)
-                        elif ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                        elif ctype == XL_CELL_ERROR:
+                            value = error_text_from_code.get(value)
+                        elif ctype in (XL_CELL_EMPTY, XL_CELL_BLANK):
                             value = None
                     except Exception:
-                        # Keep whatever raw value we have if conversion fails.
                         pass
 
-                ws.cell(row=r + 1, column=c + 1, value=value)
+                    if value == "":
+                        value = None
 
-        # Copy merged cells (best-effort)
+                    converted_row.append(value)
+                # last_non_empty is guaranteed > 0 and points at a non-empty cell.
+
+                if pending_blank_rows:
+                    for _ in range(pending_blank_rows):
+                        ws_out.append([])  # preserves internal blank rows
+                    pending_blank_rows = 0
+
+                ws_out.append(converted_row)
+
+            sheet_elapsed = perf_counter() - sheet_started
+            _emit(log_emit, f"Finished sheet {title} in {sheet_elapsed:.2f}s.")
+
+            try:
+                book.unload_sheet(sheet_idx)
+            except Exception:
+                pass
+
+        save_started = perf_counter()
+        out_wb.save(out_path)
+        save_elapsed = perf_counter() - save_started
+        _emit(log_emit, f"Saved converted .xlsx in {save_elapsed:.2f}s.")
+    finally:
         try:
-            merged = getattr(sheet, "merged_cells", None) or []
-            for rlow, rhigh, clow, chigh in merged:
-                ws.merge_cells(
-                    start_row=rlow + 1,
-                    end_row=rhigh,
-                    start_column=clow + 1,
-                    end_column=chigh,
-                )
+            book.release_resources()
         except Exception:
             pass
-
-    # Ensure the workbook is saveable even if the source had no sheets.
-    if not out_wb.worksheets:
-        out_wb.create_sheet(title="Sheet1")
-
-    return out_wb
 
 class MainWidget(QWidget):
     log_message = Signal(str)
@@ -293,7 +353,7 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
 
     For .xlsx-based files, this preserves data, formulas, and styles.
     For legacy .xls files, this performs a best-effort conversion to .xlsx
-    (values + basic structure; formulas/styles may not be fully preserved).
+    (streaming values only; formulas/styles/merges may not be preserved).
 
     Returns (out_path_for_ui, success_count, fail_count).
     out_path_for_ui is only populated when exactly one file is processed
@@ -327,16 +387,39 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
 
             open_started = datetime.now()
             if ext == ".xls":
-                wb = convert_xls_to_xlsx_workbook(path, log_emit=log_emit)
-            else:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message="wmf image format is not supported so the image is being dropped",
-                        category=UserWarning,
-                        module="openpyxl.reader.drawings",
-                    )
-                    wb = load_workbook(path, data_only=False, keep_vba=keep_vba)
+                # Build output path: YYYYMMDD_HHMMSS_duped_originalfilename (but .xls outputs as .xlsx)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_dir = os.path.dirname(path) or os.getcwd()
+                base_name = os.path.basename(path)
+                stem, _orig_ext = os.path.splitext(base_name)
+                out_name = f"{timestamp}_duped_{stem}.xlsx"
+                out_path = os.path.join(base_dir, out_name)
+
+                # Avoid accidental overwrite if a file with the same name already exists.
+                if os.path.exists(out_path):
+                    counter = 1
+                    name, ext_out = os.path.splitext(out_name)
+                    while True:
+                        candidate = os.path.join(base_dir, f"{name} ({counter}){ext_out}")
+                        if not os.path.exists(candidate):
+                            out_path = candidate
+                            break
+                        counter += 1
+
+                convert_xls_to_xlsx_trimmed(path, out_path, log_emit=log_emit)
+                success += 1
+                last_output_path = out_path
+                log_emit(f"{label} - Output workbook saved to: {out_path}")
+                continue
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="wmf image format is not supported so the image is being dropped",
+                    category=UserWarning,
+                    module="openpyxl.reader.drawings",
+                )
+                wb = load_workbook(path, data_only=False, keep_vba=keep_vba)
             open_elapsed = (datetime.now() - open_started).total_seconds()
             log_emit(
                 f"{label} - Workbook opened in {open_elapsed:.2f}s with {len(wb.worksheets)} sheet(s)."
@@ -387,8 +470,7 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
             base_dir = os.path.dirname(path) or os.getcwd()
             base_name = os.path.basename(path)
             stem, orig_ext = os.path.splitext(base_name)
-            out_ext = ".xlsx" if ext == ".xls" else orig_ext
-            out_name = f"{timestamp}_duped_{stem}{out_ext}"
+            out_name = f"{timestamp}_duped_{stem}{orig_ext}"
             out_path = os.path.join(base_dir, out_name)
 
             # Avoid accidental overwrite if a file with the same name already exists.
