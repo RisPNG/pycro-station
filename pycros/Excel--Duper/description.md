@@ -15,3 +15,5 @@
 > 2025/11/25
 
 Duplicates excel to potentially fix issues and bypass restrictions.
+
+Legacy `.xls` files are supported by converting to `.xlsx` (best-effort; formulas/styles may not be fully preserved).

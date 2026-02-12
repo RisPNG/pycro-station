@@ -24,6 +24,92 @@ try:
 except Exception:
     xlrd = None
 
+
+def _emit(log_emit, text: str):
+    if callable(log_emit):
+        try:
+            log_emit(text)
+            return
+        except Exception:
+            pass
+    print(text)
+
+
+def convert_xls_to_xlsx_workbook(xls_path: str, log_emit=None) -> Workbook:
+    """
+    Convert a legacy .xls workbook into an openpyxl Workbook (xlsx-compatible).
+
+    Notes:
+    - This is a best-effort conversion focused on values + basic structure.
+    - Excel formulas and rich formatting from .xls cannot be reliably preserved
+      with xlrd alone; callers should treat the result as data-focused.
+    """
+    if xlrd is None:
+        raise RuntimeError("Missing dependency: xlrd is required to process .xls files.")
+
+    _emit(log_emit, "Legacy .xls detected; converting to .xlsx (best-effort; formulas/styles may not be preserved).")
+
+    # Some xlrd features (like merged cell info) may require formatting_info=True.
+    # Try to enable it, but fall back gracefully if the file/library doesn't support it.
+    try:
+        book = xlrd.open_workbook(xls_path, formatting_info=True)
+    except Exception:
+        book = xlrd.open_workbook(xls_path)
+
+    out_wb = Workbook()
+    # Remove the default sheet if we are going to add real sheets.
+    if book.nsheets > 0 and out_wb.worksheets:
+        out_wb.remove(out_wb.worksheets[0])
+
+    for sheet in book.sheets():
+        ws = out_wb.create_sheet(title=sheet.name)
+
+        # Copy cell values
+        for r in range(sheet.nrows):
+            for c in range(sheet.ncols):
+                try:
+                    cell = sheet.cell(r, c)
+                except Exception:
+                    continue
+
+                value = cell.value
+                ctype = getattr(cell, "ctype", None)
+
+                if ctype is not None:
+                    try:
+                        if ctype == xlrd.XL_CELL_DATE:
+                            value = xlrd.xldate_as_datetime(value, book.datemode)
+                        elif ctype == xlrd.XL_CELL_BOOLEAN:
+                            value = bool(value)
+                        elif ctype == xlrd.XL_CELL_ERROR:
+                            value = getattr(xlrd, "error_text_from_code", {}).get(value)
+                        elif ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                            value = None
+                    except Exception:
+                        # Keep whatever raw value we have if conversion fails.
+                        pass
+
+                ws.cell(row=r + 1, column=c + 1, value=value)
+
+        # Copy merged cells (best-effort)
+        try:
+            merged = getattr(sheet, "merged_cells", None) or []
+            for rlow, rhigh, clow, chigh in merged:
+                ws.merge_cells(
+                    start_row=rlow + 1,
+                    end_row=rhigh,
+                    start_column=clow + 1,
+                    end_column=chigh,
+                )
+        except Exception:
+            pass
+
+    # Ensure the workbook is saveable even if the source had no sheets.
+    if not out_wb.worksheets:
+        out_wb.create_sheet(title="Sheet1")
+
+    return out_wb
+
 class MainWidget(QWidget):
     log_message = Signal(str)
     processing_done = Signal(int, int, str)
@@ -136,7 +222,12 @@ class MainWidget(QWidget):
 
     # Functions
     def select_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select")
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Excel files",
+            "",
+            "Excel Files (*.xlsx *.xlsm *.xltx *.xltm *.xls)",
+        )
         if files:
             self.files_box.setPlainText("\n".join(files))
         else:
@@ -198,7 +289,11 @@ def get_widget():
 def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
     """
     Duplicate each selected workbook, trimming trailing empty rows/columns
-    on every worksheet while preserving data, formulas, and styles.
+    on every worksheet.
+
+    For .xlsx-based files, this preserves data, formulas, and styles.
+    For legacy .xls files, this performs a best-effort conversion to .xlsx
+    (values + basic structure; formulas/styles may not be fully preserved).
 
     Returns (out_path_for_ui, success_count, fail_count).
     out_path_for_ui is only populated when exactly one file is processed
@@ -223,8 +318,6 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
                 raise FileNotFoundError(f"File not found: {path}")
 
             ext = os.path.splitext(path)[1].lower()
-            if ext == ".xls":
-                raise ValueError("Legacy .xls files are not supported. Please convert to .xlsx before using this pycro.")
 
             size_bytes = os.path.getsize(path)
             keep_vba = ext in (".xlsm", ".xltm", ".xlam")
@@ -233,14 +326,17 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
             )
 
             open_started = datetime.now()
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="wmf image format is not supported so the image is being dropped",
-                    category=UserWarning,
-                    module="openpyxl.reader.drawings",
-                )
-                wb = load_workbook(path, data_only=False, keep_vba=keep_vba)
+            if ext == ".xls":
+                wb = convert_xls_to_xlsx_workbook(path, log_emit=log_emit)
+            else:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="wmf image format is not supported so the image is being dropped",
+                        category=UserWarning,
+                        module="openpyxl.reader.drawings",
+                    )
+                    wb = load_workbook(path, data_only=False, keep_vba=keep_vba)
             open_elapsed = (datetime.now() - open_started).total_seconds()
             log_emit(
                 f"{label} - Workbook opened in {open_elapsed:.2f}s with {len(wb.worksheets)} sheet(s)."
@@ -290,7 +386,9 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_dir = os.path.dirname(path) or os.getcwd()
             base_name = os.path.basename(path)
-            out_name = f"{timestamp}_duped_{base_name}"
+            stem, orig_ext = os.path.splitext(base_name)
+            out_ext = ".xlsx" if ext == ".xls" else orig_ext
+            out_name = f"{timestamp}_duped_{stem}{out_ext}"
             out_path = os.path.join(base_dir, out_name)
 
             # Avoid accidental overwrite if a file with the same name already exists.
