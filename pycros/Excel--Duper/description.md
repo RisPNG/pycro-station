@@ -16,4 +16,6 @@
 
 Duplicates excel to potentially fix issues and bypass restrictions.
 
-Legacy `.xls` files are supported by converting to `.xlsx` (streaming values only; formulas/styles/merges may not be preserved).
+Legacy `.xls` files are supported:
+- Default: fast values-only conversion (recommended for very large reports).
+- Optional: enable “preserve formatting” to convert via LibreOffice (`soffice`) (slower and may produce very large files).

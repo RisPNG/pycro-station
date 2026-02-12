@@ -1,7 +1,11 @@
 import os
+import shutil
+import subprocess
+import tempfile
 import threading
 import warnings
 from datetime import datetime
+from pathlib import Path
 from time import perf_counter
 from typing import List, Tuple, Any, Optional
 
@@ -11,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
     QLabel,
+    QCheckBox,
     QTextEdit,
     QWidget,
     QSizePolicy
@@ -25,6 +30,12 @@ try:
 except Exception:
     xlrd = None
 
+try:
+    # Match Settings page toggle styling
+    from PackagesPage import CheckIconButton  # type: ignore
+except Exception:
+    CheckIconButton = None
+
 
 def _emit(log_emit, text: str):
     if callable(log_emit):
@@ -34,6 +45,67 @@ def _emit(log_emit, text: str):
         except Exception:
             pass
     print(text)
+
+
+def _soffice_executable() -> Optional[str]:
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def convert_xls_to_xlsx_with_libreoffice(xls_path: str, out_dir: str, log_emit=None) -> str:
+    """
+    Convert .xls -> .xlsx using LibreOffice for higher fidelity.
+
+    This preserves styles/row heights/column widths far better than xlrd-based conversion.
+    """
+    soffice = _soffice_executable()
+    if not soffice:
+        raise FileNotFoundError("LibreOffice (soffice) not found on PATH.")
+
+    src = Path(xls_path)
+    out_dir_path = Path(out_dir)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="pycro_lo_profile_") as profile_dir:
+        profile_url = Path(profile_dir).resolve().as_uri()
+
+        _emit(log_emit, "Converting via LibreOffice for formatting preservation...")
+        started = perf_counter()
+        proc = subprocess.run(
+            [
+                soffice,
+                "--headless",
+                "--nologo",
+                "--nolockcheck",
+                "--norestore",
+                f"-env:UserInstallation={profile_url}",
+                "--convert-to",
+                "xlsx",
+                "--outdir",
+                str(out_dir_path),
+                str(src),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        elapsed = perf_counter() - started
+
+    if proc.returncode != 0:
+        msg = (proc.stdout or "").strip()
+        raise RuntimeError(f"LibreOffice conversion failed (code={proc.returncode}, {elapsed:.2f}s): {msg}")
+
+    expected = out_dir_path / f"{src.stem}.xlsx"
+    if expected.exists():
+        _emit(log_emit, f"LibreOffice conversion finished in {elapsed:.2f}s.")
+        return str(expected)
+
+    # Fallback: pick the only .xlsx output in the out_dir (expected to be unique).
+    candidates = sorted(out_dir_path.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError("LibreOffice conversion finished but no .xlsx output was produced.")
+
+    _emit(log_emit, f"LibreOffice conversion finished in {elapsed:.2f}s.")
+    return str(candidates[0])
 
 
 def convert_xls_to_xlsx_trimmed(xls_path: str, out_path: str, log_emit=None) -> None:
@@ -197,6 +269,18 @@ class MainWidget(QWidget):
         )
         self.set_long_description("")
 
+        # Options
+        self.preserve_xls_format_toggle = None
+        self.preserve_xls_format_checkbox = None
+        self.preserve_xls_format_label = QLabel("For .xls: preserve formatting (slow / large output)", self)
+        self.preserve_xls_format_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        if CheckIconButton is not None:
+            self.preserve_xls_format_toggle = CheckIconButton(self, initially_checked=False)
+        else:
+            self.preserve_xls_format_checkbox = QCheckBox(self.preserve_xls_format_label.text(), self)
+            self.preserve_xls_format_checkbox.setChecked(False)
+            self.preserve_xls_format_checkbox.setStyleSheet("color: #dcdcdc; background: transparent;")
+
         # Buttons
         self.select_btn = PrimaryPushButton("Select Excel Files", self)
         self.run_btn = PrimaryPushButton("Run", self)
@@ -235,6 +319,18 @@ class MainWidget(QWidget):
 
         # Row 0
         main_layout.addWidget(self.desc_label, 1)  # Row 0: fixed height
+
+        # Row 0.5: options
+        options_layout = QHBoxLayout()
+        if self.preserve_xls_format_toggle is not None:
+            options_layout.addWidget(self.preserve_xls_format_toggle, 0, Qt.AlignVCenter)
+            options_layout.addWidget(self.preserve_xls_format_label, 0, Qt.AlignVCenter)
+            options_layout.addStretch(1)
+            main_layout.addLayout(options_layout, 0)
+        elif self.preserve_xls_format_checkbox is not None:
+            main_layout.addWidget(self.preserve_xls_format_checkbox, 0)
+        else:
+            main_layout.addWidget(self.preserve_xls_format_label, 0)
 
         # Row 1: Select button layout (3 columns with button in middle)
         row1_layout = QHBoxLayout()
@@ -305,6 +401,12 @@ class MainWidget(QWidget):
             MessageBox("Warning", "Nothing to process.", self).exec()
             return
 
+        preserve_xls_format = False
+        if self.preserve_xls_format_toggle is not None:
+            preserve_xls_format = bool(self.preserve_xls_format_toggle.isChecked())
+        elif self.preserve_xls_format_checkbox is not None:
+            preserve_xls_format = bool(self.preserve_xls_format_checkbox.isChecked())
+
         self.log_box.clear()
         self.log_message.emit(f"Process starts")
         self.run_btn.setEnabled(False)
@@ -313,7 +415,11 @@ class MainWidget(QWidget):
         def worker():
             ok, fail, out_path = 0, 0, ""
             try:
-                out_path, ok, fail = process_files(files, self.log_message.emit)
+                out_path, ok, fail = process_files(
+                    files,
+                    self.log_message.emit,
+                    preserve_xls_format=preserve_xls_format,
+                )
             except Exception as e:
                 self.log_message.emit(f"ERROR: {e}")
             self.processing_done.emit(ok, fail, out_path)
@@ -346,14 +452,15 @@ def get_widget():
 
 # Pycro Main Process
 
-def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
+def process_files(file_paths: List[str], log_emit, preserve_xls_format: bool = False) -> Tuple[str, int, int]:
     """
     Duplicate each selected workbook, trimming trailing empty rows/columns
     on every worksheet.
 
     For .xlsx-based files, this preserves data, formulas, and styles.
-    For legacy .xls files, this performs a best-effort conversion to .xlsx
-    (streaming values only; formulas/styles/merges may not be preserved).
+    For legacy .xls files:
+    - Default is a fast, values-only conversion (smallest output; best for very large reports).
+    - If "preserve formatting" is enabled, uses LibreOffice (`soffice`) to convert to .xlsx.
 
     Returns (out_path_for_ui, success_count, fail_count).
     out_path_for_ui is only populated when exactly one file is processed
@@ -406,7 +513,20 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
                             break
                         counter += 1
 
-                convert_xls_to_xlsx_trimmed(path, out_path, log_emit=log_emit)
+                if preserve_xls_format:
+                    # Convert with LibreOffice and copy the result as-is for best formatting fidelity.
+                    try:
+                        with tempfile.TemporaryDirectory(prefix="pycro_xls_convert_") as tmp_dir:
+                            converted = convert_xls_to_xlsx_with_libreoffice(path, tmp_dir, log_emit=log_emit)
+                            shutil.copy2(converted, out_path)
+                    except Exception as lo_exc:
+                        log_emit(
+                            f"{label} - LibreOffice conversion failed; falling back to values-only conversion. ({lo_exc})"
+                        )
+                        convert_xls_to_xlsx_trimmed(path, out_path, log_emit=log_emit)
+                else:
+                    convert_xls_to_xlsx_trimmed(path, out_path, log_emit=log_emit)
+
                 success += 1
                 last_output_path = out_path
                 log_emit(f"{label} - Output workbook saved to: {out_path}")
@@ -431,20 +551,33 @@ def process_files(file_paths: List[str], log_emit) -> Tuple[str, int, int]:
                 max_used_row = 0
                 max_used_col = 0
 
-                # Scan for cells that actually contain a value or formula.
-                for row in ws.iter_rows():
-                    for cell in row:
+                # Scan existing cells only (avoid creating millions of empty cells).
+                cells = getattr(ws, "_cells", None)
+                if isinstance(cells, dict):
+                    for (r, c), cell in cells.items():
                         if cell.value is not None:
-                            if cell.row > max_used_row:
-                                max_used_row = cell.row
-                            if cell.column > max_used_col:
-                                max_used_col = cell.column
+                            if r > max_used_row:
+                                max_used_row = r
+                            if c > max_used_col:
+                                max_used_col = c
+                else:
+                    for row in ws.iter_rows():
+                        for cell in row:
+                            if cell.value is not None:
+                                if cell.row > max_used_row:
+                                    max_used_row = cell.row
+                                if cell.column > max_used_col:
+                                    max_used_col = cell.column
 
                 # Ensure merged ranges containing a value are fully kept.
                 if ws.merged_cells.ranges and (max_used_row or max_used_col):
                     for cell_range in ws.merged_cells.ranges:
-                        top_left = ws.cell(row=cell_range.min_row, column=cell_range.min_col)
-                        if top_left.value is not None:
+                        if isinstance(cells, dict):
+                            top_left = cells.get((cell_range.min_row, cell_range.min_col))
+                        else:
+                            top_left = ws.cell(row=cell_range.min_row, column=cell_range.min_col)
+
+                        if top_left is not None and top_left.value is not None:
                             if cell_range.max_row > max_used_row:
                                 max_used_row = cell_range.max_row
                             if cell_range.max_col > max_used_col:
