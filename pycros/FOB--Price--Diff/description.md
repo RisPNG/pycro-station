@@ -1,6 +1,6 @@
 > Validate and tag OCCC <=> PPM <=> PPS price difference
 > [!info]
-> [Version 0.1.0rc1](#bae1ffff)
+> [Version 1.0.0](#bae1ffff)
 >
 > [Author](#bae1ffff)
 > Nik Faris Aiman bin Nik Rahiman (faris@sig.com.my)

@@ -4,6 +4,7 @@ import re
 import threading
 import warnings
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import List, Tuple, Any, Dict, Optional
 
 # GUI Imports
@@ -80,6 +81,32 @@ def safe_float(value):
         return float(s_val)
     except ValueError:
         return 0.0
+
+MONEY_CENT = Decimal("0.01")
+
+def safe_decimal(value: Any) -> Decimal:
+    """Safely convert value to Decimal, handling currency strings."""
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value))
+        except InvalidOperation:
+            return Decimal("0")
+
+    s_val = str(value).strip().replace(" ", "").replace("$", "").replace(",", "")
+    if s_val == "-" or s_val == "":
+        return Decimal("0")
+    try:
+        return Decimal(s_val)
+    except InvalidOperation:
+        return Decimal("0")
+
+def money_abs_diff(a: Any, b: Any) -> Decimal:
+    """Absolute difference between 2 money values, rounded to cents."""
+    return (safe_decimal(a) - safe_decimal(b)).copy_abs().quantize(MONEY_CENT, rounding=ROUND_HALF_UP)
 
 def normalize_date_str(date_val):
     """
@@ -177,22 +204,71 @@ def build_timestamped_copy_path(input_path: str, timestamp: str, label: str = "u
             return candidate
         counter += 1
 
+EXT_SIZE_EMPTY = {"-", "", "NONE", "NA", "N/A"}
+
+def normalize_size_code(size_val: Any) -> str:
+    """Normalize size strings for SIZE_ORDER lookup (e.g., 'XL-T' -> 'XLT')."""
+    if size_val is None:
+        return ""
+    s_val = str(size_val).strip().upper()
+    if not s_val:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", s_val)
+
+def is_tall_size(size_code: Any) -> bool:
+    """Best-effort detection for Tall sizes (e.g., ST, MTT, XLTT, 2XLT)."""
+    s = normalize_size_code(size_code)
+    if not s or s.startswith("CUST"):
+        return False
+    return s.endswith("TT") or s.endswith("T")
+
+def extract_ext_threshold_size_code(ext_def_val: Any) -> str:
+    """
+    Extract a SIZE_ORDER code from OCCC 'Extended Sizes' values.
+
+    Examples:
+    - '3XL&Abv' -> '3XL'
+    - '38 ONWARDS' -> '38'
+    - \"3XL.Follow to FA'26\" -> '3XL'
+    - \"Follow to SP'26\" -> '' (no usable size code)
+    """
+    raw = str(ext_def_val).strip().upper() if ext_def_val is not None else ""
+    if not raw or raw in EXT_SIZE_EMPTY:
+        return ""
+
+    # Avoid accidentally treating season/year notes (e.g. "SP'26") as numeric sizes like "26"
+    cleaned = re.sub(r"\b[A-Z]{2,3}'\d{2}\b", " ", raw)
+    cleaned = re.sub(r"'\d{2}\b", " ", cleaned)
+    cleaned = re.sub(r"\b20\d{2}\b", " ", cleaned)
+
+    tokens = [t for t in re.split(r"[\s&./,;()]+", cleaned) if t]
+    for t in tokens:
+        code = normalize_size_code(t)
+        if code in SIZE_ORDER:
+            return code
+    return ""
+
 def is_extended_size(ppm_size_str, occc_threshold_str):
     """Determine if a size is extended based on the OCCC threshold or TALL logic."""
-    ppm_size = str(ppm_size_str).strip().upper()
-    threshold = str(occc_threshold_str).strip().upper()
+    ppm_size = normalize_size_code(ppm_size_str)
+    threshold_raw = str(occc_threshold_str).strip().upper() if occc_threshold_str is not None else ""
 
     if not ppm_size:
         return False
 
-    if threshold in ["-", "", "NONE", "NA"]:
+    if threshold_raw in EXT_SIZE_EMPTY:
+        return False
+
+    if "TALL" in threshold_raw:
+        return is_tall_size(ppm_size)
+
+    threshold = extract_ext_threshold_size_code(threshold_raw)
+    if not threshold:
         return False
 
     try:
         idx_ppm = SIZE_ORDER.index(ppm_size)
     except ValueError:
-        if "T" in ppm_size:
-            return True
         return False
 
     try:
@@ -316,6 +392,19 @@ def load_file_data(path, log_emit) -> Tuple[List[Any], List[List[Any]], Any]:
     else:
         raise ValueError("Unsupported file format")
 
+def pick_worksheet(wb, preferred_names: List[str]):
+    """Pick worksheet by name (case/whitespace insensitive), fallback to active."""
+    if not wb:
+        return None
+    for name in preferred_names:
+        if name in wb.sheetnames:
+            return wb[name]
+    normalized_targets = {normalize_header(n) for n in preferred_names}
+    for name in wb.sheetnames:
+        if normalize_header(name) in normalized_targets:
+            return wb[name]
+    return wb.active
+
 def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> Tuple[str, int, int]:
     success_count = 0
     fail_count = 0
@@ -430,10 +519,10 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
             if is_excel:
                 keep_vba = occc_path.lower().endswith('.xlsm')
                 wb_read = load_workbook(occc_path, data_only=True, keep_vba=keep_vba)
-                ws_read = wb_read.active
+                ws_read = pick_worksheet(wb_read, ["OCCC"])
                 rows_read = list(ws_read.values)
                 wb_write = load_workbook(occc_path, data_only=False, keep_vba=keep_vba)
-                ws_write = wb_write.active
+                ws_write = pick_worksheet(wb_write, ["OCCC"])
             else:
                 rows_read, _, _ = load_file_data(occc_path, log_emit)
                 output_csv_data = [list(r) for r in rows_read]
@@ -467,7 +556,13 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
             idx_ofob_ext = get_col_index(headers, ["OFOB (Extended sizes)"])
             idx_final_reg = get_col_index(headers, ["FINAL FOB (Regular sizes)"])
             idx_final_ext = get_col_index(headers, ["FINAL FOB (Extended sizes)", "FINAL FOB (Extended sizes) (2)"])
-            idx_ext_sizes_def = get_col_index(headers, ["Extended Sizes"])
+            idx_ext_sizes_def = get_col_index(headers, [
+                "Extended Sizes",
+                "Extended Sizes (2)",
+                "EXT SIZE",
+                "EXT SIZES",
+                "EXTENDED SIZE",
+            ])
 
             idx_remarks = get_col_index(headers, ["PRICE DIFF REMARKS"])
             idx_dpom_fob = get_col_index(headers, ["DPOM - Incorrect FOB"])
@@ -532,23 +627,23 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                         ave_ppm_am = sum_am / count if count else 0.0
                         ave_ppm_ao = sum_ao / count if count else 0.0
 
-                        # Surcharge Checks - THRESHOLD 0.01
-                        if abs(safe_float(row_vals[idx_sc_min_prod]) - ave_ppm_ag) > 0.01:
+                        # Surcharge Checks - treat >= $0.01 as mismatch
+                        if idx_sc_min_prod != -1 and money_abs_diff(row_vals[idx_sc_min_prod], ave_ppm_ag) >= MONEY_CENT:
                             remarks.append("S/C MIN PRODUCTION (ZPMX) doesn't match")
 
                         # Min Mat
-                        occc_zmmx = safe_float(row_vals[idx_sc_min_mat])
+                        occc_zmmx = safe_float(row_vals[idx_sc_min_mat]) if idx_sc_min_mat != -1 else 0.0
                         zmmx_cmt = str(row_vals[idx_sc_min_mat_comment]).strip().upper() if idx_sc_min_mat_comment != -1 and row_vals[idx_sc_min_mat_comment] else ""
-                        if zmmx_cmt != "DN" and abs(occc_zmmx - ave_ppm_ai) > 0.01:
+                        if idx_sc_min_mat != -1 and zmmx_cmt != "DN" and money_abs_diff(occc_zmmx, ave_ppm_ai) >= MONEY_CENT:
                             remarks.append("S/C Min Material (ZMMX) doesn't match")
 
                         # Misc
-                        occc_zmsx = safe_float(row_vals[idx_sc_misc])
+                        occc_zmsx = safe_float(row_vals[idx_sc_misc]) if idx_sc_misc != -1 else 0.0
                         zmsx_cmt = str(row_vals[idx_sc_misc_comment]).strip().upper() if idx_sc_misc_comment != -1 and row_vals[idx_sc_misc_comment] else ""
-                        if zmsx_cmt != "DN" and abs(occc_zmsx - ave_ppm_am) > 0.01:
+                        if idx_sc_misc != -1 and zmsx_cmt != "DN" and money_abs_diff(occc_zmsx, ave_ppm_am) >= MONEY_CENT:
                             remarks.append("S/C Misc (ZMSX) doesn't match")
 
-                        if abs(safe_float(row_vals[idx_sc_vas]) - ave_ppm_ao) > 0.01:
+                        if idx_sc_vas != -1 and money_abs_diff(row_vals[idx_sc_vas], ave_ppm_ao) >= MONEY_CENT:
                             remarks.append("S/C VAS Manual (ZVAX) doesn't match")
 
                         # Final FOB Checks
@@ -564,8 +659,8 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                             is_ext = is_extended_size(entry['size'], ext_threshold)
                             target_fob = round(occc_final_ext if is_ext else occc_final_reg, 2)
 
-                            # THRESHOLD 0.01
-                            if ppm_total > 0 and abs(target_fob - ppm_total) > 0.01:
+                            # treat >= $0.01 as mismatch
+                            if ppm_total > 0 and money_abs_diff(target_fob, ppm_total) >= MONEY_CENT:
                                 lbl = "Extended" if is_ext else "Regular"
 
                                 # Add to DPOM Error List: "Size Price"
@@ -599,7 +694,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                                 reg_match = next((r for r in matched_rows if not r['size_data']), None)
                                 occc_ofob_reg = safe_float(row_vals[idx_ofob_reg])
                                 if reg_match:
-                                    if abs(reg_match['quote'] - occc_ofob_reg) <= 0.01:
+                                    if money_abs_diff(reg_match['quote'], occc_ofob_reg) == 0:
                                         remarks.append("PPS OFOB match for regular sizes")
                                     else:
                                         remarks.append("PPS OFOB doesn't match for regular sizes")
@@ -612,7 +707,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                                 if ext_threshold not in ["-", "", "NONE", "NA"] or occc_ofob_ext > 0:
                                     ext_match = next((r for r in matched_rows if is_extended_size(r['size_data'], ext_threshold)), None)
                                     if ext_match:
-                                        if abs(ext_match['quote'] - occc_ofob_ext) <= 0.01:
+                                        if money_abs_diff(ext_match['quote'], occc_ofob_ext) == 0:
                                             remarks.append("PPS OFOB match for extended sizes")
                                         else:
                                             remarks.append("PPS OFOB doesn't match for extended sizes")
