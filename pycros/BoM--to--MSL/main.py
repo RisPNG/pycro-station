@@ -195,8 +195,6 @@ def get_widget():
     return MainWidget()
 
 # Pycro Main Process
-NORMAL_COL_COUNT = 12
-
 STYLE_LABEL = "STYLE#:"
 SEASON_LABEL = "SEASON:"
 
@@ -317,11 +315,9 @@ class BoMToMSLProcessor:
         temp_file = os.path.basename(path)
         wb, ws = self._load_sheet(path)
         try:
-            max_row = ws.max_row or 0
-            max_col = ws.max_column or 0
-
-            if max_col != NORMAL_COL_COUNT:
-                raise ValueError(f"{temp_file} - Unusual column size detected. (Default : {NORMAL_COL_COUNT})")
+            max_row, max_col = self._get_used_range(ws)
+            if max_col < S_COL_UOM:
+                raise ValueError(f"{temp_file} - Unexpected worksheet layout. Required BOM columns were not found.")
 
             style_season = self._get_season_style(ws)
             if not style_season:
@@ -710,9 +706,47 @@ class BoMToMSLProcessor:
                 ws.column_dimensions[col_letter].width = needed
 
     # ---- parsing helpers ----
-    def _get_season_style(self, ws) -> str:
+    def _get_used_range(self, ws) -> Tuple[int, int]:
+        """Return the last populated row/column, ignoring merged-cell padding."""
+        used_max_row = 0
+        used_max_col = 0
+
+        cells = getattr(ws, "_cells", None)
+        if cells:
+            for cell in cells.values():
+                value = cell.value
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                if cell.row > used_max_row:
+                    used_max_row = cell.row
+                if cell.column > used_max_col:
+                    used_max_col = cell.column
+            if used_max_row or used_max_col:
+                return used_max_row, used_max_col
+
         max_row = ws.max_row or 0
         max_col = ws.max_column or 0
+        for row_idx, row in enumerate(
+            ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True),
+            start=1,
+        ):
+            row_has_value = False
+            for col_idx, value in enumerate(row, start=1):
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                row_has_value = True
+                if col_idx > used_max_col:
+                    used_max_col = col_idx
+            if row_has_value:
+                used_max_row = row_idx
+        return used_max_row, used_max_col
+
+    def _get_season_style(self, ws) -> str:
+        max_row, max_col = self._get_used_range(ws)
 
         for i in range(1, max_row + 1):
             for j in range(1, max_col + 1):
