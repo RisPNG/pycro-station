@@ -516,10 +516,15 @@ class ProcessingLogic:
 
                 # Group by PO within OGAC (each PO is independent)
                 po_groups = defaultdict(list)
+                po_group_meta = {}
                 styles_with_explicit_ship_to = defaultdict(set)
                 styles_with_blank_ship_to = defaultdict(set)
                 money_scope_sizes = defaultdict(lambda: defaultdict(int))
                 money_scope_fob_by_size = defaultdict(dict)
+                blank_scope_sizes = defaultdict(lambda: defaultdict(int))
+                blank_scope_fob_by_size = defaultdict(dict)
+                blank_scope_last_item = {}
+                blank_scope_styles = defaultdict(set)
                 for item in ogac_items:
                     base_po_key = (item['country'], item['po'], item['afs'])
                     explicit_style_scope_key = (item['po'], item['afs'])
@@ -539,11 +544,23 @@ class ProcessingLogic:
                             money_scope_fob_by_size[money_scope_key][sz] = fob_num
                     else:
                         styles_with_blank_ship_to[explicit_style_scope_key].add(item['style_full'])
+                        blank_scope_styles[base_po_key].add(item['style_full'])
+                        for sz, qty in item.get('sizes', {}).items():
+                            if not qty:
+                                continue
+                            fob_val = item.get('fob_by_size', {}).get(sz, item.get('fob', 0))
+                            try:
+                                fob_num = round(float(fob_val) if fob_val not in (None, "") else 0.0, 2)
+                            except Exception:
+                                fob_num = 0.0
+                            blank_scope_sizes[base_po_key][sz] += qty
+                            blank_scope_fob_by_size[base_po_key][sz] = fob_num
+                        blank_scope_last_item[base_po_key] = item
                 split_ship_to_idx = 0
                 split_blank_idx = 0
                 blank_group_keys = {}
                 blank_group_style_sizes = defaultdict(dict)
-                for item in ogac_items:
+                for item_idx, item in enumerate(ogac_items):
                     ship_to = item.get('ship_no', '#')
                     base_po_key = (item['country'], item['po'], item['afs'])
                     explicit_style_scope_key = (item['po'], item['afs'])
@@ -559,21 +576,63 @@ class ProcessingLogic:
                         blank_group_keys[base_po_key] = None
                         blank_group_style_sizes[base_po_key] = {}
                     else:
+                        blank_group_scope_key = base_po_key
+                        if normalize_country(item['country']) == "JAPAN":
+                            blank_group_scope_key = (*base_po_key, item['raw'][COL_PLANT])
                         size_set = {sz for sz, qty in item.get('sizes', {}).items() if qty}
-                        current_key = blank_group_keys.get(base_po_key)
-                        current_style_sizes = blank_group_style_sizes[base_po_key]
+                        current_key = blank_group_keys.get(blank_group_scope_key)
+                        current_style_sizes = blank_group_style_sizes[blank_group_scope_key]
                         existing_sizes = current_style_sizes.get(item['style_full'])
                         if current_key is None or (existing_sizes is not None and not existing_sizes.isdisjoint(size_set)):
                             current_key = (*base_po_key, ship_to, split_blank_idx)
                             split_blank_idx += 1
-                            blank_group_keys[base_po_key] = current_key
-                            blank_group_style_sizes[base_po_key] = {item['style_full']: set(size_set)}
+                            blank_group_keys[blank_group_scope_key] = current_key
+                            blank_group_style_sizes[blank_group_scope_key] = {item['style_full']: set(size_set)}
                         else:
                             current_style_sizes.setdefault(item['style_full'], set()).update(size_set)
                         po_key = current_key
+                    if po_key not in po_group_meta:
+                        po_group_meta[po_key] = {
+                            'base_po_key': base_po_key,
+                            'first_index': item_idx,
+                            'country': normalize_country(item['country']),
+                            'ship_to': ship_to,
+                            'plant': item['raw'][COL_PLANT],
+                        }
                     po_groups[po_key].append(item)
 
-                for _, po_items in po_groups.items():
+                blank_group_counts = defaultdict(int)
+                po_group_entries = list(po_groups.items())
+                for po_key, _ in po_group_entries:
+                    if po_group_meta[po_key]['ship_to'] == "#":
+                        blank_group_counts[po_group_meta[po_key]['base_po_key']] += 1
+
+                po_group_entries_by_base = OrderedDict()
+                for po_key, po_items in po_group_entries:
+                    po_group_entries_by_base[po_group_meta[po_key]['base_po_key']] = po_group_entries_by_base.get(
+                        po_group_meta[po_key]['base_po_key'],
+                        []
+                    ) + [(po_key, po_items)]
+
+                ordered_po_group_entries = []
+                for entries in po_group_entries_by_base.values():
+                    entries = list(entries)
+                    japan_blank_positions = [
+                        idx for idx, (po_key, _) in enumerate(entries)
+                        if po_group_meta[po_key]['ship_to'] == "#" and po_group_meta[po_key]['country'] == "JAPAN"
+                    ]
+                    sorted_japan_blank_entries = sorted(
+                        (entries[idx] for idx in japan_blank_positions),
+                        key=lambda entry: (
+                            numeric_sort_value(po_group_meta[entry[0]]['plant']),
+                            po_group_meta[entry[0]]['first_index']
+                        )
+                    )
+                    for idx, entry in zip(japan_blank_positions, sorted_japan_blank_entries):
+                        entries[idx] = entry
+                    ordered_po_group_entries.extend(entries)
+
+                for po_key, po_items in ordered_po_group_entries:
                     # Check for blind buy
                     is_blind_buy = False
                     bb_job = ""
@@ -611,12 +670,6 @@ class ProcessingLogic:
                             style_fob_by_size[sz] = fob_num
 
                     po_data_item = po_items[-1]
-                    top_fob_val = po_data_item.get('fob', 0)
-                    try:
-                        top_fob = round(float(top_fob_val) if top_fob_val not in (None, "") else 0.0, 2)
-                    except Exception:
-                        top_fob = 0.0
-
                     ship_to = po_data_item.get('ship_no', '#')
                     po_money = sum(qty * po_fob_by_size.get(sz, 0) for sz, qty in po_totals.items())
                     if ship_to != "#" and po_data_item['style_full'] not in styles_with_blank_ship_to[(po_data_item['po'], po_data_item['afs'])]:
@@ -626,7 +679,15 @@ class ProcessingLogic:
                             for sz, qty in money_scope_sizes[money_scope_key].items()
                         )
 
-                    if ship_to == "#" and len({item['style_full'] for item in po_items}) == 1:
+                    blank_scope_key = po_group_meta[po_key]['base_po_key']
+                    if ship_to == "#" and blank_group_counts[blank_scope_key] > 1:
+                        po_data_item = blank_scope_last_item.get(blank_scope_key, po_data_item)
+                        po_money = sum(
+                            qty * blank_scope_fob_by_size[blank_scope_key].get(sz, 0)
+                            for sz, qty in blank_scope_sizes[blank_scope_key].items()
+                        )
+
+                    if ship_to == "#" and len({item['style_full'] for item in po_items}) == 1 and len(blank_scope_styles[blank_scope_key]) == 1:
                         style_scope_items = [
                             item for item in ogac_items
                             if item['country'] == po_data_item['country']
@@ -653,6 +714,12 @@ class ProcessingLogic:
                             po_data_item = style_scope_items[-1]
                             po_money = sum(qty * scope_fob_by_size.get(sz, 0) for sz, qty in scope_totals.items())
                     po_money = round(po_money, 2)
+
+                    top_fob_val = po_data_item.get('fob', 0)
+                    try:
+                        top_fob = round(float(top_fob_val) if top_fob_val not in (None, "") else 0.0, 2)
+                    except Exception:
+                        top_fob = 0.0
 
                     # Total PO Qty row
                     final_rows.append({
