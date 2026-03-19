@@ -31,7 +31,7 @@ COLOR_DARK_GREEN = "FF00B050"  # cDGreen = 5287936
 COLOR_MAGENTA = "800080"  # cDMagenta = 8388736
 
 # Destination countries that require separating each Material (incl. colorway)
-SPLIT_MATERIAL_BY_DEST_COUNTRY = {"CANADA", "INDONESIA", "MEXICO"}
+SPLIT_MATERIAL_BY_DEST_COUNTRY = {"INDONESIA", "MEXICO"}
 
 # Column indices in raw data (0-based)
 COL_VENDOR = 0
@@ -577,8 +577,11 @@ class ProcessingLogic:
                         blank_group_style_sizes[base_po_key] = {}
                     else:
                         blank_group_scope_key = base_po_key
-                        if normalize_country(item['country']) == "JAPAN":
+                        country_norm = normalize_country(item['country'])
+                        if country_norm == "JAPAN":
                             blank_group_scope_key = (*base_po_key, item['raw'][COL_PLANT])
+                        elif country_norm in SPLIT_MATERIAL_BY_DEST_COUNTRY:
+                            blank_group_scope_key = (*base_po_key, item['style_full'])
                         size_set = {sz for sz, qty in item.get('sizes', {}).items() if qty}
                         current_key = blank_group_keys.get(blank_group_scope_key)
                         current_style_sizes = blank_group_style_sizes[blank_group_scope_key]
@@ -681,11 +684,12 @@ class ProcessingLogic:
 
                     blank_scope_key = po_group_meta[po_key]['base_po_key']
                     if ship_to == "#" and blank_group_counts[blank_scope_key] > 1:
-                        po_data_item = blank_scope_last_item.get(blank_scope_key, po_data_item)
                         po_money = sum(
                             qty * blank_scope_fob_by_size[blank_scope_key].get(sz, 0)
                             for sz, qty in blank_scope_sizes[blank_scope_key].items()
                         )
+                        if po_group_meta[po_key]['country'] == "JAPAN":
+                            po_data_item = blank_scope_last_item.get(blank_scope_key, po_data_item)
 
                     if ship_to == "#" and len({item['style_full'] for item in po_items}) == 1 and len(blank_scope_styles[blank_scope_key]) == 1:
                         style_scope_items = [
