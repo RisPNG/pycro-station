@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import threading
 from collections import defaultdict
@@ -14,16 +13,20 @@ from typing import Callable, Dict, Iterable, List, Optional
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import quote_sheetname
 from openpyxl.utils.datetime import from_excel
 
 try:
     from PySide6.QtCore import Qt, Signal
     from PySide6.QtWidgets import (
+        QAbstractItemView,
         QFileDialog,
         QHBoxLayout,
         QLabel,
+        QListView,
         QSizePolicy,
         QTextEdit,
+        QTreeView,
         QVBoxLayout,
         QWidget,
     )
@@ -40,6 +43,10 @@ VND_NUMBER_FORMAT = "#,##0"
 USD_NUMBER_FORMAT = "#,###.00"
 GENERAL_RATE_FORMAT = "#,##0.00"
 DATE_NUMBER_FORMAT = "yyyy/mm/dd"
+SUMMARY_DATE_DISPLAY_FORMAT = "%-m/%-d/%Y"
+SUMMARY_DATE_FALLBACK_FORMAT = "%m/%d/%Y"
+DATA_ROW_HEIGHT = 18
+SUMMARY_DATA_ROW_HEIGHT = 24
 MONTH_ABBR = {
     1: "JAN",
     2: "FEB",
@@ -201,6 +208,34 @@ OUTPUT_COL_VAT_RATE = OUTPUT_COL_USD + 5
 OUTPUT_COL_FOREX_VAT_VND = OUTPUT_COL_USD + 6
 OUTPUT_COL_FOREX_VAT_USD = OUTPUT_COL_USD + 7
 TOTAL_OUTPUT_COLUMNS = OUTPUT_COL_FOREX_VAT_USD
+
+SUMMARY_COL_MONTH = 1
+SUMMARY_COL_SIG_USD = 2
+SUMMARY_COL_SIG_VND = 3
+SUMMARY_COL_SIG_AVG_RATE = 4
+SUMMARY_COL_PAYMENT_DATE = 5
+SUMMARY_COL_BANK_USD = 6
+SUMMARY_COL_BANK_RATE = 7
+SUMMARY_COL_BANK_VND = 8
+SUMMARY_COL_PAYMENT_LOSS_VND = 9
+SUMMARY_COL_PAYMENT_LOSS_USD = 10
+SUMMARY_COL_VAT_LOSS_VND = 11
+SUMMARY_COL_VAT_LOSS_USD = 12
+
+MONTHLY_HEADER_FILL = "FFF200"
+MONTHLY_GROUP_FILL = "D9E7F5"
+MONTHLY_SUBGROUP_FILL = "EAF2FB"
+MONTHLY_GREEN_FILL = "E2F0D9"
+MONTHLY_RATE_FILL = "FCE4D6"
+MONTHLY_WHITE_FILL = "FFFFFF"
+MONTHLY_CALC_FILL = "DCE6F1"
+MONTHLY_GREEN_DATA_FILL = "EEF6E7"
+SUMMARY_YELLOW_FILL = "FFF200"
+SUMMARY_BLUE_FILL = "D9E7F5"
+SUMMARY_GREEN_FILL = "E2F0D9"
+SUMMARY_TOTAL_FILL = "F2F2F2"
+BLACK = "000000"
+RED = "FF0000"
 
 VND_KEYS = {"po_amount_before_vat_vnd", "surcharge_other_vnd", "total_vnd"}
 USD_KEYS = {"po_amount_before_vat_usd", "surcharge_other_usd", "total_usd"}
@@ -400,22 +435,11 @@ def collect_source_files(input_folders: List[Path], audit_log: AuditLog) -> List
             audit_log.source_file_errors.append(f"{folder} | folder does not exist or is not accessible")
             continue
 
-        folder_files: List[Path] = []
-
-        def handle_walk_error(exc: OSError):
-            error_path = getattr(exc, "filename", None) or folder
-            audit_log.source_file_errors.append(f"{error_path} | could not scan subfolder: {exc.strerror or exc}")
-
-        for root, _dirs, files in os.walk(folder, onerror=handle_walk_error):
-            root_path = Path(root)
-            for file_name in sorted(files, key=str.lower):
-                if file_name.startswith("~$") or not file_name.lower().endswith(".xlsx"):
-                    continue
-                file_path = root_path / file_name
-                if file_path.is_file():
-                    folder_files.append(file_path)
-
-        folder_files.sort(key=lambda path: str(path.relative_to(folder)).lower())
+        folder_files = [
+            path
+            for path in sorted(folder.iterdir(), key=lambda p: p.name.lower())
+            if path.is_file() and path.suffix.lower() == ".xlsx" and not path.name.startswith("~$")
+        ]
         if not folder_files:
             audit_log.folders_without_xlsx.append(str(folder))
             continue
@@ -615,7 +639,7 @@ def parse_source_file(
             parts = [f"{source_file} | skipped whole file"]
             if missing_payment_rows:
                 parts.append(
-                    "Payment to Supplier missing/invalid at row(s): "
+                    "Payment to Supplier empty/whitespace-only at row(s): "
                     + ", ".join(str(row) for row in missing_payment_rows)
                 )
             if missing_vat_rows:
@@ -638,26 +662,57 @@ def parse_source_file(
         wb.close()
 
 
-def apply_header_style(cell, fill_color: str):
-    cell.font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+def apply_header_style(cell, fill_color: str, font_color: str = BLACK, font_size: int = 10):
+    cell.font = Font(bold=True, color=font_color, name="Arial", size=font_size)
     cell.fill = PatternFill("solid", fgColor=fill_color)
     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin = Side(style="thin", color="D9D9D9")
+    thin = Side(style="thin", color=BLACK)
     cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
-def apply_data_style(cell):
-    thin = Side(style="thin", color="E0E0E0")
+def apply_data_style(cell, fill_color: str = MONTHLY_WHITE_FILL, font_color: str = BLACK, bold: bool = False):
+    thin = Side(style="thin", color="BFBFBF")
     cell.font = Font(name="Arial", size=10)
+    if font_color != BLACK or bold:
+        cell.font = Font(name="Arial", size=10, color=font_color, bold=bold)
     cell.alignment = Alignment(vertical="center", wrap_text=True)
     cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cell.fill = PatternFill("solid", fgColor=fill_color)
+
+
+def apply_total_style(cell):
+    thin = Side(style="thin", color=BLACK)
+    cell.font = Font(name="Arial", size=11, bold=True)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cell.fill = PatternFill("solid", fgColor=SUMMARY_TOTAL_FILL)
+
+
+def summary_display_date(value: date) -> str:
+    try:
+        return value.strftime(SUMMARY_DATE_DISPLAY_FORMAT)
+    except ValueError:
+        return value.strftime(SUMMARY_DATE_FALLBACK_FORMAT)
+
+
+def month_range(sheet_name: str, column: str, start_row: int, end_row: int) -> str:
+    return f"{quote_sheetname(sheet_name)}!${column}${start_row}:${column}${end_row}"
+
+
+def summary_date_label(rows: List[SourceRow]) -> str:
+    dates = sorted({row.payment_to_supplier_date for row in rows})
+    if not dates:
+        return ""
+    if len(dates) == 1:
+        return summary_display_date(dates[0])
+    return f"{summary_display_date(dates[0])} - {summary_display_date(dates[-1])}"
 
 
 def setup_month_sheet(ws):
     for col_index, header in enumerate(ORIGINAL_OUTPUT_HEADERS, start=1):
         cell = ws.cell(row=1, column=col_index, value=header)
-        apply_header_style(cell, "1F4E78")
-        ws.merge_cells(start_row=1, start_column=col_index, end_row=2, end_column=col_index)
+        apply_header_style(cell, MONTHLY_HEADER_FILL)
+        apply_header_style(ws.cell(row=2, column=col_index, value=""), MONTHLY_HEADER_FILL)
 
     ws.merge_cells(start_row=1, start_column=OUTPUT_COL_USD, end_row=1, end_column=OUTPUT_COL_PAYMENT_VND)
     cell = ws.cell(
@@ -665,52 +720,53 @@ def setup_month_sheet(ws):
         column=OUTPUT_COL_USD,
         value="VTEC have to sell the USD to VCB bank at VCB's buying rate and then pay to suppliers in VND",
     )
-    apply_header_style(cell, "1F4E78")
+    apply_header_style(cell, MONTHLY_GROUP_FILL, font_size=12)
 
-    single_header_columns = {
-        OUTPUT_COL_RED_INVOICE_VND: "Red Invoice amount Before VAT",
-        OUTPUT_COL_FOREX_PAYMENT_VND: "Gain/(Loss) in Forex",
-        OUTPUT_COL_VAT_RATE: "VCB's Buying Rate at VAT Invoice Date",
-        OUTPUT_COL_FOREX_VAT_VND: "Gain/(Loss) in Forex",
-        OUTPUT_COL_FOREX_VAT_USD: "Gain/(Loss) in Forex",
+    monthly_row1_headers = {
+        OUTPUT_COL_RED_INVOICE_VND: ("Red Invoice amount Before VAT", MONTHLY_RATE_FILL, RED),
+        OUTPUT_COL_FOREX_PAYMENT_VND: ("Gain/(Loss) in Forex", MONTHLY_WHITE_FILL, RED),
+        OUTPUT_COL_VAT_RATE: ("VCB's Buying Rate at VAT Invoice Date", MONTHLY_GREEN_FILL, RED),
+        OUTPUT_COL_FOREX_VAT_VND: ("Gain/(Loss) in Forex", MONTHLY_GREEN_FILL, RED),
+        OUTPUT_COL_FOREX_VAT_USD: ("Gain/(Loss) in Forex", MONTHLY_GREEN_FILL, RED),
     }
-    for col_index, header in single_header_columns.items():
+    for col_index, (header, fill_color, font_color) in monthly_row1_headers.items():
         cell = ws.cell(row=1, column=col_index, value=header)
-        apply_header_style(cell, "4F81BD")
+        apply_header_style(cell, fill_color, font_color=font_color)
 
     row2_headers = {
-        OUTPUT_COL_USD: "USD",
-        OUTPUT_COL_PAYMENT_RATE: "Rate (VND/USD)",
-        OUTPUT_COL_PAYMENT_VND: "VND",
-        OUTPUT_COL_RED_INVOICE_VND: "VND",
-        OUTPUT_COL_FOREX_PAYMENT_VND: "VND",
-        OUTPUT_COL_VAT_RATE: "VND/USD",
-        OUTPUT_COL_FOREX_VAT_VND: "VND",
-        OUTPUT_COL_FOREX_VAT_USD: "USD",
+        OUTPUT_COL_USD: ("USD", MONTHLY_SUBGROUP_FILL, BLACK),
+        OUTPUT_COL_PAYMENT_RATE: ("Rate (VND/USD)", MONTHLY_RATE_FILL, RED),
+        OUTPUT_COL_PAYMENT_VND: ("VND", MONTHLY_SUBGROUP_FILL, BLACK),
+        OUTPUT_COL_RED_INVOICE_VND: ("VND", MONTHLY_RATE_FILL, RED),
+        OUTPUT_COL_FOREX_PAYMENT_VND: ("VND", MONTHLY_WHITE_FILL, RED),
+        OUTPUT_COL_VAT_RATE: ("VND/USD", MONTHLY_GREEN_FILL, RED),
+        OUTPUT_COL_FOREX_VAT_VND: ("VND", MONTHLY_GREEN_FILL, RED),
+        OUTPUT_COL_FOREX_VAT_USD: ("USD", MONTHLY_GREEN_FILL, RED),
     }
-    for col_index, header in row2_headers.items():
+    for col_index, (header, fill_color, font_color) in row2_headers.items():
         cell = ws.cell(row=2, column=col_index, value=header)
-        apply_header_style(cell, "4F81BD")
+        apply_header_style(cell, fill_color, font_color=font_color)
 
     ws.freeze_panes = "A3"
-    ws.row_dimensions[1].height = 36
-    ws.row_dimensions[2].height = 24
+    ws.sheet_view.showGridLines = False
+    ws.row_dimensions[1].height = 38
+    ws.row_dimensions[2].height = 22
 
     widths = {
         1: 8,
         2: 34,
-        3: 24,
-        4: 18,
+        3: 20,
+        4: 10,
         5: 14,
         6: 14,
         7: 18,
-        8: 24,
+        8: 18,
         9: 18,
-        10: 18,
-        11: 18,
+        10: 10,
+        11: 12,
         12: 14,
         13: 18,
-        14: 18,
+        14: 10,
         15: 18,
         16: 14,
         17: 8,
@@ -719,16 +775,176 @@ def setup_month_sheet(ws):
         20: 14,
         21: 17,
         22: 14,
-        23: 14,
-        24: 16,
-        25: 18,
-        26: 16,
-        27: 18,
-        28: 16,
-        29: 16,
+        23: 12,
+        24: 14,
+        25: 14,
+        26: 14,
+        27: 12,
+        28: 14,
+        29: 14,
     }
     for col_index, width in widths.items():
         ws.column_dimensions[get_column_letter(col_index)].width = width
+
+
+def build_summary_sheet(
+    ws,
+    year: int,
+    month_entries: List[tuple[int, List[SourceRow], str, int]],
+):
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    ws.merge_cells(start_row=1, start_column=SUMMARY_COL_MONTH, end_row=1, end_column=SUMMARY_COL_SIG_AVG_RATE)
+    apply_header_style(
+        ws.cell(row=1, column=SUMMARY_COL_MONTH, value="SIG payment to Vtec"),
+        SUMMARY_YELLOW_FILL,
+        font_size=12,
+    )
+    ws.merge_cells(start_row=1, start_column=SUMMARY_COL_PAYMENT_DATE, end_row=1, end_column=SUMMARY_COL_BANK_VND)
+    apply_header_style(
+        ws.cell(
+            row=1,
+            column=SUMMARY_COL_PAYMENT_DATE,
+            value="VTEC have to sell the USD to VCB bank at VCB's buying rate and then pay to suppliers in VND",
+        ),
+        SUMMARY_BLUE_FILL,
+        font_size=12,
+    )
+    ws.merge_cells(start_row=1, start_column=SUMMARY_COL_PAYMENT_LOSS_VND, end_row=1, end_column=SUMMARY_COL_PAYMENT_LOSS_USD)
+    apply_header_style(
+        ws.cell(
+            row=1,
+            column=SUMMARY_COL_PAYMENT_LOSS_VND,
+            value="Gain/(Loss) in Forex\n(if VCB's buying rate at VTEC's date payment)",
+        ),
+        SUMMARY_BLUE_FILL,
+        font_size=12,
+    )
+    ws.merge_cells(start_row=1, start_column=SUMMARY_COL_VAT_LOSS_VND, end_row=1, end_column=SUMMARY_COL_VAT_LOSS_USD)
+    apply_header_style(
+        ws.cell(
+            row=1,
+            column=SUMMARY_COL_VAT_LOSS_VND,
+            value="Gain/(Loss) in Forex\n(if VCB's buying rate at VAT invoice's date)",
+        ),
+        SUMMARY_GREEN_FILL,
+        font_size=12,
+    )
+
+    row2 = {
+        SUMMARY_COL_MONTH: ("Month", SUMMARY_YELLOW_FILL, BLACK),
+        SUMMARY_COL_SIG_USD: ("USD", SUMMARY_YELLOW_FILL, RED),
+        SUMMARY_COL_SIG_VND: ("VND", SUMMARY_YELLOW_FILL, RED),
+        SUMMARY_COL_SIG_AVG_RATE: ("Average\nRate", SUMMARY_YELLOW_FILL, RED),
+        SUMMARY_COL_PAYMENT_DATE: ("Date", SUMMARY_BLUE_FILL, BLACK),
+        SUMMARY_COL_BANK_USD: ("USD", SUMMARY_BLUE_FILL, BLACK),
+        SUMMARY_COL_BANK_RATE: ("(VCB' buying rate at\nVTEC's date payment)", SUMMARY_BLUE_FILL, RED),
+        SUMMARY_COL_BANK_VND: ("VND", SUMMARY_BLUE_FILL, BLACK),
+        SUMMARY_COL_PAYMENT_LOSS_VND: ("VND", SUMMARY_BLUE_FILL, BLACK),
+        SUMMARY_COL_PAYMENT_LOSS_USD: ("USD", SUMMARY_BLUE_FILL, BLACK),
+        SUMMARY_COL_VAT_LOSS_VND: ("VND", SUMMARY_GREEN_FILL, BLACK),
+        SUMMARY_COL_VAT_LOSS_USD: ("USD", SUMMARY_GREEN_FILL, BLACK),
+    }
+    for col_index, (label, fill, font_color) in row2.items():
+        apply_header_style(ws.cell(row=2, column=col_index, value=label), fill, font_color=font_color, font_size=11)
+
+    ws.row_dimensions[1].height = 48
+    ws.row_dimensions[2].height = 34
+
+    widths = {
+        SUMMARY_COL_MONTH: 12,
+        SUMMARY_COL_SIG_USD: 16,
+        SUMMARY_COL_SIG_VND: 18,
+        SUMMARY_COL_SIG_AVG_RATE: 14,
+        SUMMARY_COL_PAYMENT_DATE: 16,
+        SUMMARY_COL_BANK_USD: 16,
+        SUMMARY_COL_BANK_RATE: 18,
+        SUMMARY_COL_BANK_VND: 18,
+        SUMMARY_COL_PAYMENT_LOSS_VND: 18,
+        SUMMARY_COL_PAYMENT_LOSS_USD: 14,
+        SUMMARY_COL_VAT_LOSS_VND: 18,
+        SUMMARY_COL_VAT_LOSS_USD: 14,
+    }
+    for col_index, width in widths.items():
+        ws.column_dimensions[get_column_letter(col_index)].width = width
+
+    for row_offset, (month, rows, month_sheet, end_row) in enumerate(month_entries, start=3):
+        sig_usd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_USD), 3, end_row)
+        red_invoice_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_RED_INVOICE_VND), 3, end_row)
+        payment_rate_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_PAYMENT_RATE), 3, end_row)
+        payment_vnd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_PAYMENT_VND), 3, end_row)
+        payment_loss_vnd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_FOREX_PAYMENT_VND), 3, end_row)
+        vat_loss_vnd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_FOREX_VAT_VND), 3, end_row)
+        vat_loss_usd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_FOREX_VAT_USD), 3, end_row)
+
+        ws.cell(row=row_offset, column=SUMMARY_COL_MONTH, value=MONTH_ABBR[month])
+        ws.cell(row=row_offset, column=SUMMARY_COL_SIG_USD, value=f"=SUM({sig_usd_range})")
+        ws.cell(row=row_offset, column=SUMMARY_COL_SIG_VND, value=f"=SUM({red_invoice_range})")
+        ws.cell(
+            row=row_offset,
+            column=SUMMARY_COL_SIG_AVG_RATE,
+            value=f'=IFERROR({get_column_letter(SUMMARY_COL_SIG_VND)}{row_offset}/{get_column_letter(SUMMARY_COL_SIG_USD)}{row_offset},"")',
+        )
+        ws.cell(row=row_offset, column=SUMMARY_COL_PAYMENT_DATE, value=summary_date_label(rows))
+        ws.cell(row=row_offset, column=SUMMARY_COL_BANK_USD, value=f"={get_column_letter(SUMMARY_COL_SIG_USD)}{row_offset}")
+        ws.cell(
+            row=row_offset,
+            column=SUMMARY_COL_BANK_RATE,
+            value=f'=IFERROR({get_column_letter(SUMMARY_COL_BANK_VND)}{row_offset}/{get_column_letter(SUMMARY_COL_BANK_USD)}{row_offset},"")',
+        )
+        ws.cell(row=row_offset, column=SUMMARY_COL_BANK_VND, value=f"=SUM({payment_vnd_range})")
+        ws.cell(row=row_offset, column=SUMMARY_COL_PAYMENT_LOSS_VND, value=f"=SUM({payment_loss_vnd_range})")
+        ws.cell(
+            row=row_offset,
+            column=SUMMARY_COL_PAYMENT_LOSS_USD,
+            value=f"=SUMPRODUCT(IFERROR({payment_loss_vnd_range}/{payment_rate_range},0))",
+        )
+        ws.cell(row=row_offset, column=SUMMARY_COL_VAT_LOSS_VND, value=f"=SUM({vat_loss_vnd_range})")
+        ws.cell(row=row_offset, column=SUMMARY_COL_VAT_LOSS_USD, value=f"=SUM({vat_loss_usd_range})")
+
+        for col_index in range(SUMMARY_COL_MONTH, SUMMARY_COL_VAT_LOSS_USD + 1):
+            fill = MONTHLY_WHITE_FILL
+            if col_index <= SUMMARY_COL_SIG_AVG_RATE:
+                fill = SUMMARY_YELLOW_FILL
+            elif col_index <= SUMMARY_COL_PAYMENT_LOSS_USD:
+                fill = SUMMARY_BLUE_FILL
+            elif col_index <= SUMMARY_COL_VAT_LOSS_USD:
+                fill = SUMMARY_GREEN_FILL
+            font_color = BLACK
+            if col_index in {SUMMARY_COL_SIG_AVG_RATE, SUMMARY_COL_BANK_RATE}:
+                font_color = RED
+            if col_index in {SUMMARY_COL_PAYMENT_LOSS_USD, SUMMARY_COL_VAT_LOSS_USD}:
+                apply_data_style(ws.cell(row=row_offset, column=col_index), fill_color=fill, font_color=BLACK, bold=True)
+            else:
+                apply_data_style(ws.cell(row=row_offset, column=col_index), fill_color=fill, font_color=font_color)
+
+        ws.row_dimensions[row_offset].height = SUMMARY_DATA_ROW_HEIGHT
+        ws.cell(row=row_offset, column=SUMMARY_COL_SIG_USD).number_format = USD_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_SIG_VND).number_format = VND_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_SIG_AVG_RATE).number_format = VND_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_BANK_USD).number_format = USD_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_BANK_RATE).number_format = VND_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_BANK_VND).number_format = VND_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_PAYMENT_LOSS_VND).number_format = VND_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_PAYMENT_LOSS_USD).number_format = USD_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_VAT_LOSS_VND).number_format = VND_NUMBER_FORMAT
+        ws.cell(row=row_offset, column=SUMMARY_COL_VAT_LOSS_USD).number_format = USD_NUMBER_FORMAT
+
+    total_row = len(month_entries) + 3
+    apply_total_style(ws.cell(row=total_row, column=SUMMARY_COL_MONTH, value="TOTAL:"))
+    for col_index in range(SUMMARY_COL_SIG_USD, SUMMARY_COL_VAT_LOSS_USD + 1):
+        apply_total_style(ws.cell(row=total_row, column=col_index))
+
+    ws.cell(row=total_row, column=SUMMARY_COL_PAYMENT_LOSS_VND, value=f"=SUM(I3:I{total_row - 1})")
+    ws.cell(row=total_row, column=SUMMARY_COL_PAYMENT_LOSS_USD, value=f"=SUM(J3:J{total_row - 1})")
+    ws.cell(row=total_row, column=SUMMARY_COL_VAT_LOSS_VND, value=f"=SUM(K3:K{total_row - 1})")
+    ws.cell(row=total_row, column=SUMMARY_COL_VAT_LOSS_USD, value=f"=SUM(L3:L{total_row - 1})")
+    ws.cell(row=total_row, column=SUMMARY_COL_PAYMENT_LOSS_VND).number_format = VND_NUMBER_FORMAT
+    ws.cell(row=total_row, column=SUMMARY_COL_PAYMENT_LOSS_USD).number_format = USD_NUMBER_FORMAT
+    ws.cell(row=total_row, column=SUMMARY_COL_VAT_LOSS_VND).number_format = VND_NUMBER_FORMAT
+    ws.cell(row=total_row, column=SUMMARY_COL_VAT_LOSS_USD).number_format = USD_NUMBER_FORMAT
+    ws.row_dimensions[total_row].height = SUMMARY_DATA_ROW_HEIGHT
 
 
 def set_number_format(cell, key: str):
@@ -754,6 +970,10 @@ def write_data_row(
         cell = ws.cell(row=output_row_index, column=col_index, value=value)
         apply_data_style(cell)
         set_number_format(cell, spec.key)
+        if spec.key in {"supplier_name", "payment_term", "other_references_number"}:
+            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        else:
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     usd_value = choose_numeric(
         source_row.values.get("total_usd"),
@@ -816,7 +1036,19 @@ def write_data_row(
 
     for col_index in range(OUTPUT_COL_USD, TOTAL_OUTPUT_COLUMNS + 1):
         cell = ws.cell(row=output_row_index, column=col_index)
-        apply_data_style(cell)
+        fill = MONTHLY_WHITE_FILL
+        font_color = BLACK
+        if col_index in {OUTPUT_COL_USD, OUTPUT_COL_PAYMENT_VND}:
+            fill = MONTHLY_CALC_FILL
+        elif col_index in {OUTPUT_COL_PAYMENT_RATE, OUTPUT_COL_RED_INVOICE_VND}:
+            fill = MONTHLY_RATE_FILL
+            font_color = RED
+        elif col_index in {OUTPUT_COL_VAT_RATE, OUTPUT_COL_FOREX_VAT_VND, OUTPUT_COL_FOREX_VAT_USD}:
+            fill = MONTHLY_GREEN_DATA_FILL
+            if col_index == OUTPUT_COL_VAT_RATE:
+                font_color = RED
+        apply_data_style(cell, fill_color=fill, font_color=font_color)
+        cell.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
 
     ws.cell(row=output_row_index, column=OUTPUT_COL_USD).number_format = USD_NUMBER_FORMAT
     ws.cell(row=output_row_index, column=OUTPUT_COL_PAYMENT_RATE).number_format = VND_NUMBER_FORMAT
@@ -826,6 +1058,7 @@ def write_data_row(
     ws.cell(row=output_row_index, column=OUTPUT_COL_VAT_RATE).number_format = VND_NUMBER_FORMAT
     ws.cell(row=output_row_index, column=OUTPUT_COL_FOREX_VAT_VND).number_format = VND_NUMBER_FORMAT
     ws.cell(row=output_row_index, column=OUTPUT_COL_FOREX_VAT_USD).number_format = USD_NUMBER_FORMAT
+    ws.row_dimensions[output_row_index].height = DATA_ROW_HEIGHT
 
 
 def render_audit_log(
@@ -862,7 +1095,7 @@ def render_audit_log(
     )
 
     sections = [
-        ("Folders with no .xlsx files in them or their subfolders", audit_log.folders_without_xlsx),
+        ("Folders with no .xlsx files", audit_log.folders_without_xlsx),
         ("Source files skipped because they have more than 1 sheet", audit_log.multi_sheet_files),
         ("Source file read/open errors", audit_log.source_file_errors),
         ("Source files skipped because required headers were missing", audit_log.missing_required_headers),
@@ -912,10 +1145,9 @@ def process_files(
     output_root.mkdir(parents=True, exist_ok=True)
     workbook_path, log_path = build_output_paths(output_root)
 
-    _emit(log_emit, "Scanning selected input folders recursively for .xlsx files...")
     source_files = collect_source_files(input_folders, audit_log)
     if not source_files:
-        raise ValueError("No .xlsx files were found in the selected input folders or their subfolders.")
+        raise ValueError("No .xlsx files were found in the selected input folders.")
 
     usd_rates = load_vcb_usd_rates(vcb_files, audit_log, log_emit=log_emit)
     if not usd_rates:
@@ -956,12 +1188,20 @@ def process_files(
         grouped_rows[(source_row.payment_to_supplier_date.year, source_row.payment_to_supplier_date.month)].append(source_row)
 
     wb = Workbook()
-    first_sheet = wb.active
-
     sorted_group_keys = sorted(grouped_rows.keys())
-    for sheet_index, group_key in enumerate(sorted_group_keys):
+    sorted_years = sorted({year for year, _month in sorted_group_keys})
+
+    first_sheet = wb.active
+    summary_sheets: Dict[int, object] = {}
+    for summary_index, year in enumerate(sorted_years):
+        ws = first_sheet if summary_index == 0 else wb.create_sheet()
+        ws.title = f"SUM'{year % 100:02d}"
+        summary_sheets[year] = ws
+
+    month_sheet_meta: Dict[tuple[int, int], tuple[str, int]] = {}
+    for group_key in sorted_group_keys:
         year, month = group_key
-        ws = first_sheet if sheet_index == 0 else wb.create_sheet()
+        ws = wb.create_sheet()
         ws.title = month_sheet_name(date(year, month, 1))
         setup_month_sheet(ws)
 
@@ -977,6 +1217,15 @@ def process_files(
         )
         for output_row_index, source_row in enumerate(sorted_rows, start=3):
             write_data_row(ws, output_row_index, source_row, usd_rates, audit_log)
+        month_sheet_meta[group_key] = (ws.title, ws.max_row)
+
+    for year in sorted_years:
+        month_entries = [
+            (month, grouped_rows[(year, month)], month_sheet_meta[(year, month)][0], month_sheet_meta[(year, month)][1])
+            for (_year, month) in sorted_group_keys
+            if _year == year
+        ]
+        build_summary_sheet(summary_sheets[year], year, month_entries)
 
     wb.save(workbook_path)
 
@@ -1001,7 +1250,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "folders",
         nargs="+",
-        help="Input folders containing .xlsx payment-summary files. Subfolders are scanned automatically.",
+        help="Input folders containing .xlsx payment-summary files.",
     )
     parser.add_argument(
         "--vcb",
@@ -1063,7 +1312,7 @@ if GUI_AVAILABLE:
             )
             self.set_long_description("")
 
-            self.select_folders_btn = PrimaryPushButton("Add Input Folder", self)
+            self.select_folders_btn = PrimaryPushButton("Add Input Folder(s)", self)
             self.clear_folders_btn = PrimaryPushButton("Clear Input Folders", self)
             self.select_vcb_btn = PrimaryPushButton("Select VCB File(s)", self)
             self.select_output_btn = PrimaryPushButton("Select Output Folder", self)
@@ -1155,7 +1404,6 @@ if GUI_AVAILABLE:
 
             lines = [
                 f"Input folders selected: {len(self.input_folders)}",
-                "Input scan: recursive (includes subfolders)",
             ]
             if self.input_folders:
                 lines.extend(f"- {path}" for path in self.input_folders)
@@ -1180,18 +1428,26 @@ if GUI_AVAILABLE:
 
             self.summary_box.setPlainText("\n".join(lines))
 
-        def _select_input_folder(self) -> Optional[Path]:
-            start_dir = self.input_folders[-1] if self.input_folders else self.output_dir
-            selected = QFileDialog.getExistingDirectory(self, "Select Input Folder", str(start_dir))
-            if selected:
-                return Path(selected)
-            return None
+        def _select_multiple_directories(self) -> List[Path]:
+            dialog = QFileDialog(self, "Select Input Folder(s)")
+            dialog.setFileMode(QFileDialog.Directory)
+            dialog.setOption(QFileDialog.ShowDirsOnly, True)
+            dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+
+            for view in dialog.findChildren(QListView):
+                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            for view in dialog.findChildren(QTreeView):
+                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+            if dialog.exec():
+                return [Path(path) for path in dialog.selectedFiles()]
+            return []
 
         def select_input_folders(self):
-            selected = self._select_input_folder()
+            selected = self._select_multiple_directories()
             if not selected:
                 return
-            self.input_folders = self._dedupe_paths([*self.input_folders, selected])
+            self.input_folders = self._dedupe_paths([*self.input_folders, *selected])
             self._refresh_summary()
 
         def clear_input_folders(self):
