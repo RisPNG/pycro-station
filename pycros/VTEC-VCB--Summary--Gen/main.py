@@ -18,14 +18,11 @@ from openpyxl.utils.datetime import from_excel
 try:
     from PySide6.QtCore import Qt, Signal
     from PySide6.QtWidgets import (
-        QAbstractItemView,
         QFileDialog,
         QHBoxLayout,
         QLabel,
-        QListView,
         QSizePolicy,
         QTextEdit,
-        QTreeView,
         QVBoxLayout,
         QWidget,
     )
@@ -1053,7 +1050,7 @@ if GUI_AVAILABLE:
             )
             self.set_long_description("")
 
-            self.select_folders_btn = PrimaryPushButton("Add Input Folder(s)", self)
+            self.select_folders_btn = PrimaryPushButton("Add Input Folder", self)
             self.clear_folders_btn = PrimaryPushButton("Clear Input Folders", self)
             self.select_vcb_btn = PrimaryPushButton("Select VCB File(s)", self)
             self.select_output_btn = PrimaryPushButton("Select Output Folder", self)
@@ -1169,26 +1166,18 @@ if GUI_AVAILABLE:
 
             self.summary_box.setPlainText("\n".join(lines))
 
-        def _select_multiple_directories(self) -> List[Path]:
-            dialog = QFileDialog(self, "Select Input Folder(s)")
-            dialog.setFileMode(QFileDialog.Directory)
-            dialog.setOption(QFileDialog.ShowDirsOnly, True)
-            dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-
-            for view in dialog.findChildren(QListView):
-                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-            for view in dialog.findChildren(QTreeView):
-                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-            if dialog.exec():
-                return [Path(path) for path in dialog.selectedFiles()]
-            return []
+        def _select_input_folder(self) -> Optional[Path]:
+            start_dir = self.input_folders[-1] if self.input_folders else self.output_dir
+            selected = QFileDialog.getExistingDirectory(self, "Select Input Folder", str(start_dir))
+            if selected:
+                return Path(selected)
+            return None
 
         def select_input_folders(self):
-            selected = self._select_multiple_directories()
+            selected = self._select_input_folder()
             if not selected:
                 return
-            self.input_folders = self._dedupe_paths([*self.input_folders, *selected])
+            self.input_folders = self._dedupe_paths([*self.input_folders, selected])
             self._refresh_summary()
 
         def clear_input_folders(self):

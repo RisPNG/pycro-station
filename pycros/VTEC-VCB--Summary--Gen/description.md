@@ -14,7 +14,7 @@
 > [Last updated date](#bae1ffff)
 > 2026/03/26
 
-Choose one or more input folders that contain `.xlsx` VTEC payment summaries, choose one or more VCB exchange-rate workbooks, and optionally choose an output folder.
+Add one or more input folders that contain `.xlsx` VTEC payment summaries, choose one or more VCB exchange-rate workbooks, and optionally choose an output folder. Use `Add Input Folder` again to include more folders.
 
 The pycro will:
 - combine all valid rows into one workbook
