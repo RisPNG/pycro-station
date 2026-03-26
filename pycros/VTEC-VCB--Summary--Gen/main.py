@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import threading
 from collections import defaultdict
@@ -399,11 +400,22 @@ def collect_source_files(input_folders: List[Path], audit_log: AuditLog) -> List
             audit_log.source_file_errors.append(f"{folder} | folder does not exist or is not accessible")
             continue
 
-        folder_files = [
-            path
-            for path in sorted(folder.iterdir(), key=lambda p: p.name.lower())
-            if path.is_file() and path.suffix.lower() == ".xlsx" and not path.name.startswith("~$")
-        ]
+        folder_files: List[Path] = []
+
+        def handle_walk_error(exc: OSError):
+            error_path = getattr(exc, "filename", None) or folder
+            audit_log.source_file_errors.append(f"{error_path} | could not scan subfolder: {exc.strerror or exc}")
+
+        for root, _dirs, files in os.walk(folder, onerror=handle_walk_error):
+            root_path = Path(root)
+            for file_name in sorted(files, key=str.lower):
+                if file_name.startswith("~$") or not file_name.lower().endswith(".xlsx"):
+                    continue
+                file_path = root_path / file_name
+                if file_path.is_file():
+                    folder_files.append(file_path)
+
+        folder_files.sort(key=lambda path: str(path.relative_to(folder)).lower())
         if not folder_files:
             audit_log.folders_without_xlsx.append(str(folder))
             continue
@@ -850,7 +862,7 @@ def render_audit_log(
     )
 
     sections = [
-        ("Folders with no .xlsx files", audit_log.folders_without_xlsx),
+        ("Folders with no .xlsx files in them or their subfolders", audit_log.folders_without_xlsx),
         ("Source files skipped because they have more than 1 sheet", audit_log.multi_sheet_files),
         ("Source file read/open errors", audit_log.source_file_errors),
         ("Source files skipped because required headers were missing", audit_log.missing_required_headers),
@@ -900,9 +912,10 @@ def process_files(
     output_root.mkdir(parents=True, exist_ok=True)
     workbook_path, log_path = build_output_paths(output_root)
 
+    _emit(log_emit, "Scanning selected input folders recursively for .xlsx files...")
     source_files = collect_source_files(input_folders, audit_log)
     if not source_files:
-        raise ValueError("No .xlsx files were found in the selected input folders.")
+        raise ValueError("No .xlsx files were found in the selected input folders or their subfolders.")
 
     usd_rates = load_vcb_usd_rates(vcb_files, audit_log, log_emit=log_emit)
     if not usd_rates:
@@ -988,7 +1001,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "folders",
         nargs="+",
-        help="Input folders containing .xlsx payment-summary files.",
+        help="Input folders containing .xlsx payment-summary files. Subfolders are scanned automatically.",
     )
     parser.add_argument(
         "--vcb",
@@ -1142,6 +1155,7 @@ if GUI_AVAILABLE:
 
             lines = [
                 f"Input folders selected: {len(self.input_folders)}",
+                "Input scan: recursive (includes subfolders)",
             ]
             if self.input_folders:
                 lines.extend(f"- {path}" for path in self.input_folders)
