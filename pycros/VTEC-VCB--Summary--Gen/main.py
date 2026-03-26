@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import threading
 from collections import defaultdict
@@ -19,14 +20,11 @@ from openpyxl.utils.datetime import from_excel
 try:
     from PySide6.QtCore import Qt, Signal
     from PySide6.QtWidgets import (
-        QAbstractItemView,
         QFileDialog,
         QHBoxLayout,
         QLabel,
-        QListView,
         QSizePolicy,
         QTextEdit,
-        QTreeView,
         QVBoxLayout,
         QWidget,
     )
@@ -435,11 +433,22 @@ def collect_source_files(input_folders: List[Path], audit_log: AuditLog) -> List
             audit_log.source_file_errors.append(f"{folder} | folder does not exist or is not accessible")
             continue
 
-        folder_files = [
-            path
-            for path in sorted(folder.iterdir(), key=lambda p: p.name.lower())
-            if path.is_file() and path.suffix.lower() == ".xlsx" and not path.name.startswith("~$")
-        ]
+        folder_files: List[Path] = []
+
+        def handle_walk_error(exc: OSError):
+            error_path = getattr(exc, "filename", None) or folder
+            audit_log.source_file_errors.append(f"{error_path} | could not scan subfolder: {exc.strerror or exc}")
+
+        for root, _dirs, files in os.walk(folder, onerror=handle_walk_error):
+            root_path = Path(root)
+            for file_name in sorted(files, key=str.lower):
+                if file_name.startswith("~$") or not file_name.lower().endswith(".xlsx"):
+                    continue
+                file_path = root_path / file_name
+                if file_path.is_file():
+                    folder_files.append(file_path)
+
+        folder_files.sort(key=lambda path: str(path.relative_to(folder)).lower())
         if not folder_files:
             audit_log.folders_without_xlsx.append(str(folder))
             continue
@@ -639,7 +648,7 @@ def parse_source_file(
             parts = [f"{source_file} | skipped whole file"]
             if missing_payment_rows:
                 parts.append(
-                    "Payment to Supplier empty/whitespace-only at row(s): "
+                    "Payment to Supplier missing/invalid at row(s): "
                     + ", ".join(str(row) for row in missing_payment_rows)
                 )
             if missing_vat_rows:
@@ -1095,7 +1104,7 @@ def render_audit_log(
     )
 
     sections = [
-        ("Folders with no .xlsx files", audit_log.folders_without_xlsx),
+        ("Folders with no .xlsx files in them or their subfolders", audit_log.folders_without_xlsx),
         ("Source files skipped because they have more than 1 sheet", audit_log.multi_sheet_files),
         ("Source file read/open errors", audit_log.source_file_errors),
         ("Source files skipped because required headers were missing", audit_log.missing_required_headers),
@@ -1145,9 +1154,10 @@ def process_files(
     output_root.mkdir(parents=True, exist_ok=True)
     workbook_path, log_path = build_output_paths(output_root)
 
+    _emit(log_emit, "Scanning selected input folders recursively for .xlsx files...")
     source_files = collect_source_files(input_folders, audit_log)
     if not source_files:
-        raise ValueError("No .xlsx files were found in the selected input folders.")
+        raise ValueError("No .xlsx files were found in the selected input folders or their subfolders.")
 
     usd_rates = load_vcb_usd_rates(vcb_files, audit_log, log_emit=log_emit)
     if not usd_rates:
@@ -1250,7 +1260,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "folders",
         nargs="+",
-        help="Input folders containing .xlsx payment-summary files.",
+        help="Input folders containing .xlsx payment-summary files. Subfolders are scanned automatically.",
     )
     parser.add_argument(
         "--vcb",
@@ -1312,7 +1322,7 @@ if GUI_AVAILABLE:
             )
             self.set_long_description("")
 
-            self.select_folders_btn = PrimaryPushButton("Add Input Folder(s)", self)
+            self.select_folders_btn = PrimaryPushButton("Add Input Folder", self)
             self.clear_folders_btn = PrimaryPushButton("Clear Input Folders", self)
             self.select_vcb_btn = PrimaryPushButton("Select VCB File(s)", self)
             self.select_output_btn = PrimaryPushButton("Select Output Folder", self)
@@ -1404,6 +1414,7 @@ if GUI_AVAILABLE:
 
             lines = [
                 f"Input folders selected: {len(self.input_folders)}",
+                "Input scan: recursive (includes subfolders)",
             ]
             if self.input_folders:
                 lines.extend(f"- {path}" for path in self.input_folders)
@@ -1428,26 +1439,18 @@ if GUI_AVAILABLE:
 
             self.summary_box.setPlainText("\n".join(lines))
 
-        def _select_multiple_directories(self) -> List[Path]:
-            dialog = QFileDialog(self, "Select Input Folder(s)")
-            dialog.setFileMode(QFileDialog.Directory)
-            dialog.setOption(QFileDialog.ShowDirsOnly, True)
-            dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-
-            for view in dialog.findChildren(QListView):
-                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-            for view in dialog.findChildren(QTreeView):
-                view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-            if dialog.exec():
-                return [Path(path) for path in dialog.selectedFiles()]
-            return []
+        def _select_input_folder(self) -> Optional[Path]:
+            start_dir = self.input_folders[-1] if self.input_folders else self.output_dir
+            selected = QFileDialog.getExistingDirectory(self, "Select Input Folder", str(start_dir))
+            if selected:
+                return Path(selected)
+            return None
 
         def select_input_folders(self):
-            selected = self._select_multiple_directories()
+            selected = self._select_input_folder()
             if not selected:
                 return
-            self.input_folders = self._dedupe_paths([*self.input_folders, *selected])
+            self.input_folders = self._dedupe_paths([*self.input_folders, selected])
             self._refresh_summary()
 
         def clear_input_folders(self):
