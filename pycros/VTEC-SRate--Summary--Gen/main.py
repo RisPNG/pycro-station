@@ -15,6 +15,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import quote_sheetname
 from openpyxl.utils.datetime import from_excel
 
 try:
@@ -42,10 +43,12 @@ USD_NUMBER_FORMAT = "#,###.00"
 RATE_NUMBER_FORMAT = "#,##0"
 DATE_NUMBER_FORMAT = "yyyy/mm/dd"
 DATA_ROW_HEIGHT = 20
+SUMMARY_DATA_ROW_HEIGHT = 22
 BLACK = "000000"
 WHITE = "FFFFFF"
 HEADER_FILL = "1F4E78"
 STANDARD_RATE_FILL = "DDEBF7"
+SUMMARY_TOTAL_FILL = "D9E2F3"
 STATUS_MATCH_FILL = "C6EFCE"
 STATUS_MATCH_FONT = "006100"
 STATUS_MISMATCH_FILL = "FFC7CE"
@@ -270,6 +273,16 @@ def _build_output_layout() -> tuple[List[str], Dict[str, int], int, int]:
 
 OUTPUT_HEADERS, SOURCE_OUTPUT_COL_BY_KEY, OUTPUT_COL_STANDARD_RATE, OUTPUT_COL_STATUS = _build_output_layout()
 TOTAL_OUTPUT_COLUMNS = len(OUTPUT_HEADERS)
+
+SUMMARY_COL_MONTH = 1
+SUMMARY_COL_ROWS = 2
+SUMMARY_COL_MATCH = 3
+SUMMARY_COL_MISMATCH = 4
+SUMMARY_COL_NO_S_RATE = 5
+SUMMARY_COL_NO_CURRENCY_RATE = 6
+SUMMARY_COL_BLANK_PAYMENT_TO_SUPPLIER = 7
+SUMMARY_COL_OTHER_STATUS = 8
+SUMMARY_COL_MATCH_PCT = 9
 
 VND_KEYS = {"po_amount_before_vat_vnd", "surcharge_other_vnd", "total_vnd"}
 USD_KEYS = {"po_amount_before_vat_usd", "surcharge_other_usd", "total_usd"}
@@ -623,7 +636,10 @@ def parse_source_file(
             start=header_row + 1,
         ):
             row_values = trim_trailing_blank(raw_values)
-            if not any(
+            if "no" in header_map:
+                if is_blank(row_value(row_values, header_map.get("no"))):
+                    continue
+            elif not any(
                 not is_blank(row_value(row_values, header_map.get(key)))
                 for key in SOURCE_ROW_ANCHOR_KEYS
                 if key in header_map
@@ -867,6 +883,174 @@ def setup_month_sheet(ws):
     ws.row_dimensions[1].height = 28
 
 
+def summary_sheet_range(sheet_name: str, col_index: int, start_row: int, end_row: int) -> str:
+    col_letter = get_column_letter(col_index)
+    return f"{quote_sheetname(sheet_name)}!${col_letter}${start_row}:${col_letter}${end_row}"
+
+
+def apply_total_style(cell, fill_color: str = SUMMARY_TOTAL_FILL):
+    thin = Side(style="thin", color=BLACK)
+    cell.font = Font(name="Arial", size=10, color=BLACK, bold=True)
+    cell.fill = PatternFill("solid", fgColor=fill_color)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def build_summary_sheet(
+    ws,
+    year: int,
+    month_entries: List[tuple[int, str, int]],
+):
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    ws.merge_cells(
+        start_row=1,
+        start_column=SUMMARY_COL_MONTH,
+        end_row=1,
+        end_column=SUMMARY_COL_MATCH_PCT,
+    )
+    title_cell = ws.cell(
+        row=1,
+        column=SUMMARY_COL_MONTH,
+        value=f"Status Breakdown by Month - {year}",
+    )
+    apply_header_style(title_cell)
+
+    headers = {
+        SUMMARY_COL_MONTH: ("Month", HEADER_FILL, WHITE),
+        SUMMARY_COL_ROWS: ("Rows", HEADER_FILL, WHITE),
+        SUMMARY_COL_MATCH: ("Match", STATUS_MATCH_FILL, STATUS_MATCH_FONT),
+        SUMMARY_COL_MISMATCH: ("Mismatch", STATUS_MISMATCH_FILL, STATUS_MISMATCH_FONT),
+        SUMMARY_COL_NO_S_RATE: ("No S Rate", STATUS_NEUTRAL_FILL, STATUS_NEUTRAL_FONT),
+        SUMMARY_COL_NO_CURRENCY_RATE: ("No Currency Rate", STATUS_MISMATCH_FILL, STATUS_MISMATCH_FONT),
+        SUMMARY_COL_BLANK_PAYMENT_TO_SUPPLIER: ("Blank Payment to Supplier", STANDARD_RATE_FILL, BLACK),
+        SUMMARY_COL_OTHER_STATUS: ("Other Status", HEADER_FILL, WHITE),
+        SUMMARY_COL_MATCH_PCT: ("Match %", HEADER_FILL, WHITE),
+    }
+    for col_index, (label, fill_color, font_color) in headers.items():
+        cell = ws.cell(row=2, column=col_index, value=label)
+        thin = Side(style="thin", color=BLACK)
+        cell.font = Font(name="Arial", size=10, color=font_color, bold=True)
+        cell.fill = PatternFill("solid", fgColor=fill_color)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    widths = {
+        SUMMARY_COL_MONTH: 12,
+        SUMMARY_COL_ROWS: 12,
+        SUMMARY_COL_MATCH: 12,
+        SUMMARY_COL_MISMATCH: 14,
+        SUMMARY_COL_NO_S_RATE: 14,
+        SUMMARY_COL_NO_CURRENCY_RATE: 18,
+        SUMMARY_COL_BLANK_PAYMENT_TO_SUPPLIER: 22,
+        SUMMARY_COL_OTHER_STATUS: 14,
+        SUMMARY_COL_MATCH_PCT: 12,
+    }
+    for col_index, width in widths.items():
+        ws.column_dimensions[get_column_letter(col_index)].width = width
+
+    ws.row_dimensions[1].height = 26
+    ws.row_dimensions[2].height = 32
+
+    status_range_col = OUTPUT_COL_STATUS
+    payment_to_supplier_col = SOURCE_OUTPUT_COL_BY_KEY["payment_to_supplier"]
+
+    for row_offset, (month, month_sheet, end_row) in enumerate(month_entries, start=3):
+        status_range = summary_sheet_range(month_sheet, status_range_col, 2, end_row)
+        payment_range = summary_sheet_range(month_sheet, payment_to_supplier_col, 2, end_row)
+
+        ws.cell(row=row_offset, column=SUMMARY_COL_MONTH, value=MONTH_ABBR[month])
+        ws.cell(row=row_offset, column=SUMMARY_COL_ROWS, value=f"=COUNTA({status_range})")
+        ws.cell(row=row_offset, column=SUMMARY_COL_MATCH, value=f'=COUNTIF({status_range},"MATCH")')
+        ws.cell(row=row_offset, column=SUMMARY_COL_MISMATCH, value=f'=COUNTIF({status_range},"MISMATCH")')
+        ws.cell(row=row_offset, column=SUMMARY_COL_NO_S_RATE, value=f'=COUNTIF({status_range},"NO S RATE")')
+        ws.cell(
+            row=row_offset,
+            column=SUMMARY_COL_NO_CURRENCY_RATE,
+            value=f'=COUNTIF({status_range},"NO CURRENCY RATE")',
+        )
+        ws.cell(
+            row=row_offset,
+            column=SUMMARY_COL_BLANK_PAYMENT_TO_SUPPLIER,
+            value=f"=COUNTBLANK({payment_range})",
+        )
+        ws.cell(
+            row=row_offset,
+            column=SUMMARY_COL_OTHER_STATUS,
+            value=(
+                f"=MAX(0,{get_column_letter(SUMMARY_COL_ROWS)}{row_offset}"
+                f"-SUM({get_column_letter(SUMMARY_COL_MATCH)}{row_offset}:{get_column_letter(SUMMARY_COL_NO_CURRENCY_RATE)}{row_offset}))"
+            ),
+        )
+        ws.cell(
+            row=row_offset,
+            column=SUMMARY_COL_MATCH_PCT,
+            value=(
+                f'=IFERROR({get_column_letter(SUMMARY_COL_MATCH)}{row_offset}/'
+                f'{get_column_letter(SUMMARY_COL_ROWS)}{row_offset},"")'
+            ),
+        )
+
+        for col_index in range(SUMMARY_COL_MONTH, SUMMARY_COL_MATCH_PCT + 1):
+            fill_color = WHITE
+            font_color = BLACK
+            if col_index == SUMMARY_COL_MATCH:
+                fill_color = STATUS_MATCH_FILL
+                font_color = STATUS_MATCH_FONT
+            elif col_index in {SUMMARY_COL_MISMATCH, SUMMARY_COL_NO_CURRENCY_RATE}:
+                fill_color = STATUS_MISMATCH_FILL
+                font_color = STATUS_MISMATCH_FONT
+            elif col_index == SUMMARY_COL_NO_S_RATE:
+                fill_color = STATUS_NEUTRAL_FILL
+                font_color = STATUS_NEUTRAL_FONT
+            elif col_index == SUMMARY_COL_BLANK_PAYMENT_TO_SUPPLIER:
+                fill_color = STANDARD_RATE_FILL
+            apply_data_style(ws.cell(row=row_offset, column=col_index), fill_color=fill_color, font_color=font_color)
+
+        for col_index in range(SUMMARY_COL_ROWS, SUMMARY_COL_OTHER_STATUS + 1):
+            ws.cell(row=row_offset, column=col_index).number_format = "#,##0"
+        ws.cell(row=row_offset, column=SUMMARY_COL_MATCH_PCT).number_format = "0.00%"
+        ws.row_dimensions[row_offset].height = SUMMARY_DATA_ROW_HEIGHT
+
+    total_row = len(month_entries) + 3
+    apply_total_style(ws.cell(row=total_row, column=SUMMARY_COL_MONTH, value="TOTAL"))
+    for col_index in range(SUMMARY_COL_ROWS, SUMMARY_COL_MATCH_PCT + 1):
+        apply_total_style(ws.cell(row=total_row, column=col_index))
+
+    if month_entries:
+        data_start = 3
+        data_end = total_row - 1
+        for col_index in (
+            SUMMARY_COL_ROWS,
+            SUMMARY_COL_MATCH,
+            SUMMARY_COL_MISMATCH,
+            SUMMARY_COL_NO_S_RATE,
+            SUMMARY_COL_NO_CURRENCY_RATE,
+            SUMMARY_COL_BLANK_PAYMENT_TO_SUPPLIER,
+            SUMMARY_COL_OTHER_STATUS,
+        ):
+            col_letter = get_column_letter(col_index)
+            ws.cell(row=total_row, column=col_index, value=f"=SUM({col_letter}{data_start}:{col_letter}{data_end})")
+        ws.cell(
+            row=total_row,
+            column=SUMMARY_COL_MATCH_PCT,
+            value=(
+                f'=IFERROR({get_column_letter(SUMMARY_COL_MATCH)}{total_row}/'
+                f'{get_column_letter(SUMMARY_COL_ROWS)}{total_row},"")'
+            ),
+        )
+    else:
+        for col_index in range(SUMMARY_COL_ROWS, SUMMARY_COL_OTHER_STATUS + 1):
+            ws.cell(row=total_row, column=col_index, value="=0")
+        ws.cell(row=total_row, column=SUMMARY_COL_MATCH_PCT, value='=""')
+
+    for col_index in range(SUMMARY_COL_ROWS, SUMMARY_COL_OTHER_STATUS + 1):
+        ws.cell(row=total_row, column=col_index).number_format = "#,##0"
+    ws.cell(row=total_row, column=SUMMARY_COL_MATCH_PCT).number_format = "0.00%"
+    ws.row_dimensions[total_row].height = SUMMARY_DATA_ROW_HEIGHT
+
+
 def build_status_formula(currency_rate_ref: str, standard_rate_ref: str) -> str:
     currency_text = f'TRIM(SUBSTITUTE({currency_rate_ref}&"",",",""))'
     standard_text = f'TRIM(SUBSTITUTE({standard_rate_ref}&"",",",""))'
@@ -1106,13 +1290,23 @@ def process_files(
     for source_row in all_rows:
         grouped_rows[(source_row.grouping_date.year, source_row.grouping_date.month)].append(source_row)
 
-    wb = Workbook()
     sorted_group_keys = sorted(grouped_rows.keys())
+    sorted_years = sorted({year for year, _month in sorted_group_keys})
+    wb = Workbook()
     srate_cache: Dict[date, tuple[Optional[SRateRange], int]] = {}
+    summary_sheets: Dict[int, object] = {}
 
-    for group_index, group_key in enumerate(sorted_group_keys):
+    first_sheet = wb.active
+    for summary_index, year in enumerate(sorted_years):
+        ws = first_sheet if summary_index == 0 else wb.create_sheet()
+        ws.title = f"SUM'{year % 100:02d}"
+        summary_sheets[year] = ws
+
+    month_sheet_meta: Dict[tuple[int, int], tuple[str, int]] = {}
+
+    for group_key in sorted_group_keys:
         year, month = group_key
-        ws = wb.active if group_index == 0 else wb.create_sheet()
+        ws = wb.create_sheet()
         ws.title = month_sheet_name(date(year, month, 1))
         setup_month_sheet(ws)
 
@@ -1129,6 +1323,15 @@ def process_files(
         for output_row_index, source_row in enumerate(sorted_rows, start=2):
             write_data_row(ws, output_row_index, source_row, srate_ranges, srate_cache, audit_log)
         apply_status_conditional_formatting(ws, start_row=2)
+        month_sheet_meta[group_key] = (ws.title, ws.max_row)
+
+    for year in sorted_years:
+        month_entries = [
+            (month, month_sheet_meta[(year, month)][0], month_sheet_meta[(year, month)][1])
+            for (_year, month) in sorted_group_keys
+            if _year == year
+        ]
+        build_summary_sheet(summary_sheets[year], year, month_entries)
 
     wb.save(workbook_path)
 

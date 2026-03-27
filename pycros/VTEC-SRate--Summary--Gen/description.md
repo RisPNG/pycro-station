@@ -19,6 +19,7 @@ Add one or more input folders that contain `.xlsx` VTEC payment summaries, choos
 The pycro will:
 - combine all valid rows into one workbook
 - split the output into sheets such as `JAN'25`, `FEB'25`, and `DEC'25` based on `Payment to Supplier`
+- create yearly summary sheets such as `SUM'25` with formula-based monthly status breakdowns
 - insert `Standard Rate` and `Status` after `Currency Rate`
 - read `Material Delivery -> From/To` date ranges plus `S Rate` from the selected S Rate workbook(s)
 - match `S Rate` using `VAT Invoice Date`, then mark `Status` against `Currency Rate`
