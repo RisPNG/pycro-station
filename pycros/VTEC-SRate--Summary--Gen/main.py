@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.datetime import from_excel
@@ -38,7 +39,7 @@ SCAN_MAX_COL = 64
 HEADER_SCAN_ROWS = 10
 VND_NUMBER_FORMAT = "#,##0"
 USD_NUMBER_FORMAT = "#,###.00"
-GENERAL_RATE_FORMAT = "#,##0.00"
+RATE_NUMBER_FORMAT = "#,##0"
 DATE_NUMBER_FORMAT = "yyyy/mm/dd"
 DATA_ROW_HEIGHT = 20
 BLACK = "000000"
@@ -80,7 +81,7 @@ class SourceRow:
     source_file: Path
     sheet_name: str
     row_number: int
-    payment_to_supplier_date: date
+    grouping_date: date
     vat_invoice_date: date
     values: Dict[str, object]
 
@@ -234,9 +235,18 @@ SOURCE_COLUMNS: List[ColumnSpec] = [
 SOURCE_COLUMN_BY_KEY = {spec.key: spec for spec in SOURCE_COLUMNS}
 MANDATORY_SOURCE_HEADER_KEYS = (
     "vat_invoice_date",
+    "currency_rate",
+)
+SOURCE_ROW_ANCHOR_KEYS = (
+    "no",
+    "supplier_name",
+    "vat_invoice_number",
+    "other_references_number",
     "po_amount_before_vat_vnd",
     "po_amount_before_vat_usd",
+    "currency_rate",
     "payment_to_supplier",
+    "vat_invoice_date",
 )
 
 
@@ -462,9 +472,7 @@ def find_header_row_from_rows(scanned_rows: List[List[object]]) -> tuple[int, Di
         if not row_values:
             continue
         mapping = build_header_map(row_values)
-        if "no" not in mapping:
-            continue
-        if "supplier_name" not in mapping and "vat_invoice_date" not in mapping:
+        if "vat_invoice_date" not in mapping and "currency_rate" not in mapping:
             continue
         score = len(mapping)
         if score > best_score:
@@ -603,8 +611,7 @@ def parse_source_file(
 
         rows: List[SourceRow] = []
         missing_vat_rows: List[int] = []
-        missing_payment_rows: List[int] = []
-        invalid_payment_rows: List[int] = []
+        missing_currency_rate_rows: List[int] = []
 
         for row_index, raw_values in enumerate(
             ws.iter_rows(
@@ -616,18 +623,11 @@ def parse_source_file(
             start=header_row + 1,
         ):
             row_values = trim_trailing_blank(raw_values)
-            no_value = row_value(row_values, header_map.get("no"))
-            if is_blank(no_value):
-                continue
-
-            payment_to_supplier_raw = row_value(row_values, header_map.get("payment_to_supplier"))
-            if is_blank(payment_to_supplier_raw):
-                missing_payment_rows.append(row_index)
-                continue
-
-            payment_to_supplier_date = parse_date_value(payment_to_supplier_raw, wb.epoch)
-            if payment_to_supplier_date is None:
-                invalid_payment_rows.append(row_index)
+            if not any(
+                not is_blank(row_value(row_values, header_map.get(key)))
+                for key in SOURCE_ROW_ANCHOR_KEYS
+                if key in header_map
+            ):
                 continue
 
             vat_invoice_raw = row_value(row_values, header_map.get("vat_invoice_date"))
@@ -635,6 +635,15 @@ def parse_source_file(
             if vat_invoice_date is None:
                 missing_vat_rows.append(row_index)
                 continue
+
+            currency_rate_raw = row_value(row_values, header_map.get("currency_rate"))
+            if is_blank(currency_rate_raw):
+                missing_currency_rate_rows.append(row_index)
+                continue
+
+            payment_to_supplier_raw = row_value(row_values, header_map.get("payment_to_supplier"))
+            payment_to_supplier_date = parse_date_value(payment_to_supplier_raw, wb.epoch)
+            grouping_date = payment_to_supplier_date or vat_invoice_date
 
             normalized_values: Dict[str, object] = {}
             for spec in SOURCE_COLUMNS:
@@ -645,42 +654,37 @@ def parse_source_file(
                 )
 
             normalized_values["vat_invoice_date"] = vat_invoice_date
-            normalized_values["payment_to_supplier"] = payment_to_supplier_date
+            if payment_to_supplier_date is not None:
+                normalized_values["payment_to_supplier"] = payment_to_supplier_date
 
             rows.append(
                 SourceRow(
                     source_file=source_file,
                     sheet_name=sheet_name,
                     row_number=row_index,
-                    payment_to_supplier_date=payment_to_supplier_date,
+                    grouping_date=grouping_date,
                     vat_invoice_date=vat_invoice_date,
                     values=normalized_values,
                 )
             )
 
-        if missing_payment_rows or missing_vat_rows:
+        if missing_vat_rows or missing_currency_rate_rows:
             parts = [f"{source_file} | skipped whole file"]
-            if missing_payment_rows:
-                parts.append(
-                    "Payment to Supplier missing/invalid at row(s): "
-                    + ", ".join(str(row) for row in missing_payment_rows)
-                )
             if missing_vat_rows:
                 parts.append(
                     "VAT Invoice Date missing/invalid at row(s): "
                     + ", ".join(str(row) for row in missing_vat_rows)
                 )
+            if missing_currency_rate_rows:
+                parts.append(
+                    "Currency Rate missing at row(s): "
+                    + ", ".join(str(row) for row in missing_currency_rate_rows)
+                )
             audit_log.file_level_row_issues.append(" | ".join(parts))
             return [], 0
 
-        if invalid_payment_rows:
-            audit_log.invalid_payment_to_supplier_rows.append(
-                f"{source_file} | row(s) ignored because Payment to Supplier was not a date: "
-                + ", ".join(str(row) for row in invalid_payment_rows)
-            )
-
         _emit(log_emit, f"Imported {len(rows)} row(s) from {source_file.name}")
-        return rows, len(invalid_payment_rows)
+        return rows, 0
     finally:
         wb.close()
 
@@ -845,7 +849,7 @@ def set_number_format(cell, key: str):
     elif key in USD_KEYS:
         cell.number_format = USD_NUMBER_FORMAT
     elif key == "currency_rate" and isinstance(cell.value, (int, float)):
-        cell.number_format = GENERAL_RATE_FORMAT
+        cell.number_format = RATE_NUMBER_FORMAT
 
 
 def setup_month_sheet(ws):
@@ -863,14 +867,38 @@ def setup_month_sheet(ws):
     ws.row_dimensions[1].height = 28
 
 
-def status_details(currency_rate: Optional[float], standard_rate: Optional[float]) -> tuple[str, str, str]:
-    if standard_rate is None:
-        return "NO S RATE", STATUS_NEUTRAL_FILL, STATUS_NEUTRAL_FONT
-    if currency_rate is None:
-        return "NO CURRENCY RATE", STATUS_MISMATCH_FILL, STATUS_MISMATCH_FONT
-    if rates_equal(currency_rate, standard_rate):
-        return "MATCH", STATUS_MATCH_FILL, STATUS_MATCH_FONT
-    return "MISMATCH", STATUS_MISMATCH_FILL, STATUS_MISMATCH_FONT
+def build_status_formula(currency_rate_ref: str, standard_rate_ref: str) -> str:
+    currency_text = f'TRIM(SUBSTITUTE({currency_rate_ref}&"",",",""))'
+    standard_text = f'TRIM(SUBSTITUTE({standard_rate_ref}&"",",",""))'
+    return (
+        f'=IF(LEN({standard_text})=0,"NO S RATE",'
+        f'IF(LEN({currency_text})=0,"NO CURRENCY RATE",'
+        f'IF(ISNUMBER(SEARCH({standard_text},{currency_text})),"MATCH","MISMATCH")))'
+    )
+
+
+def apply_status_conditional_formatting(ws, start_row: int = 2):
+    if ws.max_row < start_row:
+        return
+
+    status_col_letter = get_column_letter(OUTPUT_COL_STATUS)
+    range_ref = f"{status_col_letter}{start_row}:{status_col_letter}{ws.max_row}"
+    rules = [
+        ("MATCH", STATUS_MATCH_FILL, STATUS_MATCH_FONT),
+        ("MISMATCH", STATUS_MISMATCH_FILL, STATUS_MISMATCH_FONT),
+        ("NO CURRENCY RATE", STATUS_MISMATCH_FILL, STATUS_MISMATCH_FONT),
+        ("NO S RATE", STATUS_NEUTRAL_FILL, STATUS_NEUTRAL_FONT),
+    ]
+    for value, fill_color, font_color in rules:
+        ws.conditional_formatting.add(
+            range_ref,
+            FormulaRule(
+                formula=[f'=${status_col_letter}{start_row}="{value}"'],
+                fill=PatternFill("solid", fgColor=fill_color),
+                font=Font(name="Arial", size=10, color=font_color, bold=True),
+                stopIfTrue=False,
+            ),
+        )
 
 
 def write_data_row(
@@ -907,23 +935,27 @@ def write_data_row(
         )
 
     standard_rate = matched_range.standard_rate if matched_range else None
-    currency_rate = parse_number(source_row.values.get("currency_rate"))
-    status_text, status_fill, status_font_color = status_details(currency_rate, standard_rate)
 
     standard_rate_cell = ws.cell(row=output_row_index, column=OUTPUT_COL_STANDARD_RATE, value=standard_rate)
     apply_data_style(standard_rate_cell, fill_color=STANDARD_RATE_FILL)
     standard_rate_cell.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
     if isinstance(standard_rate, (int, float)):
-        standard_rate_cell.number_format = GENERAL_RATE_FORMAT
+        standard_rate_cell.number_format = RATE_NUMBER_FORMAT
 
-    status_cell = ws.cell(row=output_row_index, column=OUTPUT_COL_STATUS, value=status_text)
-    apply_data_style(status_cell, fill_color=status_fill, font_color=status_font_color, bold=True)
+    currency_rate_ref = f"{get_column_letter(SOURCE_OUTPUT_COL_BY_KEY['currency_rate'])}{output_row_index}"
+    standard_rate_ref = f"{get_column_letter(OUTPUT_COL_STANDARD_RATE)}{output_row_index}"
+    status_cell = ws.cell(
+        row=output_row_index,
+        column=OUTPUT_COL_STATUS,
+        value=build_status_formula(currency_rate_ref, standard_rate_ref),
+    )
+    apply_data_style(status_cell, bold=True)
     status_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     currency_rate_cell = ws.cell(row=output_row_index, column=SOURCE_OUTPUT_COL_BY_KEY["currency_rate"])
     currency_rate_cell.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
     if isinstance(currency_rate_cell.value, (int, float)):
-        currency_rate_cell.number_format = GENERAL_RATE_FORMAT
+        currency_rate_cell.number_format = RATE_NUMBER_FORMAT
 
     for key in (
         "po_amount_before_vat_vnd",
@@ -965,7 +997,6 @@ def render_audit_log(
             f"Source files imported: {result.source_files_imported}",
             f"Source files skipped: {result.source_files_skipped}",
             f"Rows imported: {result.rows_imported}",
-            f"Rows ignored because Payment to Supplier was not a date: {result.rows_ignored_non_date_payment_to_supplier}",
             f"Monthly sheets created: {result.month_sheet_count}",
             f"Workbook output: {result.workbook_path}",
             f"Audit log: {result.log_path}",
@@ -977,8 +1008,7 @@ def render_audit_log(
         ("Source files skipped because they have more than 1 sheet", audit_log.multi_sheet_files),
         ("Source file read/open errors", audit_log.source_file_errors),
         ("Source files skipped because required headers were missing", audit_log.missing_required_headers),
-        ("Source files skipped because mandatory date cells were missing or invalid", audit_log.file_level_row_issues),
-        ("Rows ignored because Payment to Supplier was not a date", audit_log.invalid_payment_to_supplier_rows),
+        ("Source files skipped because required row values were missing or invalid", audit_log.file_level_row_issues),
         ("S Rate file errors", audit_log.srate_file_errors),
         ("S Rate files skipped because required headers were not found", audit_log.srate_missing_headers),
         ("S Rate rows ignored because From/To/S Rate was invalid", audit_log.invalid_srate_rows),
@@ -1074,7 +1104,7 @@ def process_files(
 
     grouped_rows: Dict[tuple[int, int], List[SourceRow]] = defaultdict(list)
     for source_row in all_rows:
-        grouped_rows[(source_row.payment_to_supplier_date.year, source_row.payment_to_supplier_date.month)].append(source_row)
+        grouped_rows[(source_row.grouping_date.year, source_row.grouping_date.month)].append(source_row)
 
     wb = Workbook()
     sorted_group_keys = sorted(grouped_rows.keys())
@@ -1089,7 +1119,7 @@ def process_files(
         sorted_rows = sorted(
             grouped_rows[group_key],
             key=lambda item: (
-                item.payment_to_supplier_date,
+                item.grouping_date,
                 item.vat_invoice_date,
                 str(item.values.get("supplier_name") or "").upper(),
                 item.source_file.name.upper(),
@@ -1098,6 +1128,7 @@ def process_files(
         )
         for output_row_index, source_row in enumerate(sorted_rows, start=2):
             write_data_row(ws, output_row_index, source_row, srate_ranges, srate_cache, audit_log)
+        apply_status_conditional_formatting(ws, start_row=2)
 
     wb.save(workbook_path)
 
