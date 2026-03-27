@@ -799,15 +799,15 @@ def load_srate_ranges(
 
 
 def resolve_standard_rate(
-    payment_date: date,
+    lookup_date: date,
     srate_ranges: List[SRateRange],
     cache: Dict[date, tuple[Optional[SRateRange], int]],
 ) -> tuple[Optional[SRateRange], int]:
-    cached = cache.get(payment_date)
+    cached = cache.get(lookup_date)
     if cached is not None:
         return cached
 
-    matches = [item for item in srate_ranges if item.from_date <= payment_date <= item.to_date]
+    matches = [item for item in srate_ranges if item.from_date <= lookup_date <= item.to_date]
     matches.sort(
         key=lambda item: (
             (item.to_date - item.from_date).days,
@@ -817,7 +817,7 @@ def resolve_standard_rate(
         )
     )
     resolved = (matches[0] if matches else None, len(matches))
-    cache[payment_date] = resolved
+    cache[lookup_date] = resolved
     return resolved
 
 
@@ -892,17 +892,17 @@ def write_data_row(
         else:
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    matched_range, match_count = resolve_standard_rate(source_row.payment_to_supplier_date, srate_ranges, srate_cache)
+    matched_range, match_count = resolve_standard_rate(source_row.vat_invoice_date, srate_ranges, srate_cache)
     if matched_range is None:
         aggregate_date_issue(
             audit_log.missing_standard_rates,
-            source_row.payment_to_supplier_date,
+            source_row.vat_invoice_date,
             f"{source_row.source_file.name} row {source_row.row_number}",
         )
     elif match_count > 1:
         aggregate_date_issue(
             audit_log.ambiguous_standard_rate_matches,
-            source_row.payment_to_supplier_date,
+            source_row.vat_invoice_date,
             f"{source_row.source_file.name} row {source_row.row_number}",
         )
 
@@ -1005,12 +1005,12 @@ def render_audit_log(
             )
 
     append_date_section(
-        "Payment dates with no matching S Rate range",
+        "VAT Invoice dates with no matching S Rate range",
         audit_log.missing_standard_rates,
         "without a matching S Rate range",
     )
     append_date_section(
-        "Payment dates with multiple matching S Rate ranges",
+        "VAT Invoice dates with multiple matching S Rate ranges",
         audit_log.ambiguous_standard_rate_matches,
         "with multiple matching S Rate ranges",
     )
