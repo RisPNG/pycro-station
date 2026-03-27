@@ -411,7 +411,6 @@ def choose_numeric(primary: object, fallback: object) -> Optional[float]:
         primary_number = parse_number(primary)
         if primary_number is not None:
             return primary_number
-        return None
     if not is_blank(fallback):
         return parse_number(fallback)
     return None
@@ -881,7 +880,6 @@ def build_summary_sheet(
     for row_offset, (month, rows, month_sheet, end_row) in enumerate(month_entries, start=3):
         sig_usd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_USD), 3, end_row)
         red_invoice_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_RED_INVOICE_VND), 3, end_row)
-        payment_rate_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_PAYMENT_RATE), 3, end_row)
         payment_vnd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_PAYMENT_VND), 3, end_row)
         payment_loss_vnd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_FOREX_PAYMENT_VND), 3, end_row)
         vat_loss_vnd_range = month_range(month_sheet, get_column_letter(OUTPUT_COL_FOREX_VAT_VND), 3, end_row)
@@ -907,7 +905,10 @@ def build_summary_sheet(
         ws.cell(
             row=row_offset,
             column=SUMMARY_COL_PAYMENT_LOSS_USD,
-            value=f"=SUMPRODUCT(IFERROR({payment_loss_vnd_range}/{payment_rate_range},0))",
+            value=(
+                f'=IFERROR({get_column_letter(SUMMARY_COL_PAYMENT_LOSS_VND)}{row_offset}/'
+                f'{get_column_letter(SUMMARY_COL_BANK_RATE)}{row_offset},"")'
+            ),
         )
         ws.cell(row=row_offset, column=SUMMARY_COL_VAT_LOSS_VND, value=f"=SUM({vat_loss_vnd_range})")
         ws.cell(row=row_offset, column=SUMMARY_COL_VAT_LOSS_USD, value=f"=SUM({vat_loss_usd_range})")
