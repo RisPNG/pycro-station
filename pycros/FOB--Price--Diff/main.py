@@ -108,6 +108,10 @@ def money_abs_diff(a: Any, b: Any) -> Decimal:
     """Absolute difference between 2 money values, rounded to cents."""
     return (safe_decimal(a) - safe_decimal(b)).copy_abs().quantize(MONEY_CENT, rounding=ROUND_HALF_UP)
 
+def format_money_trace(value: Any) -> str:
+    """Format money values consistently for trace output."""
+    return f"{safe_decimal(value).quantize(MONEY_CENT, rounding=ROUND_HALF_UP):.2f}"
+
 def normalize_date_str(date_val):
     """
     Convert various date formats (datetime obj, 'MM/DD/YYYY', 'YYYY-MM-DD')
@@ -184,6 +188,20 @@ def calculate_target_effective_date(buy_mth_str):
         target_month = 9
 
     return f"{target_month:02d}/01/{target_year}"
+
+def normalize_pps_season_year(value: Any) -> str:
+    """Normalize PPS/OCCC season-year values like 'SP26' / \"SP'26\" / 'SP 26'."""
+    if value is None:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(value).strip().upper())
+
+def build_target_pps_season_year(season_val: Any, season_year_val: Any) -> str:
+    """Build the PPS SEASON_YEAR key from OCCC SEASON + SEASON YEAR."""
+    season = re.sub(r"[^A-Z]", "", str(season_val).strip().upper()) if season_val is not None else ""
+    year_digits = re.sub(r"\D", "", str(season_year_val).strip()) if season_year_val is not None else ""
+    if not season or len(year_digits) < 2:
+        return ""
+    return normalize_pps_season_year(f"{season}{year_digits[-2:]}")
 
 
 def build_timestamped_copy_path(input_path: str, timestamp: str, label: str = "updated") -> str:
@@ -306,7 +324,7 @@ def refresh_excel_formulas(filepath, log_emit):
     except Exception as e:
         log_emit(f"Could not launch Excel: {e}")
 
-def refine_remarks(remarks_list):
+def refine_remarks(remarks_list, trace_steps: Optional[List[str]] = None):
     """Post-process remarks to consolidate messages."""
     if not remarks_list:
         return []
@@ -315,11 +333,25 @@ def refine_remarks(remarks_list):
     s_pps_match_ext = "PPS OFOB match for extended sizes"
     s_pps_miss_reg = "PPS OFOB doesn't match for regular sizes"
     s_pps_miss_ext = "PPS OFOB doesn't match for extended sizes"
+    s_ofob_miss_reg = "OFOB (Regular sizes) doesn't match with PPM"
+    s_ofob_miss_ext = "OFOB (Extended sizes) doesn't match with PPM"
     s_final_miss_reg = "FINAL FOB (Regular sizes) doesn't match with PPM"
     s_final_miss_ext = "FINAL FOB (Extended sizes) doesn't match with PPM"
+    s_nike_final_all = "NIKE FINAL FOB issue for all sizes"
+    surcharge_remarks = {
+        "S/C MIN PRODUCTION (ZPMX) doesn't match",
+        "S/C Min Material (ZMMX) doesn't match",
+        "S/C Misc (ZMSX) doesn't match",
+        "S/C VAS Manual (ZVAX) doesn't match",
+    }
 
     r_set = set(remarks_list)
-    targets = {s_pps_match_reg, s_pps_match_ext, s_pps_miss_reg, s_pps_miss_ext, s_final_miss_reg, s_final_miss_ext}
+    targets = {
+        s_pps_match_reg, s_pps_match_ext,
+        s_pps_miss_reg, s_pps_miss_ext,
+        s_ofob_miss_reg, s_ofob_miss_ext,
+        s_final_miss_reg, s_final_miss_ext,
+    }
 
     final_list = []
 
@@ -328,46 +360,211 @@ def refine_remarks(remarks_list):
         if r not in targets:
             final_list.append(r)
 
-    # 2. Regular Sizes Logic
+    # 2. OFOB / PPS regular logic
     added_pps_issue_reg = False
     added_nike_issue_reg = False
+    keep_ofob_miss_reg = False
 
-    if s_pps_miss_reg in r_set and s_final_miss_reg in r_set:
+    if s_pps_miss_reg in r_set and s_ofob_miss_reg in r_set:
         added_pps_issue_reg = True
-    elif s_pps_match_reg in r_set and s_final_miss_reg in r_set:
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: PPS OFOB regular mismatch + OFOB regular mismatch -> PPS OFOB issue for regular sizes."
+            )
+    elif s_pps_match_reg in r_set and s_ofob_miss_reg in r_set:
         added_nike_issue_reg = True
-    elif s_pps_miss_reg in r_set and s_final_miss_reg not in r_set:
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: PPS OFOB regular match + OFOB regular mismatch -> NIKE OFOB issue for regular sizes."
+            )
+    elif s_pps_miss_reg in r_set:
         added_pps_issue_reg = True
-    elif s_final_miss_reg in r_set:
-        final_list.append(s_final_miss_reg)
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: PPS OFOB regular mismatch -> PPS OFOB issue for regular sizes."
+            )
+    elif s_ofob_miss_reg in r_set:
+        keep_ofob_miss_reg = True
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: keeping OFOB regular mismatch because PPS OFOB regular data did not resolve it into PPS OFOB or NIKE OFOB issue."
+            )
 
-    # 3. Extended Sizes Logic
+    # 3. OFOB / PPS extended logic
     added_pps_issue_ext = False
     added_nike_issue_ext = False
+    keep_ofob_miss_ext = False
 
-    if s_pps_miss_ext in r_set and s_final_miss_ext in r_set:
+    if s_pps_miss_ext in r_set and s_ofob_miss_ext in r_set:
         added_pps_issue_ext = True
-    elif s_pps_match_ext in r_set and s_final_miss_ext in r_set:
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: PPS OFOB extended mismatch + OFOB extended mismatch -> PPS OFOB issue for extended sizes."
+            )
+    elif s_pps_match_ext in r_set and s_ofob_miss_ext in r_set:
         added_nike_issue_ext = True
-    elif s_pps_miss_ext in r_set and s_final_miss_ext not in r_set:
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: PPS OFOB extended match + OFOB extended mismatch -> NIKE OFOB issue for extended sizes."
+            )
+    elif s_pps_miss_ext in r_set:
         added_pps_issue_ext = True
-    elif s_final_miss_ext in r_set:
-        final_list.append(s_final_miss_ext)
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: PPS OFOB extended mismatch -> PPS OFOB issue for extended sizes."
+            )
+    elif s_ofob_miss_ext in r_set:
+        keep_ofob_miss_ext = True
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: keeping OFOB extended mismatch because PPS OFOB extended data did not resolve it into PPS OFOB or NIKE OFOB issue."
+            )
 
-    # 4. Consolidate
+    # 4. Keep raw OFOB mismatches that were not consumed by issue logic
+    if keep_ofob_miss_reg:
+        final_list.append(s_ofob_miss_reg)
+    if keep_ofob_miss_ext:
+        final_list.append(s_ofob_miss_ext)
+
+    # 5. FINAL FOB logic
+    has_ppm_surcharge_issue = any(r in r_set for r in surcharge_remarks)
+    has_ofob_ppm_issue = s_ofob_miss_reg in r_set or s_ofob_miss_ext in r_set
+    has_nike_ofob_issue = added_nike_issue_reg or added_nike_issue_ext
+    suppress_final_fob_outputs = has_ppm_surcharge_issue or has_ofob_ppm_issue or has_nike_ofob_issue
+
+    if suppress_final_fob_outputs:
+        if (s_final_miss_reg in r_set or s_final_miss_ext in r_set) and trace_steps is not None:
+            reasons = []
+            if has_ppm_surcharge_issue:
+                reasons.append("PPM surcharge mismatch exists")
+            if has_ofob_ppm_issue:
+                reasons.append("OFOB vs PPM mismatch exists")
+            if has_nike_ofob_issue:
+                reasons.append("NIKE OFOB issue exists")
+            trace_steps.append(
+                f"Consolidation: suppressing FINAL FOB remarks because {'; '.join(reasons)}."
+            )
+    else:
+        if s_final_miss_reg in r_set and s_final_miss_ext in r_set:
+            final_list.append(s_nike_final_all)
+            if trace_steps is not None:
+                trace_steps.append(
+                    "Consolidation: FINAL FOB regular mismatch + FINAL FOB extended mismatch -> NIKE FINAL FOB issue for all sizes."
+                )
+        else:
+            if s_final_miss_reg in r_set:
+                final_list.append(s_final_miss_reg)
+                if trace_steps is not None:
+                    trace_steps.append(
+                        "Consolidation: keeping FINAL FOB regular mismatch because only one size bucket is present."
+                    )
+            if s_final_miss_ext in r_set:
+                final_list.append(s_final_miss_ext)
+                if trace_steps is not None:
+                    trace_steps.append(
+                        "Consolidation: keeping FINAL FOB extended mismatch because only one size bucket is present."
+                    )
+
+    # 6. Consolidate PPS OFOB issues
     if added_pps_issue_reg and added_pps_issue_ext:
         final_list.append("PPS OFOB issue for all sizes")
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: regular + extended PPS OFOB issues collapsed into PPS OFOB issue for all sizes."
+            )
     else:
         if added_pps_issue_reg: final_list.append("PPS OFOB issue for regular sizes")
         if added_pps_issue_ext: final_list.append("PPS OFOB issue for extended sizes")
 
+    # 7. Consolidate NIKE OFOB issues
     if added_nike_issue_reg and added_nike_issue_ext:
         final_list.append("NIKE OFOB issue for all sizes")
+        if trace_steps is not None:
+            trace_steps.append(
+                "Consolidation: regular + extended NIKE OFOB issues collapsed into NIKE OFOB issue for all sizes."
+            )
     else:
         if added_nike_issue_reg: final_list.append("NIKE OFOB issue for regular sizes")
         if added_nike_issue_ext: final_list.append("NIKE OFOB issue for extended sizes")
 
     return final_list
+
+def build_trace_output_path(output_path: str) -> str:
+    """Place a companion trace file beside the generated output file."""
+    base, _ = os.path.splitext(output_path)
+    return f"{base}_trace.txt"
+
+def write_trace_report(trace_path: str, source_path: str, output_path: str, row_traces: List[Dict[str, Any]]) -> None:
+    """Write a human-readable trace report for generated remarks."""
+    with open(trace_path, mode='w', encoding='utf-8') as f:
+        f.write("FOB Price Diff Trace Report\n")
+        f.write(f"Source master: {source_path}\n")
+        f.write(f"Generated output: {output_path}\n")
+        f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("\n")
+
+        if not row_traces:
+            f.write("No non-CORRECT remarks were generated.\n")
+            return
+
+        for row_trace in row_traces:
+            f.write("=" * 80 + "\n")
+            f.write(f"Row {row_trace['row_number']}\n")
+            f.write(f"Master source row: {source_path} :: row {row_trace['row_number']}\n")
+            f.write(f"NK SAP PO: {row_trace['po'] or '(blank)'}\n")
+            f.write(f"PO LINE ITEM: {row_trace['line'] or '(blank)'}\n")
+            f.write(f"STYLE: {row_trace['style'] or '(blank)'}\n")
+            f.write(f"BUY MTH: {row_trace['buy_mth'] or '(blank)'}\n")
+            f.write(f"SEASON: {row_trace['season'] or '(blank)'}\n")
+            f.write(f"SEASON YEAR: {row_trace['season_year'] or '(blank)'}\n")
+            f.write(f"Target PPS SEASON_YEAR: {row_trace['target_pps_season_year'] or '(blank)'}\n")
+            f.write(f"CW: {row_trace['cw'] or '(blank)'}\n")
+            f.write(f"PRICE DIFF REMARKS: {row_trace['final_remark']}\n")
+            f.write(f"DPOM - Incorrect FOB: {row_trace['final_dpom']}\n")
+            f.write("Trace:\n")
+            for step in row_trace["steps"]:
+                f.write(f"- {step}\n")
+            f.write("\n")
+
+def format_ppm_entry_trace(entry: Dict[str, Any]) -> str:
+    """Render a compact trace line for a matched PPM row."""
+    return (
+        f"{entry.get('source_path', '(unknown file)')} :: row {entry.get('source_row', '?')}"
+        f" | Size Description {entry.get('size') or '(blank)'}"
+        f" | Surcharge Min Mat Main Body {format_money_trace(entry.get('ag', 0))}"
+        f" | Surcharge Min Material Trim {format_money_trace(entry.get('ai', 0))}"
+        f" | Surcharge Min Productivity {format_money_trace(entry.get('ak', 0))}"
+        f" | Surcharge Misc {format_money_trace(entry.get('am', 0))}"
+        f" | Surcharge VAS {format_money_trace(entry.get('ao', 0))}"
+        f" | Gross Price/FOB {format_money_trace(entry.get('aq', 0))}"
+    )
+
+def format_pps_entry_trace(entry: Dict[str, Any]) -> str:
+    """Render a compact trace line for a matched PPS row."""
+    return (
+        f"{entry.get('source_path', '(unknown file)')} :: row {entry.get('source_row', '?')}"
+        f" | SEASON_YEAR {entry.get('season_year') or '(blank)'}"
+        f" | COLOR {entry.get('color') or '(blank)'}"
+        f" | SIZE_DATA {entry.get('size_data') or '(blank)'}"
+        f" | LOCAL_QUOTE_AMOUNT {format_money_trace(entry.get('quote', 0))}"
+    )
+
+def format_money_list_trace(values: List[Any]) -> str:
+    """Format a list of money values for trace output."""
+    if not values:
+        return "(none)"
+    return ", ".join(format_money_trace(v) for v in values)
+
+def format_ppm_total_breakdown(entry: Dict[str, Any]) -> str:
+    """Explain how a PPM total was calculated for a single source row."""
+    return (
+        f"Surcharge Min Mat Main Body {format_money_trace(entry.get('ag', 0))}"
+        f" + Surcharge Min Material Trim {format_money_trace(entry.get('ai', 0))}"
+        f" + Surcharge Min Productivity {format_money_trace(entry.get('ak', 0))}"
+        f" + Surcharge Misc {format_money_trace(entry.get('am', 0))}"
+        f" + Surcharge VAS {format_money_trace(entry.get('ao', 0))}"
+        f" + Gross Price/FOB {format_money_trace(entry.get('aq', 0))}"
+    )
 
 def load_file_data(path, log_emit) -> Tuple[List[Any], List[List[Any]], Any]:
     """Load data from Excel or CSV."""
@@ -454,7 +651,9 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     'am': safe_float(row[col_am]) if col_am != -1 else 0.0,
                     'ao': safe_float(row[col_ao]) if col_ao != -1 else 0.0,
                     'aq': safe_float(row[col_aq]) if col_aq != -1 else 0.0,
-                    'size': str(row[col_size]).strip() if col_size != -1 else ""
+                    'size': str(row[col_size]).strip() if col_size != -1 else "",
+                    'source_path': ppm_path,
+                    'source_row': r_idx + 1,
                 }
 
                 if key not in ppm_lookup: ppm_lookup[key] = []
@@ -474,6 +673,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
 
             col_style = get_col_index(headers, ["STYLE"])
             col_eff_date = get_col_index(headers, ["EFFECTIVE_DATE"])
+            col_season_year = get_col_index(headers, ["SEASON_YEAR", "SEASON YEAR"])
             col_color = get_col_index(headers, ["COLOR"])
             col_size_data = get_col_index(headers, ["SIZE_DATA"])
             col_quote = get_col_index(headers, ["LOCAL_QUOTE_AMOUNT"])
@@ -492,11 +692,19 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     continue
 
                 color = str(row[col_color]).strip() if col_color != -1 and row[col_color] is not None else ""
+                season_year = normalize_pps_season_year(row[col_season_year]) if col_season_year != -1 and row[col_season_year] is not None else ""
                 size_data = str(row[col_size_data]).strip() if col_size_data != -1 and row[col_size_data] is not None else ""
                 quote = safe_float(row[col_quote]) if col_quote != -1 else 0.0
 
                 key = (style, eff_date)
-                entry = {'color': color, 'size_data': size_data, 'quote': quote}
+                entry = {
+                    'season_year': season_year,
+                    'color': color,
+                    'size_data': size_data,
+                    'quote': quote,
+                    'source_path': pps_path,
+                    'source_row': r_idx + 1,
+                }
 
                 if key not in pps_lookup: pps_lookup[key] = []
                 pps_lookup[key].append(entry)
@@ -550,6 +758,8 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
 
             idx_style = get_col_index(headers, ["STYLE"])
             idx_buy_mth = get_col_index(headers, ["BUY MTH"])
+            idx_season = get_col_index(headers, ["SEASON"])
+            idx_season_year = get_col_index(headers, ["SEASON YEAR", "SEASON_YEAR"])
             idx_cw = get_col_index(headers, ["CW"])
 
             idx_ofob_reg = get_col_index(headers, ["OFOB (Regular sizes)"])
@@ -596,31 +806,61 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     output_csv_data[header_idx].append("DPOM - Incorrect FOB")
                     idx_dpom_fob = len(output_csv_data[header_idx]) - 1
 
+            trace_rows = []
+
             for r_i in range(header_idx + 1, len(rows_read)):
                 row_vals = rows_read[r_i]
-                if not row_vals: continue
+                if not row_vals:
+                    continue
 
                 remarks = []
                 dpom_errors = [] # Store "Size Price" mismatches
+                row_trace_steps = []
 
-                # --- PPM Comparison ---
+                # Common row context
                 po_val = str(row_vals[idx_nk_po]).strip() if idx_nk_po != -1 else ""
                 line_val = ""
                 if idx_line != -1:
-                    try: line_val = str(int(float(row_vals[idx_line])))
-                    except: line_val = str(row_vals[idx_line]).strip()
+                    try:
+                        line_val = str(int(float(row_vals[idx_line])))
+                    except:
+                        line_val = str(row_vals[idx_line]).strip()
+                style_val = str(row_vals[idx_style]).strip() if idx_style != -1 else ""
+                buy_mth_val = str(row_vals[idx_buy_mth]).strip() if idx_buy_mth != -1 else ""
+                season_val = str(row_vals[idx_season]).strip().upper() if idx_season != -1 and row_vals[idx_season] is not None else ""
+                season_year_val = str(row_vals[idx_season_year]).strip() if idx_season_year != -1 and row_vals[idx_season_year] is not None else ""
+                target_pps_season_year = build_target_pps_season_year(season_val, season_year_val)
+                cw_val = str(row_vals[idx_cw]).strip() if idx_cw != -1 else ""
+                ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
 
+                # --- PPM Comparison ---
                 if po_val and line_val:
                     ppm_entries = ppm_lookup.get((po_val, line_val))
                     if ppm_entries:
+                        row_trace_steps.append(
+                            f"PPM lookup matched {len(ppm_entries)} row(s) for NK SAP PO {po_val} / PO LINE ITEM {line_val}."
+                        )
+                        for idx_ppm, entry in enumerate(ppm_entries, start=1):
+                            row_trace_steps.append(
+                                f"PPM matched row {idx_ppm}: {format_ppm_entry_trace(entry)}."
+                            )
+
                         # Avg calc for surcharges
                         sum_ag = sum_ai = sum_am = sum_ao = 0.0
                         count = len(ppm_entries)
+                        ppm_ag_values = []
+                        ppm_ai_values = []
+                        ppm_am_values = []
+                        ppm_ao_values = []
                         for entry in ppm_entries:
                             sum_ag += entry['ag']
                             sum_ai += entry['ai']
                             sum_am += entry['am']
                             sum_ao += entry['ao']
+                            ppm_ag_values.append(entry['ag'])
+                            ppm_ai_values.append(entry['ai'])
+                            ppm_am_values.append(entry['am'])
+                            ppm_ao_values.append(entry['ao'])
 
                         ave_ppm_ag = sum_ag / count if count else 0.0
                         ave_ppm_ai = sum_ai / count if count else 0.0
@@ -630,34 +870,69 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                         # Surcharge Checks - treat >= $0.01 as mismatch
                         if idx_sc_min_prod != -1 and money_abs_diff(row_vals[idx_sc_min_prod], ave_ppm_ag) >= MONEY_CENT:
                             remarks.append("S/C MIN PRODUCTION (ZPMX) doesn't match")
+                            row_trace_steps.append(
+                                f"S/C Min Production mismatch: OCCC {format_money_trace(row_vals[idx_sc_min_prod])} from column S/C Min Production (ZPMX) vs PPM avg {format_money_trace(ave_ppm_ag)} from Surcharge Min Mat Main Body across {count} matched PPM row(s) [{format_money_list_trace(ppm_ag_values)}]."
+                            )
 
                         # Min Mat
                         occc_zmmx = safe_float(row_vals[idx_sc_min_mat]) if idx_sc_min_mat != -1 else 0.0
                         zmmx_cmt = str(row_vals[idx_sc_min_mat_comment]).strip().upper() if idx_sc_min_mat_comment != -1 and row_vals[idx_sc_min_mat_comment] else ""
                         if idx_sc_min_mat != -1 and zmmx_cmt != "DN" and money_abs_diff(occc_zmmx, ave_ppm_ai) >= MONEY_CENT:
                             remarks.append("S/C Min Material (ZMMX) doesn't match")
+                            row_trace_steps.append(
+                                f"S/C Min Material mismatch: OCCC {format_money_trace(occc_zmmx)} from column S/C Min Material (ZMMX) vs PPM avg {format_money_trace(ave_ppm_ai)} from Surcharge Min Material Trim across {count} matched PPM row(s) [{format_money_list_trace(ppm_ai_values)}]."
+                            )
 
                         # Misc
                         occc_zmsx = safe_float(row_vals[idx_sc_misc]) if idx_sc_misc != -1 else 0.0
                         zmsx_cmt = str(row_vals[idx_sc_misc_comment]).strip().upper() if idx_sc_misc_comment != -1 and row_vals[idx_sc_misc_comment] else ""
                         if idx_sc_misc != -1 and zmsx_cmt != "DN" and money_abs_diff(occc_zmsx, ave_ppm_am) >= MONEY_CENT:
                             remarks.append("S/C Misc (ZMSX) doesn't match")
+                            row_trace_steps.append(
+                                f"S/C Misc mismatch: OCCC {format_money_trace(occc_zmsx)} from column S/C Misc (ZMSX) vs PPM avg {format_money_trace(ave_ppm_am)} from Surcharge Misc across {count} matched PPM row(s) [{format_money_list_trace(ppm_am_values)}]."
+                            )
 
                         if idx_sc_vas != -1 and money_abs_diff(row_vals[idx_sc_vas], ave_ppm_ao) >= MONEY_CENT:
                             remarks.append("S/C VAS Manual (ZVAX) doesn't match")
+                            row_trace_steps.append(
+                                f"S/C VAS mismatch: OCCC {format_money_trace(row_vals[idx_sc_vas])} from column S/C VAS Manual (ZVAX) vs PPM avg {format_money_trace(ave_ppm_ao)} from Surcharge VAS across {count} matched PPM row(s) [{format_money_list_trace(ppm_ao_values)}]."
+                            )
 
-                        # Final FOB Checks
-                        ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
+                        # OFOB / Final FOB Checks
+                        occc_ofob_reg = safe_float(row_vals[idx_ofob_reg]) if idx_ofob_reg != -1 else 0.0
+                        occc_ofob_ext = safe_float(row_vals[idx_ofob_ext]) if idx_ofob_ext != -1 else 0.0
                         occc_final_reg = safe_float(row_vals[idx_final_reg]) if idx_final_reg != -1 else 0.0
                         occc_final_ext = safe_float(row_vals[idx_final_ext]) if idx_final_ext != -1 else 0.0
 
-                        fob_mismatch_found = False # Flag to avoid spamming "Remarks" but keep collecting DPOM errors
+                        ofob_mismatch_found_reg = False
+                        ofob_mismatch_found_ext = False
+                        fob_mismatch_found_reg = False
+                        fob_mismatch_found_ext = False
 
                         for entry in ppm_entries:
-                            ppm_total = round(entry['ag'] + entry['ai'] + entry['ak'] +
-                                              entry['am'] + entry['ao'] + entry['aq'], 2)
+                            ppm_gross_fob = round(entry['aq'], 2)
+                            ppm_total = round(
+                                entry['ag'] + entry['ai'] + entry['ak'] + entry['am'] + entry['ao'] + entry['aq'],
+                                2
+                            )
                             is_ext = is_extended_size(entry['size'], ext_threshold)
+                            target_ofob = round(occc_ofob_ext if is_ext else occc_ofob_reg, 2)
                             target_fob = round(occc_final_ext if is_ext else occc_final_reg, 2)
+
+                            # OFOB vs PPM Gross Price/FOB - treat >= $0.01 as mismatch
+                            if ppm_gross_fob > 0 and money_abs_diff(target_ofob, ppm_gross_fob) >= MONEY_CENT:
+                                lbl = "Extended" if is_ext else "Regular"
+                                row_trace_steps.append(
+                                    f"OFOB {lbl.lower()} mismatch for size {entry['size'] or '(blank)'} using PPM row {entry.get('source_path', '(unknown file)')} :: row {entry.get('source_row', '?')}: OCCC {format_money_trace(target_ofob)} from column OFOB ({lbl} sizes) vs PPM Gross Price/FOB {format_money_trace(ppm_gross_fob)}."
+                                )
+
+                                label_seen = ofob_mismatch_found_ext if is_ext else ofob_mismatch_found_reg
+                                if not label_seen:
+                                    remarks.append(f"OFOB ({lbl} sizes) doesn't match with PPM")
+                                    if is_ext:
+                                        ofob_mismatch_found_ext = True
+                                    else:
+                                        ofob_mismatch_found_reg = True
 
                             # treat >= $0.01 as mismatch
                             if ppm_total > 0 and money_abs_diff(target_fob, ppm_total) >= MONEY_CENT:
@@ -665,62 +940,168 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
 
                                 # Add to DPOM Error List: "Size Price"
                                 dpom_errors.append(f"{entry['size']} {ppm_total:.2f}")
+                                row_trace_steps.append(
+                                    f"FINAL FOB {lbl.lower()} mismatch for size {entry['size'] or '(blank)'} using PPM row {entry.get('source_path', '(unknown file)')} :: row {entry.get('source_row', '?')}: OCCC {format_money_trace(target_fob)} from column FINAL FOB ({lbl} sizes) vs PPM total {format_money_trace(ppm_total)} = {format_ppm_total_breakdown(entry)}."
+                                )
 
-                                # Add to Remarks (Only once per row to avoid clutter)
-                                if not fob_mismatch_found:
+                                # Add one FINAL FOB remark per size bucket while still keeping all DPOM size mismatches.
+                                label_seen = fob_mismatch_found_ext if is_ext else fob_mismatch_found_reg
+                                if not label_seen:
                                     row_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {target_fob} vs PPM {ppm_total}")
                                     remarks.append(f"FINAL FOB ({lbl} sizes) doesn't match with PPM")
-                                    fob_mismatch_found = True
+                                    if is_ext:
+                                        fob_mismatch_found_ext = True
+                                    else:
+                                        fob_mismatch_found_reg = True
 
                                 # Do NOT break here. Continue checking other sizes for DPOM column.
+                    else:
+                        row_trace_steps.append(
+                            f"PPM lookup found no rows for NK SAP PO {po_val} / PO LINE ITEM {line_val}."
+                        )
+                else:
+                    row_trace_steps.append("PPM lookup skipped because NK SAP PO or PO LINE ITEM is blank.")
 
                 # --- PPS Comparison ---
-                style_val = str(row_vals[idx_style]).strip() if idx_style != -1 else ""
-                buy_mth_val = str(row_vals[idx_buy_mth]).strip() if idx_buy_mth != -1 else ""
-                cw_val = str(row_vals[idx_cw]).strip() if idx_cw != -1 else ""
-
                 if style_val and buy_mth_val:
                     target_date = calculate_target_effective_date(buy_mth_val)
                     if target_date:
+                        row_trace_steps.append(
+                            f"PPS lookup key: STYLE {style_val}, BUY MTH {buy_mth_val} -> EFFECTIVE_DATE {target_date}, SEASON {season_val or '(blank)'}, SEASON YEAR {season_year_val or '(blank)'} -> PPS SEASON_YEAR {target_pps_season_year or '(blank)'}, CW {cw_val or '(blank)'}."
+                        )
                         pps_candidates = pps_lookup.get((style_val, target_date))
                         if pps_candidates:
-                            matched_rows = [r for r in pps_candidates if r['color'] == cw_val]
-                            if not matched_rows: matched_rows = [r for r in pps_candidates if not r['color']]
-
-                            if not matched_rows:
-                                remarks.append("No matching PPS (Color)")
+                            row_trace_steps.append(
+                                f"PPS style/date pool matched {len(pps_candidates)} row(s) for STYLE {style_val} and EFFECTIVE_DATE {target_date}."
+                            )
+                            season_filtered_rows = pps_candidates
+                            if target_pps_season_year:
+                                season_filtered_rows = [r for r in pps_candidates if r['season_year'] == target_pps_season_year]
+                                row_trace_steps.append(
+                                    f"PPS SEASON_YEAR matches for {target_pps_season_year}: {len(season_filtered_rows)} row(s)."
+                                )
+                                other_season_rows = [r for r in pps_candidates if r['season_year'] != target_pps_season_year]
+                                if other_season_rows:
+                                    other_season_values = sorted({r['season_year'] or '(blank)' for r in other_season_rows})
+                                    sample_seasons = ", ".join(other_season_values[:10])
+                                    suffix = "" if len(other_season_values) <= 10 else ", ..."
+                                    row_trace_steps.append(
+                                        f"PPS rows excluded by SEASON_YEAR filter: {len(other_season_rows)} row(s) with other SEASON_YEAR values ({sample_seasons}{suffix})."
+                                    )
                             else:
-                                # Regular - THRESHOLD 0.01
-                                reg_match = next((r for r in matched_rows if not r['size_data']), None)
-                                occc_ofob_reg = safe_float(row_vals[idx_ofob_reg])
-                                if reg_match:
-                                    if money_abs_diff(reg_match['quote'], occc_ofob_reg) == 0:
-                                        remarks.append("PPS OFOB match for regular sizes")
-                                    else:
-                                        remarks.append("PPS OFOB doesn't match for regular sizes")
-                                elif occc_ofob_reg > 0:
-                                    remarks.append("PPS OFOB missing regular size entry")
+                                row_trace_steps.append(
+                                    "PPS SEASON_YEAR filter skipped because OCCC SEASON or SEASON YEAR is blank/invalid."
+                                )
 
-                                # Extended - THRESHOLD 0.01
-                                ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
-                                occc_ofob_ext = safe_float(row_vals[idx_ofob_ext])
-                                if ext_threshold not in ["-", "", "NONE", "NA"] or occc_ofob_ext > 0:
-                                    ext_match = next((r for r in matched_rows if is_extended_size(r['size_data'], ext_threshold)), None)
-                                    if ext_match:
-                                        if money_abs_diff(ext_match['quote'], occc_ofob_ext) == 0:
-                                            remarks.append("PPS OFOB match for extended sizes")
+                            if not season_filtered_rows:
+                                remarks.append("No matching PPS found")
+                                row_trace_steps.append(
+                                    f"No PPS row matched SEASON_YEAR {target_pps_season_year or '(blank)'} after STYLE {style_val} and EFFECTIVE_DATE {target_date}."
+                                )
+                            else:
+                                matched_rows = [r for r in season_filtered_rows if r['color'] == cw_val]
+                                blank_color_rows = [r for r in season_filtered_rows if not r['color']]
+                                other_color_rows = [r for r in season_filtered_rows if r['color'] and r['color'] != cw_val]
+
+                                row_trace_steps.append(
+                                    f"PPS exact COLOR matches for {cw_val or '(blank)'}: {len(matched_rows)} row(s)."
+                                )
+                                row_trace_steps.append(
+                                    f"PPS blank COLOR rows available for fallback: {len(blank_color_rows)} row(s)."
+                                )
+                                if other_color_rows:
+                                    other_colors = sorted({r['color'] for r in other_color_rows})
+                                    sample_colors = ", ".join(other_colors[:10])
+                                    suffix = "" if len(other_colors) <= 10 else ", ..."
+                                    row_trace_steps.append(
+                                        f"PPS rows excluded by color filter: {len(other_color_rows)} row(s) with other COLOR values ({sample_colors}{suffix})."
+                                    )
+                                if matched_rows:
+                                    row_trace_steps.append(
+                                        f"Using exact COLOR match row(s) for COLOR {cw_val or '(blank)' }."
+                                    )
+                                    for idx_pps, entry in enumerate(matched_rows, start=1):
+                                        row_trace_steps.append(
+                                            f"PPS color-matched row {idx_pps}: {format_pps_entry_trace(entry)}."
+                                        )
+                                else:
+                                    matched_rows = blank_color_rows
+                                    if matched_rows:
+                                        row_trace_steps.append(
+                                            f"No PPS row matched COLOR {cw_val or '(blank)'}; using {len(matched_rows)} blank COLOR fallback row(s)."
+                                        )
+                                        for idx_pps, entry in enumerate(matched_rows, start=1):
+                                            row_trace_steps.append(
+                                                f"PPS blank-color fallback row {idx_pps}: {format_pps_entry_trace(entry)}."
+                                            )
+
+                                if not matched_rows:
+                                    remarks.append("No matching PPS found")
+                                    row_trace_steps.append(
+                                        f"No PPS row matched COLOR {cw_val or '(blank)'} and no blank COLOR fallback row was available."
+                                    )
+                                else:
+                                    # Regular - THRESHOLD 0.01
+                                    reg_match = next((r for r in matched_rows if not r['size_data']), None)
+                                    occc_ofob_reg = safe_float(row_vals[idx_ofob_reg])
+                                    if reg_match:
+                                        row_trace_steps.append(
+                                            f"Selected PPS regular row: {format_pps_entry_trace(reg_match)}."
+                                        )
+                                        if money_abs_diff(reg_match['quote'], occc_ofob_reg) == 0:
+                                            remarks.append("PPS OFOB match for regular sizes")
+                                            row_trace_steps.append(
+                                                f"Regular PPS comparison matched: PPS LOCAL_QUOTE_AMOUNT {format_money_trace(reg_match['quote'])} vs OCCC OFOB (Regular sizes) {format_money_trace(occc_ofob_reg)}."
+                                            )
                                         else:
-                                            remarks.append("PPS OFOB doesn't match for extended sizes")
-                                    elif occc_ofob_ext > 0:
-                                        remarks.append("PPS OFOB missing extended size entry")
+                                            remarks.append("PPS OFOB doesn't match for regular sizes")
+                                            row_trace_steps.append(
+                                                f"Regular PPS comparison mismatched: PPS LOCAL_QUOTE_AMOUNT {format_money_trace(reg_match['quote'])} vs OCCC OFOB (Regular sizes) {format_money_trace(occc_ofob_reg)}."
+                                            )
+                                    elif occc_ofob_reg > 0:
+                                        remarks.append("PPS OFOB missing regular size entry")
+                                        row_trace_steps.append(
+                                            f"No PPS regular row with blank SIZE_DATA was found while OCCC OFOB (Regular sizes) is {format_money_trace(occc_ofob_reg)}."
+                                        )
+
+                                    # Extended - THRESHOLD 0.01
+                                    occc_ofob_ext = safe_float(row_vals[idx_ofob_ext])
+                                    if ext_threshold not in ["-", "", "NONE", "NA"] or occc_ofob_ext > 0:
+                                        ext_match = next((r for r in matched_rows if is_extended_size(r['size_data'], ext_threshold)), None)
+                                        if ext_match:
+                                            row_trace_steps.append(
+                                                f"Selected PPS extended row with Extended Sizes threshold {ext_threshold or '(blank)'}: {format_pps_entry_trace(ext_match)}."
+                                            )
+                                            if money_abs_diff(ext_match['quote'], occc_ofob_ext) == 0:
+                                                remarks.append("PPS OFOB match for extended sizes")
+                                                row_trace_steps.append(
+                                                    f"Extended PPS comparison matched: PPS LOCAL_QUOTE_AMOUNT {format_money_trace(ext_match['quote'])} vs OCCC OFOB (Extended sizes) {format_money_trace(occc_ofob_ext)}."
+                                                )
+                                            else:
+                                                remarks.append("PPS OFOB doesn't match for extended sizes")
+                                                row_trace_steps.append(
+                                                    f"Extended PPS comparison mismatched: PPS LOCAL_QUOTE_AMOUNT {format_money_trace(ext_match['quote'])} vs OCCC OFOB (Extended sizes) {format_money_trace(occc_ofob_ext)}."
+                                                )
+                                        elif occc_ofob_ext > 0:
+                                            remarks.append("PPS OFOB missing extended size entry")
+                                            row_trace_steps.append(
+                                                f"No PPS extended row met Extended Sizes threshold {ext_threshold or '(blank)'} while OCCC OFOB (Extended sizes) is {format_money_trace(occc_ofob_ext)}."
+                                            )
                         else:
                             remarks.append("No matching PPS found")
+                            row_trace_steps.append(
+                                f"No PPS rows matched STYLE {style_val} and EFFECTIVE_DATE {target_date}."
+                            )
                     else:
                         remarks.append("Invalid BUY MTH format")
+                        row_trace_steps.append(f"BUY MTH {buy_mth_val} could not be converted into a PPS EFFECTIVE_DATE.")
+                else:
+                    row_trace_steps.append("PPS lookup skipped because STYLE or BUY MTH is blank.")
 
                 # --- Post-Processing ---
                 if remarks:
-                    remarks = refine_remarks(remarks)
+                    row_trace_steps.append(f"Raw remarks before consolidation: {'; '.join(remarks)}.")
+                    remarks = refine_remarks(remarks, row_trace_steps)
 
                 # --- Write Output ---
 
@@ -756,6 +1137,24 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                         output_csv_data[r_i].append("")
                     output_csv_data[r_i][idx_dpom_fob] = final_dpom_val
 
+                if final_remark != "CORRECT" or final_dpom_val != "CORRECT":
+                    row_trace_steps.append(f"Final PRICE DIFF REMARKS: {final_remark}.")
+                    row_trace_steps.append(f"Final DPOM - Incorrect FOB: {final_dpom_val}.")
+                    trace_rows.append({
+                        "row_number": r_i + 1,
+                        "po": po_val,
+                        "line": line_val,
+                        "style": style_val,
+                        "buy_mth": buy_mth_val,
+                        "season": season_val,
+                        "season_year": season_year_val,
+                        "target_pps_season_year": target_pps_season_year,
+                        "cw": cw_val,
+                        "final_remark": final_remark,
+                        "final_dpom": final_dpom_val,
+                        "steps": row_trace_steps,
+                    })
+
             out_path = build_timestamped_copy_path(occc_path, run_timestamp, label="updated")
             if is_excel:
                 wb_write.save(out_path)
@@ -764,9 +1163,13 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     writer = csv.writer(f)
                     writer.writerows(output_csv_data)
 
+            trace_path = build_trace_output_path(out_path)
+            write_trace_report(trace_path, occc_path, out_path, trace_rows)
+
             success_count += 1
             last_output = out_path
             log_emit(f"Output saved: {out_path}")
+            log_emit(f"Trace saved: {trace_path}")
 
         except Exception as e:
             log_emit(f"Failed to process {os.path.basename(occc_path)}: {e}")
