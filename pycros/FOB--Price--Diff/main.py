@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
     QLabel,
+    QCheckBox,
     QTextEdit,
     QWidget,
     QSizePolicy
@@ -30,6 +31,11 @@ try:
     HAS_XLWINGS = True
 except ImportError:
     HAS_XLWINGS = False
+
+try:
+    from PackagesPage import CheckIconButton  # type: ignore
+except Exception:
+    CheckIconButton = None
 
 # --- Logic Implementation ---
 
@@ -602,7 +608,7 @@ def pick_worksheet(wb, preferred_names: List[str]):
             return wb[name]
     return wb.active
 
-def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> Tuple[str, int, int]:
+def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, debug_mode: bool = False) -> Tuple[str, int, int]:
     success_count = 0
     fail_count = 0
     last_output = ""
@@ -1163,13 +1169,13 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit) -> 
                     writer = csv.writer(f)
                     writer.writerows(output_csv_data)
 
-            trace_path = build_trace_output_path(out_path)
-            write_trace_report(trace_path, occc_path, out_path, trace_rows)
-
             success_count += 1
             last_output = out_path
             log_emit(f"Output saved: {out_path}")
-            log_emit(f"Trace saved: {trace_path}")
+            if debug_mode:
+                trace_path = build_trace_output_path(out_path)
+                write_trace_report(trace_path, occc_path, out_path, trace_rows)
+                log_emit(f"Trace saved: {trace_path}")
 
         except Exception as e:
             log_emit(f"Failed to process {os.path.basename(occc_path)}: {e}")
@@ -1200,6 +1206,17 @@ class MainWidget(QWidget):
             "border: 1px solid #3a3a3a; border-radius: 6px;"
         )
         self.set_long_description("")
+
+        self.debug_mode_toggle = None
+        self.debug_mode_checkbox = None
+        self.debug_mode_label = QLabel("Debug mode (generate trace text file)", self)
+        self.debug_mode_label.setStyleSheet("color: #dcdcdc; background: transparent;")
+        if CheckIconButton is not None:
+            self.debug_mode_toggle = CheckIconButton(self, initially_checked=False)
+        else:
+            self.debug_mode_checkbox = QCheckBox(self.debug_mode_label.text(), self)
+            self.debug_mode_checkbox.setChecked(False)
+            self.debug_mode_checkbox.setStyleSheet("color: #dcdcdc; background: transparent;")
 
         self.select_master_btn = PrimaryPushButton("Select Master (OCCC)", self)
         self.select_ppm_btn = PrimaryPushButton("Select PPM Reports", self)
@@ -1242,6 +1259,17 @@ class MainWidget(QWidget):
 
         main_layout = QVBoxLayout(self)
         main_layout.addWidget(self.desc_label)
+
+        debug_layout = QHBoxLayout()
+        if self.debug_mode_toggle is not None:
+            debug_layout.addWidget(self.debug_mode_toggle, 0, Qt.AlignVCenter)
+            debug_layout.addWidget(self.debug_mode_label, 0, Qt.AlignVCenter)
+            debug_layout.addStretch(1)
+            main_layout.addLayout(debug_layout)
+        elif self.debug_mode_checkbox is not None:
+            main_layout.addWidget(self.debug_mode_checkbox, 0)
+        else:
+            main_layout.addWidget(self.debug_mode_label, 0)
 
         row1 = QHBoxLayout()
         row1.addWidget(self.select_master_btn)
@@ -1305,10 +1333,18 @@ class MainWidget(QWidget):
         text = text_box.toPlainText().strip()
         return [line.strip() for line in text.split("\n") if line.strip()]
 
+    def _debug_mode_enabled(self) -> bool:
+        if self.debug_mode_toggle is not None:
+            return bool(self.debug_mode_toggle.isChecked())
+        if self.debug_mode_checkbox is not None:
+            return bool(self.debug_mode_checkbox.isChecked())
+        return False
+
     def run_process(self):
         master_files = self.get_files_from_box(self.master_files_box)
         ppm_files = self.get_files_from_box(self.ppm_files_box)
         pps_files = self.get_files_from_box(self.pps_files_box)
+        debug_mode = self._debug_mode_enabled()
 
         if not master_files:
             MessageBox("Warning", "Please select OCCC Master file.", self).exec()
@@ -1329,7 +1365,14 @@ class MainWidget(QWidget):
 
         def worker():
             try:
-                last_file, ok, fail = process_logic(master_files, ppm_files, pps_files, self.log_message.emit, self.report_message.emit)
+                last_file, ok, fail = process_logic(
+                    master_files,
+                    ppm_files,
+                    pps_files,
+                    self.log_message.emit,
+                    self.report_message.emit,
+                    debug_mode=debug_mode,
+                )
                 self.processing_done.emit(ok, fail, last_file)
             except Exception as e:
                 self.log_message.emit(f"CRITICAL ERROR: {e}")
