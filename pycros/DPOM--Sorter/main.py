@@ -223,6 +223,15 @@ def year_sort_value(val: Any) -> int:
     """Best-effort year parsing for sorting (handles numbers/strings like '2025'/'2025.0')."""
     if val in (None, ""):
         return 0
+    if isinstance(val, bool):
+        return 0
+    try:
+        if isinstance(val, (int, float)):
+            return int(val)
+        s = str(val).strip()
+        return int(float(s)) if s else 0
+    except Exception:
+        return 0
 
 
 def numeric_sort_value(val: Any) -> int:
@@ -380,12 +389,12 @@ class ProcessingLogic:
             }
             pivoted_rows.append(obj)
 
-        # Step 5: Sort records (Year + Style + OGAC first)
+        # Step 5: Sort records (Year + Style + Season + OGAC first)
         pivoted_rows.sort(key=lambda x: (
             year_sort_value(x.get('year')),
             x['style_head'],
-            x['ogac_dt'] or datetime.max,
             x['season_rank'],
+            x['ogac_dt'] or datetime.max,
             x['po'],
             x['style_cw'],
             x.get('po_line_sort', 0),
@@ -494,8 +503,6 @@ class ProcessingLogic:
             style_fob_by_size = {}
 
             # Group by Planning Year + Planning Season + OGAC date within style.
-            # NOTE: We preserve the existing SortRecord ordering (year -> season -> OGAC),
-            #       so we must not re-sort OGAC groups purely by OGAC date here.
             ogac_groups = defaultdict(list)
             for item in style_items:
                 ogac_dt = item.get('ogac_dt')
@@ -503,10 +510,15 @@ class ProcessingLogic:
                 ogac_group_key = (item.get('year') or 0, item.get('season_rank') or 9, ogac_date)
                 ogac_groups[ogac_group_key].append(item)
 
-            ogac_keys = list(ogac_groups.keys())
-            ogac_none_keys = [k for k in ogac_keys if k[2] is None]
-            if ogac_none_keys:
-                ogac_keys = [k for k in ogac_keys if k[2] is not None] + ogac_none_keys
+            ogac_keys = sorted(
+                ogac_groups.keys(),
+                key=lambda k: (
+                    year_sort_value(k[0]),
+                    k[1] if k[1] is not None else 9,
+                    k[2] is None,
+                    k[2] or date.max,
+                )
+            )
 
             for ogac_group_key in ogac_keys:
                 ogac_items = ogac_groups[ogac_group_key]
