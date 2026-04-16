@@ -31,7 +31,7 @@ COLOR_DARK_GREEN = "FF00B050"  # cDGreen = 5287936
 COLOR_MAGENTA = "800080"  # cDMagenta = 8388736
 
 # Destination countries that require separating each Material (incl. colorway)
-SPLIT_MATERIAL_BY_DEST_COUNTRY = {"INDONESIA", "MEXICO"}
+SPLIT_MATERIAL_BY_DEST_COUNTRY = {"INDONESIA", "MEXICO", "CANADA"}
 
 # Column indices in raw data (0-based)
 COL_VENDOR = 0
