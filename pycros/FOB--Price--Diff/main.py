@@ -2,7 +2,6 @@ import os
 import csv
 import re
 import threading
-import warnings
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import List, Tuple, Any, Dict, Optional
@@ -22,8 +21,13 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import PrimaryPushButton, MessageBox
 
 # Excel Imports
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl import Workbook, load_workbook
+
+
+try:
+    import xlrd  # for legacy .xls support
+except Exception:
+    xlrd = None
 
 # Excel Automation for Formula Calculation
 try:
@@ -72,22 +76,7 @@ def get_col_index(headers, target_names):
             return idx
     return -1
 
-def safe_float(value):
-    """Safely convert value to float, handling currency strings."""
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-
-    # String cleanup
-    s_val = str(value).strip().replace(" ", "").replace("$", "").replace(",", "")
-    if s_val == "-" or s_val == "":
-        return 0.0
-    try:
-        return float(s_val)
-    except ValueError:
-        return 0.0
-
+MONEY_ZERO = Decimal("0")
 MONEY_CENT = Decimal("0.01")
 
 def safe_decimal(value: Any) -> Decimal:
@@ -117,6 +106,43 @@ def money_abs_diff(a: Any, b: Any) -> Decimal:
 def format_money_trace(value: Any) -> str:
     """Format money values consistently for trace output."""
     return f"{safe_decimal(value).quantize(MONEY_CENT, rounding=ROUND_HALF_UP):.2f}"
+
+def money_sum(values: List[Any]) -> Decimal:
+    """Add money values using Decimal end-to-end."""
+    total = MONEY_ZERO
+    for value in values:
+        total += safe_decimal(value)
+    return total
+
+def money_average(values: List[Any]) -> Decimal:
+    """Average money values using Decimal end-to-end."""
+    if not values:
+        return MONEY_ZERO
+    return money_sum(values) / Decimal(len(values))
+
+def normalize_line_item(value: Any) -> str:
+    """Normalize PO line item values without float conversion."""
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        dec = Decimal(raw.replace(",", ""))
+        if dec == dec.to_integral_value():
+            return str(dec.to_integral_value())
+    except Exception:
+        pass
+    return raw
+
+def get_row_value(row: Any, idx: int, default: Any = None) -> Any:
+    """Safely read a row value by zero-based index."""
+    if idx < 0 or row is None:
+        return default
+    try:
+        return row[idx] if idx < len(row) else default
+    except TypeError:
+        return default
 
 def normalize_date_str(date_val):
     """
@@ -210,10 +236,12 @@ def build_target_pps_season_year(season_val: Any, season_year_val: Any) -> str:
     return normalize_pps_season_year(f"{season}{year_digits[-2:]}")
 
 
-def build_timestamped_copy_path(input_path: str, timestamp: str, label: str = "updated") -> str:
+def build_timestamped_copy_path(input_path: str, timestamp: str, label: str = "updated", output_ext: Optional[str] = None) -> str:
     """Generate output path beside input file with timestamp prefix (no overwrite)."""
     base_dir = os.path.dirname(input_path) or os.getcwd()
     base_name = os.path.basename(input_path)
+    if output_ext:
+        base_name = f"{os.path.splitext(base_name)[0]}{output_ext}"
     out_name = f"{timestamp}_{label}_{base_name}"
     out_path = os.path.join(base_dir, out_name)
 
@@ -313,20 +341,15 @@ def refresh_excel_formulas(filepath, log_emit):
 
     try:
         log_emit(f"Auto-calculating formulas for {os.path.basename(filepath)}... (This may take a moment)")
-        app = xw.App(visible=False)
-        app.display_alerts = False
-        try:
-            wb = app.books.open(filepath)
-            wb.save()
-            wb.close()
-            log_emit("Formulas calculated and file saved.")
-        except Exception as e:
-            log_emit(f"Excel Automation Error: {e}")
-        finally:
+        with xw.App(visible=False, add_book=False) as app:
+            app.display_alerts = False
             try:
-                app.quit()
-            except:
-                pass
+                wb = app.books.open(filepath)
+                wb.save()
+                wb.close()
+                log_emit("Formulas calculated and file saved.")
+            except Exception as e:
+                log_emit(f"Excel Automation Error: {e}")
     except Exception as e:
         log_emit(f"Could not launch Excel: {e}")
 
@@ -572,6 +595,54 @@ def format_ppm_total_breakdown(entry: Dict[str, Any]) -> str:
         f" + Gross Price/FOB {format_money_trace(entry.get('aq', 0))}"
     )
 
+def _xlrd_cell_value(book, cell):
+    """Convert an xlrd cell into a normal Python value."""
+    from xlrd import XL_CELL_BOOLEAN, XL_CELL_DATE, xldate_as_datetime
+
+    if cell.ctype == XL_CELL_DATE:
+        try:
+            return xldate_as_datetime(cell.value, book.datemode)
+        except Exception:
+            return cell.value
+    if cell.ctype == XL_CELL_BOOLEAN:
+        return bool(cell.value)
+    return cell.value
+
+def _pick_xlrd_sheet(book, preferred_names: Optional[List[str]] = None):
+    """Pick an xlrd sheet by preferred name, falling back to the first sheet."""
+    if preferred_names:
+        normalized_targets = {normalize_header(name) for name in preferred_names}
+        for sheet in book.sheets():
+            if normalize_header(sheet.name) in normalized_targets:
+                return sheet
+    return book.sheet_by_index(0)
+
+def load_xls_rows(path: str, preferred_names: Optional[List[str]] = None) -> List[List[Any]]:
+    """Load .xls rows with xlrd."""
+    if xlrd is None:
+        raise RuntimeError("xlrd is required to read .xls files. Please install xlrd.")
+
+    book = xlrd.open_workbook(path, formatting_info=False)
+    sheet = _pick_xlrd_sheet(book, preferred_names)
+    rows: List[List[Any]] = []
+    for r_idx in range(sheet.nrows):
+        row_values = []
+        for c_idx in range(sheet.ncols):
+            row_values.append(_xlrd_cell_value(book, sheet.cell(r_idx, c_idx)))
+        rows.append(row_values)
+    return rows
+
+def load_xls_as_workbook(path: str, preferred_names: Optional[List[str]] = None) -> Workbook:
+    """Load a legacy .xls sheet into an openpyxl Workbook for output as .xlsx."""
+    rows = load_xls_rows(path, preferred_names)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = preferred_names[0] if preferred_names else "Sheet1"
+    for r_idx, row in enumerate(rows, start=1):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    return wb
+
 def load_file_data(path, log_emit) -> Tuple[List[Any], List[List[Any]], Any]:
     """Load data from Excel or CSV."""
     ext = os.path.splitext(path)[1].lower()
@@ -592,6 +663,9 @@ def load_file_data(path, log_emit) -> Tuple[List[Any], List[List[Any]], Any]:
         ws = wb.active
         rows = list(ws.iter_rows(values_only=True))
         return rows, rows, wb
+    elif ext == '.xls':
+        rows = load_xls_rows(path)
+        return rows, rows, None
     else:
         raise ValueError("Unsupported file format")
 
@@ -608,23 +682,121 @@ def pick_worksheet(wb, preferred_names: List[str]):
             return wb[name]
     return wb.active
 
+def find_header_row_idx(rows: List[Any], marker: str = "NK SAP PO") -> int:
+    """Find the OCCC header row by the unique NK SAP PO header cell."""
+    targets = {normalize_header(marker), "NK SAP PO (45/35)"}
+    for row_idx, row in enumerate(rows):
+        if not row:
+            continue
+        for cell in row:
+            if normalize_header(cell) in targets:
+                return row_idx
+    raise ValueError("Could not find OCCC header row. Expected a unique 'NK SAP PO' header cell.")
+
+ColumnSpec = Tuple[str, List[str]]
+
+def _dedupe_column_specs(specs: List[ColumnSpec]) -> List[ColumnSpec]:
+    """Preserve order while removing duplicate display labels."""
+    seen = set()
+    unique: List[ColumnSpec] = []
+    for label, names in specs:
+        if label in seen:
+            continue
+        seen.add(label)
+        unique.append((label, names))
+    return unique
+
+def missing_required_columns(headers: List[Any], specs: List[ColumnSpec]) -> List[str]:
+    """Return required display labels that are not present in headers."""
+    missing = []
+    for label, names in _dedupe_column_specs(specs):
+        if get_col_index(headers, names) == -1:
+            missing.append(label)
+    return missing
+
+def require_columns(headers: List[Any], specs: List[ColumnSpec], context: str) -> None:
+    """Raise when required columns are missing, so output is not generated from incomplete data."""
+    missing = missing_required_columns(headers, specs)
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"{context} is missing required column(s): {joined}")
+
+PPM_REQUIRED_COLUMNS: List[ColumnSpec] = [
+    ("Purchase Order Number / TC PO (85/58)", ["Purchase Order Number", "TC PO (85/58)"]),
+    ("PO Line Item Number / PO LINE ITEM", ["PO Line Item Number", "PO LINE ITEM"]),
+    ("Size Description", ["Size Description"]),
+    ("Surcharge Min Mat Main Body", ["Surcharge Min Mat Main Body"]),
+    ("Surcharge Min Material Trim", ["Surcharge Min Material Trim"]),
+    ("Surcharge Min Productivity", ["Surcharge Min Productivity"]),
+    ("Surcharge Misc", ["Surcharge Misc"]),
+    ("Surcharge VAS", ["Surcharge VAS"]),
+    ("Gross Price/FOB", ["Gross Price/FOB"]),
+]
+
+PPS_REQUIRED_COLUMNS: List[ColumnSpec] = [
+    ("STYLE", ["STYLE"]),
+    ("EFFECTIVE_DATE", ["EFFECTIVE_DATE"]),
+    ("SEASON_YEAR / SEASON YEAR", ["SEASON_YEAR", "SEASON YEAR"]),
+    ("COLOR", ["COLOR"]),
+    ("SIZE_DATA", ["SIZE_DATA"]),
+    ("LOCAL_QUOTE_AMOUNT", ["LOCAL_QUOTE_AMOUNT"]),
+]
+
+OCCC_PPM_REQUIRED_COLUMNS: List[ColumnSpec] = [
+    ("NK SAP PO / NK SAP PO (45/35)", ["NK SAP PO (45/35)", "NK SAP PO"]),
+    ("PO LINE ITEM", ["PO LINE ITEM"]),
+    ("S/C Min Production (ZPMX)", ["S/C Min Production (ZPMX)"]),
+    ("S/C Min Material (ZMMX)", ["S/C Min Material (ZMMX)"]),
+    ("S/C Min Material (ZMMX) Comment", ["S/C Min Material (ZMMX) Comment"]),
+    ("S/C Misc (ZMSX)", ["S/C Misc (ZMSX)"]),
+    ("S/C Misc (ZMSX) Comment", ["S/C Misc (ZMSX) Comment"]),
+    ("S/C VAS Manual (ZVAX)", ["S/C VAS Manual (ZVAX)"]),
+    ("OFOB (Regular sizes)", ["OFOB (Regular sizes)"]),
+    ("OFOB (Extended sizes)", ["OFOB (Extended sizes)"]),
+    ("FINAL FOB (Regular sizes)", ["FINAL FOB (Regular sizes)"]),
+    ("FINAL FOB (Extended sizes)", ["FINAL FOB (Extended sizes)", "FINAL FOB (Extended sizes) (2)"]),
+    ("Extended Sizes", ["Extended Sizes", "Extended Sizes (2)", "EXT SIZE", "EXT SIZES", "EXTENDED SIZE"]),
+]
+
+OCCC_PPS_REQUIRED_COLUMNS: List[ColumnSpec] = [
+    ("STYLE", ["STYLE"]),
+    ("BUY MTH", ["BUY MTH"]),
+    ("SEASON", ["SEASON"]),
+    ("SEASON YEAR / SEASON_YEAR", ["SEASON YEAR", "SEASON_YEAR"]),
+    ("CW", ["CW"]),
+    ("OFOB (Regular sizes)", ["OFOB (Regular sizes)"]),
+    ("OFOB (Extended sizes)", ["OFOB (Extended sizes)"]),
+    ("Extended Sizes", ["Extended Sizes", "Extended Sizes (2)", "EXT SIZE", "EXT SIZES", "EXTENDED SIZE"]),
+]
+
+def required_occc_columns_for_run(has_ppm: bool, has_pps: bool) -> List[ColumnSpec]:
+    """Only require OCCC columns needed by the selected validation path(s)."""
+    specs: List[ColumnSpec] = []
+    if has_ppm:
+        specs.extend(OCCC_PPM_REQUIRED_COLUMNS)
+    if has_pps:
+        specs.extend(OCCC_PPS_REQUIRED_COLUMNS)
+    return _dedupe_column_specs(specs)
+
 def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, debug_mode: bool = False) -> Tuple[str, int, int]:
     success_count = 0
     fail_count = 0
     last_output = ""
     row_emit = report_emit if callable(report_emit) else log_emit
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    support_errors: List[str] = []
 
     # --- 1. Parse PPM Files ---
     ppm_lookup = {}
     log_emit("Parsing PPM Files...")
     for ppm_path in ppm_files:
         try:
-            rows, raw_data, _ = load_file_data(ppm_path, log_emit)
+            rows, _, _ = load_file_data(ppm_path, log_emit)
             if not rows: continue
 
             header_row_idx = 0
             headers = [str(c) for c in rows[header_row_idx]]
+            require_columns(headers, PPM_REQUIRED_COLUMNS, f"PPM file '{os.path.basename(ppm_path)}'")
 
             col_po = get_col_index(headers, ["Purchase Order Number", "TC PO (85/58)"])
             col_line = get_col_index(headers, ["PO Line Item Number", "PO LINE ITEM"])
@@ -646,18 +818,17 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 if not row: continue
 
                 po_num = str(row[col_po]).strip()
-                try: line_item = str(int(float(row[col_line])))
-                except: line_item = str(row[col_line]).strip()
+                line_item = normalize_line_item(get_row_value(row, col_line, ""))
                 key = (po_num, line_item)
 
                 costs = {
-                    'ag': safe_float(row[col_ag]) if col_ag != -1 else 0.0,
-                    'ai': safe_float(row[col_ai]) if col_ai != -1 else 0.0,
-                    'ak': safe_float(row[col_ak]) if col_ak != -1 else 0.0,
-                    'am': safe_float(row[col_am]) if col_am != -1 else 0.0,
-                    'ao': safe_float(row[col_ao]) if col_ao != -1 else 0.0,
-                    'aq': safe_float(row[col_aq]) if col_aq != -1 else 0.0,
-                    'size': str(row[col_size]).strip() if col_size != -1 else "",
+                    'ag': safe_decimal(get_row_value(row, col_ag, 0)),
+                    'ai': safe_decimal(get_row_value(row, col_ai, 0)),
+                    'ak': safe_decimal(get_row_value(row, col_ak, 0)),
+                    'am': safe_decimal(get_row_value(row, col_am, 0)),
+                    'ao': safe_decimal(get_row_value(row, col_ao, 0)),
+                    'aq': safe_decimal(get_row_value(row, col_aq, 0)),
+                    'size': str(get_row_value(row, col_size, '') or '').strip(),
                     'source_path': ppm_path,
                     'source_row': r_idx + 1,
                 }
@@ -665,17 +836,20 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 if key not in ppm_lookup: ppm_lookup[key] = []
                 ppm_lookup[key].append(costs)
         except Exception as e:
-            log_emit(f"Error parsing PPM {os.path.basename(ppm_path)}: {e}")
+            msg = f"Error parsing PPM {os.path.basename(ppm_path)}: {e}"
+            log_emit(msg)
+            support_errors.append(msg)
 
     # --- 2. Parse PPS Files ---
     pps_lookup = {}
     log_emit("Parsing PPS Files...")
     for pps_path in pps_files:
         try:
-            rows, raw_data, _ = load_file_data(pps_path, log_emit)
+            rows, _, _ = load_file_data(pps_path, log_emit)
             if not rows: continue
 
             headers = [str(c) for c in rows[0]]
+            require_columns(headers, PPS_REQUIRED_COLUMNS, f"PPS file '{os.path.basename(pps_path)}'")
 
             col_style = get_col_index(headers, ["STYLE"])
             col_eff_date = get_col_index(headers, ["EFFECTIVE_DATE"])
@@ -700,7 +874,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 color = str(row[col_color]).strip() if col_color != -1 and row[col_color] is not None else ""
                 season_year = normalize_pps_season_year(row[col_season_year]) if col_season_year != -1 and row[col_season_year] is not None else ""
                 size_data = str(row[col_size_data]).strip() if col_size_data != -1 and row[col_size_data] is not None else ""
-                quote = safe_float(row[col_quote]) if col_quote != -1 else 0.0
+                quote = safe_decimal(get_row_value(row, col_quote, 0))
 
                 key = (style, eff_date)
                 entry = {
@@ -716,9 +890,15 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 pps_lookup[key].append(entry)
 
         except Exception as e:
-            log_emit(f"Error parsing PPS {os.path.basename(pps_path)}: {e}")
+            msg = f"Error parsing PPS {os.path.basename(pps_path)}: {e}"
+            log_emit(msg)
+            support_errors.append(msg)
 
     log_emit(f"PPS Data Loaded. Found {len(pps_lookup)} Style/Date keys.")
+
+    if support_errors:
+        log_emit("Validation aborted: one or more selected report files are missing required columns or could not be parsed.")
+        return "", 0, len(master_files)
 
     # --- 3. Process OCCC Files ---
     for occc_path in master_files:
@@ -728,33 +908,39 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 refresh_excel_formulas(occc_path, log_emit)
 
             log_emit(f"Processing Master: {os.path.basename(occc_path)}")
-            is_excel = occc_path.lower().endswith(('.xlsx', '.xlsm'))
+            ext = os.path.splitext(occc_path)[1].lower()
+            is_excel = ext in ('.xlsx', '.xlsm', '.xls')
+            is_xls = ext == '.xls'
 
-            if is_excel:
-                keep_vba = occc_path.lower().endswith('.xlsm')
+            if ext in ('.xlsx', '.xlsm'):
+                keep_vba = ext == '.xlsm'
                 wb_read = load_workbook(occc_path, data_only=True, keep_vba=keep_vba)
                 ws_read = pick_worksheet(wb_read, ["OCCC"])
                 rows_read = list(ws_read.values)
                 wb_write = load_workbook(occc_path, data_only=False, keep_vba=keep_vba)
                 ws_write = pick_worksheet(wb_write, ["OCCC"])
+            elif is_xls:
+                wb_write = load_xls_as_workbook(occc_path, ["OCCC"])
+                ws_write = wb_write.active
+                rows_read = list(ws_write.values)
             else:
                 rows_read, _, _ = load_file_data(occc_path, log_emit)
                 output_csv_data = [list(r) for r in rows_read]
                 ws_write = None
 
-            header_idx = 2
-            if len(rows_read) <= header_idx:
-                log_emit(f"Master file too short.")
+            if not rows_read:
+                log_emit("Master file is empty.")
                 fail_count += 1
                 continue
 
+            header_idx = find_header_row_idx(rows_read)
             headers = [str(x) for x in rows_read[header_idx]]
+            occc_required_columns = required_occc_columns_for_run(bool(ppm_files), bool(pps_files))
+            require_columns(headers, occc_required_columns, f"OCCC master '{os.path.basename(occc_path)}'")
 
             # Map Columns
             idx_nk_po = get_col_index(headers, ["NK SAP PO (45/35)", "NK SAP PO"])
             idx_line = get_col_index(headers, ["PO LINE ITEM"])
-            idx_ave_fob = get_col_index(headers, ["AVE FOB ON DPOM"])
-
             idx_sc_min_prod = get_col_index(headers, ["S/C Min Production (ZPMX)"])
             idx_sc_min_mat = get_col_index(headers, ["S/C Min Material (ZMMX)"])
             idx_sc_min_mat_comment = get_col_index(headers, ["S/C Min Material (ZMMX) Comment"])
@@ -824,20 +1010,15 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 row_trace_steps = []
 
                 # Common row context
-                po_val = str(row_vals[idx_nk_po]).strip() if idx_nk_po != -1 else ""
-                line_val = ""
-                if idx_line != -1:
-                    try:
-                        line_val = str(int(float(row_vals[idx_line])))
-                    except:
-                        line_val = str(row_vals[idx_line]).strip()
-                style_val = str(row_vals[idx_style]).strip() if idx_style != -1 else ""
-                buy_mth_val = str(row_vals[idx_buy_mth]).strip() if idx_buy_mth != -1 else ""
-                season_val = str(row_vals[idx_season]).strip().upper() if idx_season != -1 and row_vals[idx_season] is not None else ""
-                season_year_val = str(row_vals[idx_season_year]).strip() if idx_season_year != -1 and row_vals[idx_season_year] is not None else ""
+                po_val = str(get_row_value(row_vals, idx_nk_po, "") or "").strip()
+                line_val = normalize_line_item(get_row_value(row_vals, idx_line, ""))
+                style_val = str(get_row_value(row_vals, idx_style, "") or "").strip()
+                buy_mth_val = str(get_row_value(row_vals, idx_buy_mth, "") or "").strip()
+                season_val = str(get_row_value(row_vals, idx_season, "") or "").strip().upper()
+                season_year_val = str(get_row_value(row_vals, idx_season_year, "") or "").strip()
                 target_pps_season_year = build_target_pps_season_year(season_val, season_year_val)
-                cw_val = str(row_vals[idx_cw]).strip() if idx_cw != -1 else ""
-                ext_threshold = str(row_vals[idx_ext_sizes_def]).strip() if idx_ext_sizes_def != -1 else ""
+                cw_val = str(get_row_value(row_vals, idx_cw, "") or "").strip()
+                ext_threshold = str(get_row_value(row_vals, idx_ext_sizes_def, "") or "").strip()
 
                 # --- PPM Comparison ---
                 if po_val and line_val:
@@ -852,26 +1033,16 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                             )
 
                         # Avg calc for surcharges
-                        sum_ag = sum_ai = sum_am = sum_ao = 0.0
                         count = len(ppm_entries)
-                        ppm_ag_values = []
-                        ppm_ai_values = []
-                        ppm_am_values = []
-                        ppm_ao_values = []
-                        for entry in ppm_entries:
-                            sum_ag += entry['ag']
-                            sum_ai += entry['ai']
-                            sum_am += entry['am']
-                            sum_ao += entry['ao']
-                            ppm_ag_values.append(entry['ag'])
-                            ppm_ai_values.append(entry['ai'])
-                            ppm_am_values.append(entry['am'])
-                            ppm_ao_values.append(entry['ao'])
+                        ppm_ag_values = [entry['ag'] for entry in ppm_entries]
+                        ppm_ai_values = [entry['ai'] for entry in ppm_entries]
+                        ppm_am_values = [entry['am'] for entry in ppm_entries]
+                        ppm_ao_values = [entry['ao'] for entry in ppm_entries]
 
-                        ave_ppm_ag = sum_ag / count if count else 0.0
-                        ave_ppm_ai = sum_ai / count if count else 0.0
-                        ave_ppm_am = sum_am / count if count else 0.0
-                        ave_ppm_ao = sum_ao / count if count else 0.0
+                        ave_ppm_ag = money_average(ppm_ag_values)
+                        ave_ppm_ai = money_average(ppm_ai_values)
+                        ave_ppm_am = money_average(ppm_am_values)
+                        ave_ppm_ao = money_average(ppm_ao_values)
 
                         # Surcharge Checks - treat >= $0.01 as mismatch
                         if idx_sc_min_prod != -1 and money_abs_diff(row_vals[idx_sc_min_prod], ave_ppm_ag) >= MONEY_CENT:
@@ -881,8 +1052,8 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                             )
 
                         # Min Mat
-                        occc_zmmx = safe_float(row_vals[idx_sc_min_mat]) if idx_sc_min_mat != -1 else 0.0
-                        zmmx_cmt = str(row_vals[idx_sc_min_mat_comment]).strip().upper() if idx_sc_min_mat_comment != -1 and row_vals[idx_sc_min_mat_comment] else ""
+                        occc_zmmx = safe_decimal(get_row_value(row_vals, idx_sc_min_mat, 0))
+                        zmmx_cmt = str(get_row_value(row_vals, idx_sc_min_mat_comment, "") or "").strip().upper()
                         if idx_sc_min_mat != -1 and zmmx_cmt != "DN" and money_abs_diff(occc_zmmx, ave_ppm_ai) >= MONEY_CENT:
                             remarks.append("S/C Min Material (ZMMX) doesn't match")
                             row_trace_steps.append(
@@ -890,8 +1061,8 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                             )
 
                         # Misc
-                        occc_zmsx = safe_float(row_vals[idx_sc_misc]) if idx_sc_misc != -1 else 0.0
-                        zmsx_cmt = str(row_vals[idx_sc_misc_comment]).strip().upper() if idx_sc_misc_comment != -1 and row_vals[idx_sc_misc_comment] else ""
+                        occc_zmsx = safe_decimal(get_row_value(row_vals, idx_sc_misc, 0))
+                        zmsx_cmt = str(get_row_value(row_vals, idx_sc_misc_comment, "") or "").strip().upper()
                         if idx_sc_misc != -1 and zmsx_cmt != "DN" and money_abs_diff(occc_zmsx, ave_ppm_am) >= MONEY_CENT:
                             remarks.append("S/C Misc (ZMSX) doesn't match")
                             row_trace_steps.append(
@@ -905,10 +1076,10 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                             )
 
                         # OFOB / Final FOB Checks
-                        occc_ofob_reg = safe_float(row_vals[idx_ofob_reg]) if idx_ofob_reg != -1 else 0.0
-                        occc_ofob_ext = safe_float(row_vals[idx_ofob_ext]) if idx_ofob_ext != -1 else 0.0
-                        occc_final_reg = safe_float(row_vals[idx_final_reg]) if idx_final_reg != -1 else 0.0
-                        occc_final_ext = safe_float(row_vals[idx_final_ext]) if idx_final_ext != -1 else 0.0
+                        occc_ofob_reg = safe_decimal(get_row_value(row_vals, idx_ofob_reg, 0))
+                        occc_ofob_ext = safe_decimal(get_row_value(row_vals, idx_ofob_ext, 0))
+                        occc_final_reg = safe_decimal(get_row_value(row_vals, idx_final_reg, 0))
+                        occc_final_ext = safe_decimal(get_row_value(row_vals, idx_final_ext, 0))
 
                         ofob_mismatch_found_reg = False
                         ofob_mismatch_found_ext = False
@@ -916,17 +1087,21 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                         fob_mismatch_found_ext = False
 
                         for entry in ppm_entries:
-                            ppm_gross_fob = round(entry['aq'], 2)
-                            ppm_total = round(
-                                entry['ag'] + entry['ai'] + entry['ak'] + entry['am'] + entry['ao'] + entry['aq'],
-                                2
-                            )
+                            ppm_gross_fob = safe_decimal(entry['aq']).quantize(MONEY_CENT, rounding=ROUND_HALF_UP)
+                            ppm_total = (
+                                safe_decimal(entry['ag'])
+                                + safe_decimal(entry['ai'])
+                                + safe_decimal(entry['ak'])
+                                + safe_decimal(entry['am'])
+                                + safe_decimal(entry['ao'])
+                                + safe_decimal(entry['aq'])
+                            ).quantize(MONEY_CENT, rounding=ROUND_HALF_UP)
                             is_ext = is_extended_size(entry['size'], ext_threshold)
-                            target_ofob = round(occc_ofob_ext if is_ext else occc_ofob_reg, 2)
-                            target_fob = round(occc_final_ext if is_ext else occc_final_reg, 2)
+                            target_ofob = safe_decimal(occc_ofob_ext if is_ext else occc_ofob_reg).quantize(MONEY_CENT, rounding=ROUND_HALF_UP)
+                            target_fob = safe_decimal(occc_final_ext if is_ext else occc_final_reg).quantize(MONEY_CENT, rounding=ROUND_HALF_UP)
 
                             # OFOB vs PPM Gross Price/FOB - treat >= $0.01 as mismatch
-                            if ppm_gross_fob > 0 and money_abs_diff(target_ofob, ppm_gross_fob) >= MONEY_CENT:
+                            if ppm_gross_fob > MONEY_ZERO and money_abs_diff(target_ofob, ppm_gross_fob) >= MONEY_CENT:
                                 lbl = "Extended" if is_ext else "Regular"
                                 row_trace_steps.append(
                                     f"OFOB {lbl.lower()} mismatch for size {entry['size'] or '(blank)'} using PPM row {entry.get('source_path', '(unknown file)')} :: row {entry.get('source_row', '?')}: OCCC {format_money_trace(target_ofob)} from column OFOB ({lbl} sizes) vs PPM Gross Price/FOB {format_money_trace(ppm_gross_fob)}."
@@ -941,11 +1116,11 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                                         ofob_mismatch_found_reg = True
 
                             # treat >= $0.01 as mismatch
-                            if ppm_total > 0 and money_abs_diff(target_fob, ppm_total) >= MONEY_CENT:
+                            if ppm_total > MONEY_ZERO and money_abs_diff(target_fob, ppm_total) >= MONEY_CENT:
                                 lbl = "Extended" if is_ext else "Regular"
 
                                 # Add to DPOM Error List: "Size Price"
-                                dpom_errors.append(f"{entry['size']} {ppm_total:.2f}")
+                                dpom_errors.append(f"{entry['size']} {format_money_trace(ppm_total)}")
                                 row_trace_steps.append(
                                     f"FINAL FOB {lbl.lower()} mismatch for size {entry['size'] or '(blank)'} using PPM row {entry.get('source_path', '(unknown file)')} :: row {entry.get('source_row', '?')}: OCCC {format_money_trace(target_fob)} from column FINAL FOB ({lbl} sizes) vs PPM total {format_money_trace(ppm_total)} = {format_ppm_total_breakdown(entry)}."
                                 )
@@ -953,7 +1128,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                                 # Add one FINAL FOB remark per size bucket while still keeping all DPOM size mismatches.
                                 label_seen = fob_mismatch_found_ext if is_ext else fob_mismatch_found_reg
                                 if not label_seen:
-                                    row_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {target_fob} vs PPM {ppm_total}")
+                                    row_emit(f"Mismatch Row {r_i+1} PO {po_val}: {lbl} Size - OCCC {format_money_trace(target_fob)} vs PPM {format_money_trace(ppm_total)}")
                                     remarks.append(f"FINAL FOB ({lbl} sizes) doesn't match with PPM")
                                     if is_ext:
                                         fob_mismatch_found_ext = True
@@ -1049,7 +1224,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                                 else:
                                     # Regular - THRESHOLD 0.01
                                     reg_match = next((r for r in matched_rows if not r['size_data']), None)
-                                    occc_ofob_reg = safe_float(row_vals[idx_ofob_reg])
+                                    occc_ofob_reg = safe_decimal(get_row_value(row_vals, idx_ofob_reg, 0))
                                     if reg_match:
                                         row_trace_steps.append(
                                             f"Selected PPS regular row: {format_pps_entry_trace(reg_match)}."
@@ -1064,15 +1239,15 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                                             row_trace_steps.append(
                                                 f"Regular PPS comparison mismatched: PPS LOCAL_QUOTE_AMOUNT {format_money_trace(reg_match['quote'])} vs OCCC OFOB (Regular sizes) {format_money_trace(occc_ofob_reg)}."
                                             )
-                                    elif occc_ofob_reg > 0:
+                                    elif occc_ofob_reg > MONEY_ZERO:
                                         remarks.append("PPS OFOB missing regular size entry")
                                         row_trace_steps.append(
                                             f"No PPS regular row with blank SIZE_DATA was found while OCCC OFOB (Regular sizes) is {format_money_trace(occc_ofob_reg)}."
                                         )
 
                                     # Extended - THRESHOLD 0.01
-                                    occc_ofob_ext = safe_float(row_vals[idx_ofob_ext])
-                                    if ext_threshold not in ["-", "", "NONE", "NA"] or occc_ofob_ext > 0:
+                                    occc_ofob_ext = safe_decimal(get_row_value(row_vals, idx_ofob_ext, 0))
+                                    if ext_threshold not in ["-", "", "NONE", "NA"] or occc_ofob_ext > MONEY_ZERO:
                                         ext_match = next((r for r in matched_rows if is_extended_size(r['size_data'], ext_threshold)), None)
                                         if ext_match:
                                             row_trace_steps.append(
@@ -1088,7 +1263,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                                                 row_trace_steps.append(
                                                     f"Extended PPS comparison mismatched: PPS LOCAL_QUOTE_AMOUNT {format_money_trace(ext_match['quote'])} vs OCCC OFOB (Extended sizes) {format_money_trace(occc_ofob_ext)}."
                                                 )
-                                        elif occc_ofob_ext > 0:
+                                        elif occc_ofob_ext > MONEY_ZERO:
                                             remarks.append("PPS OFOB missing extended size entry")
                                             row_trace_steps.append(
                                                 f"No PPS extended row met Extended Sizes threshold {ext_threshold or '(blank)'} while OCCC OFOB (Extended sizes) is {format_money_trace(occc_ofob_ext)}."
@@ -1161,7 +1336,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                         "steps": row_trace_steps,
                     })
 
-            out_path = build_timestamped_copy_path(occc_path, run_timestamp, label="updated")
+            out_path = build_timestamped_copy_path(occc_path, run_timestamp, label="updated", output_ext=".xlsx" if is_xls else None)
             if is_excel:
                 wb_write.save(out_path)
             else:
@@ -1323,7 +1498,7 @@ class MainWidget(QWidget):
         self.processing_done.connect(self.on_processing_done)
 
     def select_files(self, text_box):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select Files", "", "Excel/CSV Files (*.xlsx *.xlsm *.csv)")
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Files", "", "Excel/CSV Files (*.xlsx *.xlsm *.xls *.csv)")
         if files:
             text_box.setPlainText("\n".join(files))
         else:
