@@ -257,6 +257,8 @@ def build_timestamped_copy_path(input_path: str, timestamp: str, label: str = "u
         counter += 1
 
 EXT_SIZE_EMPTY = {"-", "", "NONE", "NA", "N/A"}
+BASE_EXT_SIZE_ORDER = ["2XS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL"]
+BASE_EXT_SIZE_INDEX = {size: idx for idx, size in enumerate(BASE_EXT_SIZE_ORDER)}
 
 def normalize_size_code(size_val: Any) -> str:
     """Normalize size strings for SIZE_ORDER lookup (e.g., 'XL-T' -> 'XLT')."""
@@ -266,6 +268,84 @@ def normalize_size_code(size_val: Any) -> str:
     if not s_val:
         return ""
     return re.sub(r"[^A-Z0-9]", "", s_val)
+
+
+def normalize_size_for_cross_check(size_val: Any) -> str:
+    """Normalize size text for missing-size checks.
+
+    Removes spaces, dash-like characters, and other separators so values such as
+    'XL-T', 'XL T', and 'XLT' compare consistently.
+    """
+    return normalize_size_code(size_val)
+
+
+def ordered_base_size_values(values: List[Any]) -> List[str]:
+    """Return unique normalized sizes that exist in the predefined base-size order."""
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        size = normalize_size_for_cross_check(value)
+        if not size or size not in BASE_EXT_SIZE_INDEX or size in seen:
+            continue
+        seen.add(size)
+        result.append(size)
+    return result
+
+
+def extract_base_ext_floor_size(ext_def_val: Any) -> str:
+    """Extract the base-size floor from OCCC Extended Sizes for size-completeness checks.
+
+    This intentionally only recognizes the predefined base sizes:
+    2XS, XS, S, M, L, XL, 2XL, 3XL, 4XL, 5XL.
+    Values like 'Tall Size' do not create a base-size floor here; tall logic for
+    existing OFOB/FOB checks remains handled separately by is_extended_size().
+    """
+    raw = str(ext_def_val).strip().upper() if ext_def_val is not None else ""
+    if not raw or raw in EXT_SIZE_EMPTY:
+        return ""
+
+    # Avoid treating season/year notes as size tokens.
+    cleaned = re.sub(r"\b[A-Z]{2,3}'\d{2}\b", " ", raw)
+    cleaned = re.sub(r"'\d{2}\b", " ", cleaned)
+    cleaned = re.sub(r"\b20\d{2}\b", " ", cleaned)
+
+    suffixes = {"ABV", "ABOVE", "ANDABOVE", "ONWARD", "ONWARDS"}
+    candidates = sorted(BASE_EXT_SIZE_ORDER, key=len, reverse=True)
+    tokens = [t for t in re.split(r"[\s&./,;()]+", cleaned) if t]
+
+    for token in tokens:
+        code = normalize_size_for_cross_check(token)
+        if code in BASE_EXT_SIZE_INDEX:
+            return code
+        for size in candidates:
+            if code.startswith(size) and code[len(size):] in suffixes:
+                return size
+    return ""
+
+
+def expected_missing_base_sizes(ext_def_val: Any, observed_values: List[Any]) -> Tuple[str, str, List[str], List[str], List[str]]:
+    """Build expected base extended-size range and return missing observed entries.
+
+    The expected range starts from the base-size floor found in OCCC Extended Sizes
+    and ends at the largest predefined base size found in the observed PPM/PPS list.
+    Returns: floor, ceiling, expected_range, observed_base_sizes, missing_sizes.
+    """
+    floor = extract_base_ext_floor_size(ext_def_val)
+    observed = ordered_base_size_values(observed_values)
+    if not floor:
+        return "", "", [], observed, []
+
+    floor_idx = BASE_EXT_SIZE_INDEX[floor]
+    ceiling_indices = [BASE_EXT_SIZE_INDEX[size] for size in observed if BASE_EXT_SIZE_INDEX[size] >= floor_idx]
+    if not ceiling_indices:
+        return floor, "", [], observed, []
+
+    ceiling_idx = max(ceiling_indices)
+    ceiling = BASE_EXT_SIZE_ORDER[ceiling_idx]
+    expected = BASE_EXT_SIZE_ORDER[floor_idx:ceiling_idx + 1]
+    observed_set = set(observed)
+    missing = [size for size in expected if size not in observed_set]
+    return floor, ceiling, expected, observed, missing
 
 def is_tall_size(size_code: Any) -> bool:
     """Best-effort detection for Tall sizes (e.g., ST, MTT, XLTT, 2XLT)."""
@@ -373,6 +453,17 @@ def refine_remarks(remarks_list, trace_steps: Optional[List[str]] = None):
         "S/C Misc (ZMSX) doesn't match",
         "S/C VAS Manual (ZVAX) doesn't match",
     }
+
+    pps_missing_size_remarks = [
+        r for r in remarks_list
+        if isinstance(r, str) and r.startswith("PPS OFOB missing size ") and r.endswith(" entry")
+    ]
+    if s_pps_match_ext in remarks_list and pps_missing_size_remarks:
+        remarks_list = [r for r in remarks_list if r != s_pps_match_ext]
+        if trace_steps is not None:
+            trace_steps.append(
+                "Pre-consolidation cleanup: removed PPS OFOB match for extended sizes because PPS OFOB missing size entry exists."
+            )
 
     r_set = set(remarks_list)
     targets = {
@@ -727,7 +818,6 @@ PPM_REQUIRED_COLUMNS: List[ColumnSpec] = [
     ("Size Description", ["Size Description"]),
     ("Surcharge Min Mat Main Body", ["Surcharge Min Mat Main Body"]),
     ("Surcharge Min Material Trim", ["Surcharge Min Material Trim"]),
-    ("Surcharge Min Productivity", ["Surcharge Min Productivity"]),
     ("Surcharge Misc", ["Surcharge Misc"]),
     ("Surcharge VAS", ["Surcharge VAS"]),
     ("Gross Price/FOB", ["Gross Price/FOB"]),
@@ -1008,6 +1098,8 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 remarks = []
                 dpom_errors = [] # Store "Size Price" mismatches
                 row_trace_steps = []
+                matched_ppm_entries: List[Dict[str, Any]] = []
+                matched_pps_rows: List[Dict[str, Any]] = []
 
                 # Common row context
                 po_val = str(get_row_value(row_vals, idx_nk_po, "") or "").strip()
@@ -1024,6 +1116,7 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                 if po_val and line_val:
                     ppm_entries = ppm_lookup.get((po_val, line_val))
                     if ppm_entries:
+                        matched_ppm_entries = ppm_entries
                         row_trace_steps.append(
                             f"PPM lookup matched {len(ppm_entries)} row(s) for NK SAP PO {po_val} / PO LINE ITEM {line_val}."
                         )
@@ -1137,8 +1230,9 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
 
                                 # Do NOT break here. Continue checking other sizes for DPOM column.
                     else:
+                        remarks.append("No matching PPM found")
                         row_trace_steps.append(
-                            f"PPM lookup found no rows for NK SAP PO {po_val} / PO LINE ITEM {line_val}."
+                            f"PPM lookup found no rows for NK SAP PO {po_val} / PO LINE ITEM {line_val}; added No matching PPM found."
                         )
                 else:
                     row_trace_steps.append("PPM lookup skipped because NK SAP PO or PO LINE ITEM is blank.")
@@ -1168,6 +1262,11 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                                     suffix = "" if len(other_season_values) <= 10 else ", ..."
                                     row_trace_steps.append(
                                         f"PPS rows excluded by SEASON_YEAR filter: {len(other_season_rows)} row(s) with other SEASON_YEAR values ({sample_seasons}{suffix})."
+                                    )
+                                if not season_filtered_rows:
+                                    season_filtered_rows = pps_candidates
+                                    row_trace_steps.append(
+                                        f"No PPS row matched SEASON_YEAR {target_pps_season_year}; falling back to the STYLE + EFFECTIVE_DATE pool and continuing COLOR/SIZE filters."
                                     )
                             else:
                                 row_trace_steps.append(
@@ -1222,6 +1321,70 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                                         f"No PPS row matched COLOR {cw_val or '(blank)'} and no blank COLOR fallback row was available."
                                     )
                                 else:
+                                    matched_pps_rows = matched_rows
+
+                                    # Extended base-size completeness check.
+                                    # This does not affect the existing regular/extended OFOB/FOB logic.
+                                    # It only uses OCCC Extended Sizes to derive the expected base-size range
+                                    # for each matched PPM/PPS list independently.
+                                    if matched_ppm_entries and matched_pps_rows:
+                                        ppm_floor, ppm_ceiling, ppm_expected, ppm_observed, missing_from_ppm = expected_missing_base_sizes(
+                                            ext_threshold,
+                                            [entry.get('size') for entry in matched_ppm_entries],
+                                        )
+                                        pps_floor, pps_ceiling, pps_expected, pps_observed, missing_from_pps = expected_missing_base_sizes(
+                                            ext_threshold,
+                                            [entry.get('size_data') for entry in matched_pps_rows if entry.get('size_data')],
+                                        )
+
+                                        row_trace_steps.append(
+                                            f"Size completeness check: OCCC Extended Sizes '{ext_threshold or '(blank)'}'. "
+                                            f"PPM base sizes [{', '.join(ppm_observed) if ppm_observed else '(none)'}], "
+                                            f"PPS base sizes [{', '.join(pps_observed) if pps_observed else '(none)'}]."
+                                        )
+
+                                        if ppm_floor and ppm_expected:
+                                            row_trace_steps.append(
+                                                f"PPM expected extended base-size range from {ppm_floor} to {ppm_ceiling}: "
+                                                f"[{', '.join(ppm_expected)}]."
+                                            )
+                                        elif ppm_floor:
+                                            row_trace_steps.append(
+                                                f"PPM size completeness skipped: floor {ppm_floor} found, but no matched PPM base size at or above the floor was found."
+                                            )
+                                        else:
+                                            row_trace_steps.append(
+                                                "PPM size completeness skipped: OCCC Extended Sizes did not contain a predefined base-size floor."
+                                            )
+
+                                        if missing_from_ppm:
+                                            missing_text = " / ".join(missing_from_ppm)
+                                            remarks.append(f"NIKE PPM missing size {missing_text} entry")
+                                            row_trace_steps.append(
+                                                f"PPM size completeness result: expected size(s) {missing_text} are missing from matched PPM Size Description values."
+                                            )
+
+                                        if pps_floor and pps_expected:
+                                            row_trace_steps.append(
+                                                f"PPS expected extended base-size range from {pps_floor} to {pps_ceiling}: "
+                                                f"[{', '.join(pps_expected)}]."
+                                            )
+                                        elif pps_floor:
+                                            row_trace_steps.append(
+                                                f"PPS size completeness skipped: floor {pps_floor} found, but no matched PPS base SIZE_DATA at or above the floor was found."
+                                            )
+                                        else:
+                                            row_trace_steps.append(
+                                                "PPS size completeness skipped: OCCC Extended Sizes did not contain a predefined base-size floor."
+                                            )
+
+                                        if missing_from_pps:
+                                            missing_text = " / ".join(missing_from_pps)
+                                            remarks.append(f"PPS OFOB missing size {missing_text} entry")
+                                            row_trace_steps.append(
+                                                f"PPS size completeness result: expected size(s) {missing_text} are missing from matched PPS SIZE_DATA values."
+                                            )
+
                                     # Regular - THRESHOLD 0.01
                                     reg_match = next((r for r in matched_rows if not r['size_data']), None)
                                     occc_ofob_reg = safe_decimal(get_row_value(row_vals, idx_ofob_reg, 0))
