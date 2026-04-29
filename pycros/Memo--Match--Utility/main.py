@@ -3,7 +3,7 @@ import re
 import threading
 import time
 from datetime import datetime
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Tuple
 
 import openpyxl
 from PySide6.QtCore import Qt, Signal
@@ -18,190 +18,43 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import MessageBox, PrimaryPushButton
 
-# TODO: Sort report checking order by "Change Date". This issue could arise one day but currently it is sorted by filename
-
-class App:
-    def __init__(self):
-        super().__init__()
-
-        self.title("SIG Memo Match Utility v6.9.0")
-        self.geometry("1280x720")
-
-        # set grid layout 1x2
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
-
-        # load images with light and dark mode image
-        # load images with light and dark mode image
-        image_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "test_images")
-        self.logo_image = customtkinter.CTkImage(Image.open(os.path.join(image_path, "CustomTkinter_logo_single.png")), size=(26, 26))
-        self.large_test_image = customtkinter.CTkImage(Image.open(os.path.join(image_path, "large_test_image.png")), size=(500, 150))
-        self.image_icon_image = customtkinter.CTkImage(Image.open(os.path.join(image_path, "file-circle-plus-solid-light.png")), size=(20, 20))
-        self.home_image = customtkinter.CTkImage(
-            light_image=Image.open(os.path.join(image_path, "home_dark.png")),
-            dark_image=Image.open(os.path.join(image_path, "home_light.png")),
-            size=(20, 20)
-        )
-        self.chat_image = customtkinter.CTkImage(
-            light_image=Image.open(os.path.join(image_path, "file-solid-dark.png")),
-            dark_image=Image.open(os.path.join(image_path, "file-solid-light.png")),
-            size=(20, 20)
-        )
-        self.reports_warning = customtkinter.CTkImage(
-            light_image=Image.open(os.path.join(image_path, "file-pen-solid-dark.png")),
-            dark_image=Image.open(os.path.join(image_path, "file-pen-solid-light.png")),
-            size=(20, 20)
-        )
-        self.reports_error = customtkinter.CTkImage(
-            light_image=Image.open(os.path.join(image_path, "file-circle-exclamation-solid-dark.png")),
-            dark_image=Image.open(os.path.join(image_path, "file-circle-exclamation-solid-light.png")),
-            size=(20, 20)
-        )
-        self.reports_done = customtkinter.CTkImage(
-            light_image=Image.open(os.path.join(image_path, "file-circle-check-solid-dark.png")),
-            dark_image=Image.open(os.path.join(image_path, "file-circle-check-solid-light.png")),
-            size=(20, 20)
-        )
-        self.add_user_image = customtkinter.CTkImage(
-            light_image=Image.open(os.path.join(image_path, "file-solid-dark.png")),
-            dark_image=Image.open(os.path.join(image_path, "file-solid-light.png")),
-            size=(20, 20)
-        )
+# TODO: Sort report checking order by "Change Date". This issue could arise one day but currently it is sorted by filename.
 
 
-        # create navigation frame
-        self.navigation_frame = customtkinter.CTkFrame(self, corner_radius=0)
-        self.navigation_frame.grid(row=0, column=0, sticky="nsew")
-        self.navigation_frame.grid_rowconfigure(4, weight=1)
+class _TextboxProxy:
+    """Small adapter that lets the legacy MMU logic write to Pycro Station signals."""
 
-        self.navigation_frame_label = customtkinter.CTkLabel(self.navigation_frame, text="  Memo Match Utility", image=self.logo_image,
-                                                             compound="left", font=customtkinter.CTkFont(size=15, weight="bold"))
-        self.navigation_frame_label.grid(row=0, column=0, padx=20, pady=20)
+    def __init__(self, emit: Callable[[str], None]):
+        self._emit = emit
 
-        self.home_button = customtkinter.CTkButton(self.navigation_frame, corner_radius=0, height=40, border_spacing=10, text="Home",
-                                                   fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                                   image=self.home_image, anchor="w", command=self.home_button_event)
-        self.home_button.grid(row=1, column=0, sticky="ew")
+    def insert(self, *_args):
+        if len(_args) >= 2:
+            self._emit(str(_args[1]))
 
-        self.frame_2_button = customtkinter.CTkButton(self.navigation_frame, corner_radius=0, height=40, border_spacing=10, text="Reports",
-                                                      fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                                      image=self.chat_image, anchor="w", command=self.frame_2_button_event)
-        self.frame_2_button.grid(row=2, column=0, sticky="ew")
+    def see(self, *_args):
+        pass
 
-        self.frame_3_button = customtkinter.CTkButton(self.navigation_frame, corner_radius=0, height=40, border_spacing=10, text="Logs",
-                                                      fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                                      image=self.add_user_image, anchor="w", command=self.frame_3_button_event)
-        self.frame_3_button.grid(row=3, column=0, sticky="ew")
+    def configure(self, **_kwargs):
+        pass
 
-        self.appearance_mode_menu = customtkinter.CTkOptionMenu(self.navigation_frame, values=["System", "Light", "Dark"],
-                                                                command=self.change_appearance_mode_event)
-        self.appearance_mode_menu.grid(row=6, column=0, padx=20, pady=20, sticky="s")
+    def delete(self, *_args, **_kwargs):
+        pass
 
-        # create home frame
-        self.home_frame = customtkinter.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        self.home_frame.grid_columnconfigure(0, weight=1)
 
-        self.home_frame_large_image_label = customtkinter.CTkLabel(self.home_frame, text="", image=self.large_test_image)
-        self.home_frame_large_image_label.grid(row=0, column=0, padx=20, pady=10)
+class MemoMatchEngine:
+    """Pycro Station wrapper around the original MMU.py processing logic."""
 
-        self.home_frame_button_1 = customtkinter.CTkButton(self.home_frame, text="Upload Master File", image=self.image_icon_image, width=200, command=self.home_frame_button_1_event)
-        self.home_frame_button_1.grid(row=1, column=0, padx=20, pady=10)
-        # self.home_frame_button_1.configure(width=200)
-        self.home_frame_textbox_1 = customtkinter.CTkTextbox(self.home_frame, state="disabled", width=400, height=100)
-        self.home_frame_textbox_1.grid(row=2, column=0, padx=20, pady=10)
-        # self.home_frame_entry_1 = customtkinter.CTkEntry(self.home_frame, placeholder_text="File path will display here", state="readonly", width=400)
-        # self.home_frame_entry_1.grid(row=2, column=0, padx=20, pady=10)
-        # self.home_frame_entry_1.configure(state="disabled", width=400)
-
-        self.home_frame_button_2 = customtkinter.CTkButton(self.home_frame, text="Upload PPM Report(s)", state="disabled", image=self.image_icon_image, width=200, command=self.home_frame_button_2_event)
-        self.home_frame_button_2.grid(row=3, column=0, padx=20, pady=10)
-        # self.home_frame_button_2.configure(width=200)
-        # self.home_frame_entry_2 = customtkinter.CTkEntry(self.home_frame, placeholder_text="File path will display here")
-        # self.home_frame_entry_2.grid(row=4, column=0, padx=20, pady=10)
-        # self.home_frame_entry_2.configure(state="disabled", width=400)
-        self.home_frame_textbox_2 = customtkinter.CTkTextbox(self.home_frame, state="disabled", width=400, height=100)
-        self.home_frame_textbox_2.grid(row=4, column=0, padx=20, pady=10)
-        # self.home_frame_textbox_2.configure(state="disabled", width=400)
-
-        self.home_frame_button_3 = customtkinter.CTkButton(self.home_frame, text="Analyze & Report", state="disabled", width=200, command=self.home_frame_button_3_event)
-        self.home_frame_button_3.grid(row=5, column=0, padx=20, pady=10)
-        # self.home_frame_button_3.configure(state="disabled", width=200)
-
-        # create second frame
-        self.second_frame = customtkinter.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        self.second_frame.grid_columnconfigure(0, weight=1)
-        self.second_frame_textbox_1 = customtkinter.CTkTextbox(self.second_frame, state="disabled", width=600, height=600)
-        self.second_frame_textbox_1.grid(row=1, column=0, padx=20, pady=40)
-
-        # create third frame
-        self.third_frame = customtkinter.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        self.third_frame.grid_columnconfigure(0, weight=1)
-        self.third_frame_textbox_1 = customtkinter.CTkTextbox(self.third_frame, state="disabled", width=600, height=600)
-        self.third_frame_textbox_1.grid(row=1, column=0, padx=20, pady=40)
-
-        # self.copy_button = customtkinter.CTkButton(self.third_frame, text="Copy", command=self.copy_textbox_content)
-        # self.copy_button.grid(row=2, column=0, padx=20, pady=10)
-
-        # select default frame
-        self.select_frame_by_name("home")
-
-    # def copy_textbox_content(self):
-    #     # Temporarily enable the textbox to copy its contents
-    #     self.third_frame_textbox_1.configure(state="normal")
-    #     content = self.third_frame_textbox_1.get("1.0", "end-1c")  # Get all text
-    #     self.clipboard_clear()  # Clear clipboard
-    #     self.clipboard_append(content)  # Copy content to clipboard
-    #     self.third_frame_textbox_1.configure(state="disabled")  # Set back to disabled
-
-    #     # Optional: Show a brief message to confirm copying
-    #     print("Text copied to clipboard")
-
-    def home_frame_button_1_event(self):
-        file_paths = filedialog.askopenfilenames()
-        if file_paths:
-            self.full_master_file_path = file_paths
-            self.home_frame_textbox_1.configure(state="normal")
-            self.home_frame_textbox_1.delete("1.0", 'end')
-            for path in file_paths:
-                file_name = os.path.basename(path)
-                self.home_frame_textbox_1.insert("end", file_name + "\n")
-            self.home_frame_textbox_1.configure(state="disabled")
-            self.home_frame_button_2.configure(state="normal")
-
-    def home_frame_button_2_event(self):
-        file_paths = filedialog.askopenfilenames()
-        file_paths = sorted(file_paths, key=lambda x: x.split('/')[-1])
-        if file_paths:
-            self.full_report_file_paths = file_paths
-            self.home_frame_textbox_2.configure(state="normal")
-            self.home_frame_textbox_2.delete("1.0", "end")
-            for path in file_paths:
-                file_name = os.path.basename(path)
-                self.home_frame_textbox_2.insert("end", file_name + "\n")
-            self.home_frame_textbox_2.configure(state="disabled")
-            self.home_frame_button_3.configure(state="normal")
-
-    def home_frame_button_3_event(self):
-        self.second_frame_textbox_1.configure(state="normal")
-        self.second_frame_textbox_1.delete("1.0", "end")
-        self.third_frame_textbox_1.configure(state="normal")
-        self.third_frame_textbox_1.delete("1.0", "end")
-        self.home_frame_button_1.configure(state="disabled")
-        self.home_frame_button_2.configure(state="disabled")
-        self.home_frame_button_3.configure(state="disabled")
-        self.frame_2_button.configure(image=self.reports_warning, text="Reports (Processing...)")
-
-        # Switch to Logs frame before processing
-        self.home_button.configure(fg_color="transparent")
-        self.frame_2_button.configure(fg_color="transparent")
-        self.frame_3_button.configure(fg_color=("gray75", "gray25"))
-        self.home_frame.grid_forget()
-        self.second_frame.grid_forget()
-        self.third_frame.grid(row=0, column=1, sticky="nsew")
-
-        # Start the processing in a new thread
-        thread = threading.Thread(target=self.process_files)
-        thread.start()
+    def __init__(
+        self,
+        master_paths: List[str],
+        report_paths: List[str],
+        log_emit: Callable[[str], None],
+        report_emit: Callable[[str], None],
+    ):
+        self.full_master_file_path = list(master_paths or [])
+        self.full_report_file_paths = sorted(list(report_paths or []), key=lambda x: os.path.basename(x))
+        self.third_frame_textbox_1 = _TextboxProxy(log_emit)
+        self.second_frame_textbox_1 = _TextboxProxy(report_emit)
 
     def process_files(self) -> Tuple[str, int, int]:
         start_time = time.time()
@@ -566,6 +419,15 @@ class App:
         def hasComma(val):
             return ',' in str(val).strip()
 
+        def save_workbook_fast(workbook, path):
+            # Use a valid uncompressed XLSX package. This avoids slow/hanging ZIP compression
+            # on large updated OCCC workbooks while preserving workbook contents.
+            import zipfile
+            from openpyxl.writer.excel import ExcelWriter
+
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED, allowZip64=True) as archive:
+                ExcelWriter(workbook, archive).save()
+
         # Process
         try:
             report_date_now = 0
@@ -580,7 +442,41 @@ class App:
             newPO = {}
             existingPO = {}
             work_path = ""
-            sizes = ["2XS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "2XSS", "XSS", "SS", "MS", "LS", "XLS", "2XLS", "3XLS", "4XLS", "5XLS", "2XSL", "XSL", "SL", "ML", "XLL", "2XLL", "3XLL", "4XLL", "5XLL", "2XST", "XST", "ST", "MT", "LT", "XLT", "2XLT", "3XLT", "4XLT", "5XLT", "2XSTT", "XSTT", "STT", "MTT", "LTT", "XLTT", "2XLTT", "3XLTT", "4XLTT", "5XLTT", "0X", "1X", "2X", "3X", "4X", "5X", "0XT", "1XT", "2XT", "3XT", "4XT", "5XT", "0XTT", "1XTT", "2XTT", "3XTT", "4XTT", "5XTT", "CUST0", "CUST1", "CUST2", "CUST3", "CUST4", "CUST5", "CUST6", "CUST7", "CUST2XS", "CUSTXS", "CUSTS", "CUSTM", "CUSTL", "CUSTXL", "CUST2XL", "CUST3XL", "CUST4XL", "CUST5XL"]
+            numeric_sizes = ["0", "2", "4", "6", "8", "10", "12", "14", "16", "18", "20", "22", "24", "26", "28", "30", "32", "34", "36", "38", "40", "42"]
+            numeric_tall_sizes = [f"{size}T" for size in numeric_sizes]
+            numeric_double_tall_sizes = [f"{size}TT" for size in numeric_sizes]
+            legacy_sizes = ["2XS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "2XSS", "XSS", "SS", "MS", "LS", "XLS", "2XLS", "3XLS", "4XLS", "5XLS", "2XSL", "XSL", "SL", "ML", "XLL", "2XLL", "3XLL", "4XLL", "5XLL", "2XST", "XST", "ST", "MT", "LT", "XLT", "2XLT", "3XLT", "4XLT", "5XLT", "2XSTT", "XSTT", "STT", "MTT", "LTT", "XLTT", "2XLTT", "3XLTT", "4XLTT", "5XLTT", "X", "0X", "1X", "2X", "3X", "4X", "5X", "XT", "0XT", "1XT", "2XT", "3XT", "4XT", "5XT", "XTT", "0XTT", "1XTT", "2XTT", "3XTT", "4XTT", "5XTT", "CUST", "CUST0", "CUST1", "CUST2", "CUST3", "CUST4", "CUST5", "CUST6", "CUST7", "CUST2XS", "CUSTXS", "CUSTS", "CUSTM", "CUSTL", "CUSTXL", "CUST2XL", "CUST3XL", "CUST4XL", "CUST5XL"]
+            sizes = numeric_sizes + numeric_tall_sizes + numeric_double_tall_sizes + legacy_sizes
+
+            def normalize_size(value):
+                cleaned = str(value).strip().replace('-', '')
+                if isEmptyCell(cleaned):
+                    return ""
+                if "tall" in cleaned.lower():
+                    return "T"
+                cleaned = re.sub(r'([A-Za-z0-9]+)[\.\(\&\+].*', r'\1', cleaned)
+                return cleaned.strip().upper()
+
+            def extended_size_range(value):
+                start_size = normalize_size(value)
+                if not start_size:
+                    return [], start_size
+                if start_size in numeric_sizes:
+                    numeric_from_start = numeric_sizes[numeric_sizes.index(start_size):]
+                    return numeric_from_start + numeric_tall_sizes + numeric_double_tall_sizes, start_size
+                if start_size in numeric_tall_sizes:
+                    return numeric_tall_sizes[numeric_tall_sizes.index(start_size):], start_size
+                if start_size in numeric_double_tall_sizes:
+                    return numeric_double_tall_sizes[numeric_double_tall_sizes.index(start_size):], start_size
+                if start_size == "T" and "2XST" in legacy_sizes:
+                    return legacy_sizes[legacy_sizes.index("2XST"):], start_size
+                if start_size in legacy_sizes:
+                    return legacy_sizes[legacy_sizes.index(start_size):], start_size
+                for sequence in (numeric_sizes, numeric_tall_sizes, numeric_double_tall_sizes, legacy_sizes):
+                    matching_size = next((size for size in sequence if start_size and start_size in size), None)
+                    if matching_size:
+                        return sequence[sequence.index(matching_size):], start_size
+                return [], start_size
 
             # Preflight: PPM columns are mandatory. Abort early if any report is missing expected columns.
             report_header_indicator = ["Purchase Order Number"]
@@ -881,12 +777,8 @@ class App:
 
                         if key in master_dict[master_current] and report_po_style != "INVALID":
                             existingPO[(report_po_style, report_po_num, report_po_line)] = row
-                            # Loop through a copy of newPO's keys to avoid modifying it while iterating
-                            for keyPO in list(newPO.keys()):
-                                # Check if the first three elements match the desired values
-                                if keyPO[:3] == (report_po_style, report_po_num, report_po_line):
-                                    # Delete the matching key from newPO
-                                    del newPO[keyPO]
+                            # Keep scanning fast: newPO is filtered once at the end using existing PO keys.
+                            # This preserves the original output while avoiding repeated full-dict scans.
                             # Declare numeric values
                             master_rows = master_dict[master_current][key]
                             master_rows_data = master_dict_data[master_current][key]
@@ -1104,30 +996,14 @@ class App:
 
                                 # Price Check
                                 if (report_po_fob != master_po_fob or (report_po_fob != master_po_fob_ex_1 and master_po_fob_ex_1 != 0.00) or (report_po_fob != master_po_fob_ex_2 and master_po_fob_ex_2 != 0.00)):
-                                    sizesE = []
-                                    sizesE2 = []
+                                    sizesE, extended_size_value_1 = extended_size_range(master_row[master_cols["Extended Sizes"] - 3].value)
+                                    sizesE2, extended_size_value_2 = extended_size_range(master_row[master_cols["Extended Sizes"] - 1].value)
+                                    report_size_value = normalize_size(row[report_cols['Size Description'] - 1].value)
 
-                                    # Handle sizesE for master_row[master_cols["Extended Sizes"] - 3]
-                                    extended_size_value_1 = str(master_row[master_cols["Extended Sizes"] - 3].value).strip().replace('-', '')
-                                    extended_size_value_1 = "T" if "tall" in extended_size_value_1.lower() else extended_size_value_1 # Tall become "T" so it matches with the first T it encounters in sizes list
-                                    extended_size_value_1 = re.sub(r'([A-Za-z0-9]+)[\.\(\&\+].*', r'\1', extended_size_value_1) # ex. 3XL[&|.|+](any) becomes 3XL so it matches with any of the size in the sizes list
-                                    if not isEmptyCell(extended_size_value_1):
-                                        matching_size_1 = next((size for size in sizes if extended_size_value_1 in size), None)
-                                        if not isEmptyCell(matching_size_1):
-                                            index_1 = sizes.index(matching_size_1)
-                                            sizesE = sizes[index_1:]  # All sizes after the matching size
+                                    is_ext_size_1 = bool(extended_size_value_1) and report_size_value in sizesE
+                                    is_ext_size_2 = bool(extended_size_value_2) and report_size_value in sizesE2
 
-                                    # Handle sizesE2 for master_row[master_cols["Extended Sizes"] - 1]
-                                    extended_size_value_2 = str(master_row[master_cols["Extended Sizes"] - 1].value).strip().replace('-', '')
-                                    extended_size_value_2 = "T" if "tall" in extended_size_value_2.lower() else extended_size_value_2 # Tall become "T" so it matches with the first T it encounters in sizes list
-                                    extended_size_value_2 = re.sub(r'([A-Za-z0-9]+)[\.\(\&\+].*', r'\1', extended_size_value_2) # ex. 3XL[&|.|+](any) becomes 3XL so it matches with any of the size in the sizes list
-                                    if not isEmptyCell(extended_size_value_2):
-                                        matching_size_2 = next((size for size in sizes if extended_size_value_2 in size), None)
-                                        if not isEmptyCell(matching_size_2):
-                                            index_2 = sizes.index(matching_size_2)
-                                            sizesE2 = sizes[index_2:]  # All sizes after the matching size
-
-                                    if (not str(row[report_cols['Size Description'] - 1].value).strip().replace('-', '') in sizesE and not str(row[report_cols['Size Description'] - 1].value).strip().replace('-', '') in sizesE2 and report_po_fob != master_po_fob) or (extended_size_value_1 != 0.00 and str(row[report_cols['Size Description'] - 1].value).strip().replace('-', '') in sizesE and report_po_fob != master_po_fob_ex_1) or (extended_size_value_2 != 0.00 and str(row[report_cols['Size Description'] - 1].value).strip().replace('-', '') in sizesE2 and report_po_fob != master_po_fob_ex_2):
+                                    if (not is_ext_size_1 and not is_ext_size_2 and report_po_fob != master_po_fob) or (is_ext_size_1 and report_po_fob != master_po_fob_ex_1) or (is_ext_size_2 and report_po_fob != master_po_fob_ex_2):
                                         noDiscrepancy = False
                                         if "/" in str(master_row[master_cols["DPOM - Incorrect FOB"] - 1].value).strip():
                                             sizesInMaster = str(master_row[master_cols["DPOM - Incorrect FOB"] - 1].value).strip().split('/')
@@ -1223,17 +1099,23 @@ class App:
                                 row_value(row, report_cols.get("Change Date")),
                             )
                             if new_key not in newPO:
-                                newPO[new_key] = row
+                                newPO[new_key] = None
 
                         if row_index == report_sheet.max_row:
                             report_date_bfr = report_change_datetime(row, report_cols).strftime('%m/%d').strip()
 
                 self.third_frame_textbox_1.insert("end", f"Saving file... please wait\n\n")
                 self.third_frame_textbox_1.see("end")
-                timestamp = getattr(self, "timestamp", datetime.now().strftime("%Y%m%d-%H%M%S"))
-                base_no_ext = os.path.splitext(master_path)[0]
-                updated_master_path = f"{base_no_ext}_UPDATED_{timestamp}.xlsx"
-                master_wb.save(updated_master_path)
+                updated_master_path = f"{master_path}_UPDATED.xlsx"
+                save_workbook_fast(master_wb, updated_master_path)
+                try:
+                    master_wb.close()
+                except Exception:
+                    pass
+                try:
+                    master_wb_data.close()
+                except Exception:
+                    pass
                 last_output = updated_master_path
                 self.third_frame_textbox_1.insert("end", f"Saved new file at {updated_master_path}\n\n")
                 self.third_frame_textbox_1.see("end")
@@ -1272,25 +1154,12 @@ class App:
                 cell.font = header_font
                 cell.border = header_border
 
-            # List to keep track of items to remove from newPO
-            items_to_remove = []
-
-            for new_key in newPO.keys():
-                # Extract the first three elements from new_key for comparison
-                new_first_three_keys = new_key[:3]
-
-                for existing_key in existingPO.keys():
-                    # Extract the first three elements from existing_key for comparison
-                    existing_first_three_keys = existing_key[:3]
-
-                    # Compare the first three keys
-                    if new_first_three_keys == existing_first_three_keys:
-                        items_to_remove.append(new_key)
-                        break  # Stop checking other existing keys if a match is found
-
-            # Remove the matched items from newPO
-            for key in items_to_remove:
-                del newPO[key]
+            # Remove any rows that were previously seen as new but are present in the master.
+            # Use a set for O(n) filtering instead of comparing every new key against every existing key.
+            existing_first_three_keys = {existing_key[:3] for existing_key in existingPO.keys()}
+            for key in list(newPO.keys()):
+                if key[:3] in existing_first_three_keys:
+                    del newPO[key]
 
             # Iterate through the dictionary and write rows to the worksheet
             for row_idx, (key, row) in enumerate(newPO.items(), start=2):
@@ -1328,10 +1197,13 @@ class App:
                 adjusted_width = (max_length + 2)
                 new_ws.column_dimensions[col_letter].width = adjusted_width
 
-            # Save the workbook to a file (timestamped next to the master)
-            timestamp = getattr(self, "timestamp", datetime.now().strftime("%Y%m%d-%H%M%S"))
-            new_po_path = os.path.join(work_path, f"New_PO_List_{timestamp}.xlsx")
-            new_wb.save(new_po_path)
+            # Save the workbook to a file, matching the original MMU.py output path.
+            new_po_path = os.path.join(work_path, "New_PO_List.xlsx")
+            save_workbook_fast(new_wb, new_po_path)
+            try:
+                new_wb.close()
+            except Exception:
+                pass
             last_output = new_po_path
             self.third_frame_textbox_1.insert("end", f"Saved new PO list file at {new_po_path}\n\n")
             self.third_frame_textbox_1.see("end")
@@ -1342,6 +1214,13 @@ class App:
             self.third_frame_textbox_1.see("end")
             self.third_frame_textbox_1.insert("end", f"Finished, you may exit now\n\n")
             self.third_frame_textbox_1.see("end")
+
+            # Release large workbook row caches before returning control to Pycro Station.
+            master_dict.clear()
+            master_dict_data.clear()
+            newPO.clear()
+            existingPO.clear()
+
             return last_output, total_master or total_inputs, 0
 
 
@@ -1350,55 +1229,6 @@ class App:
             self.third_frame_textbox_1.see("end")
             return last_output, 0, total_inputs
 
-    def select_frame_by_name(self, name):
-        # set button color for selected button
-        self.home_button.configure(fg_color=("gray75", "gray25") if name == "home" else "transparent")
-        self.frame_2_button.configure(fg_color=("gray75", "gray25") if name == "frame_2" else "transparent")
-        self.frame_3_button.configure(fg_color=("gray75", "gray25") if name == "frame_3" else "transparent")
-
-        # show selected frame
-        if name == "home":
-            self.home_frame.grid(row=0, column=1, sticky="nsew")
-        else:
-            self.home_frame.grid_forget()
-        if name == "frame_2":
-            self.second_frame.grid(row=0, column=1, sticky="nsew")
-        else:
-            self.second_frame.grid_forget()
-        if name == "frame_3":
-            self.third_frame.grid(row=0, column=1, sticky="nsew")
-        else:
-            self.third_frame.grid_forget()
-
-    def home_button_event(self):
-        self.select_frame_by_name("home")
-
-    def frame_2_button_event(self):
-        self.select_frame_by_name("frame_2")
-
-    def frame_3_button_event(self):
-        self.select_frame_by_name("frame_3")
-
-    def change_appearance_mode_event(self, new_appearance_mode):
-        customtkinter.set_appearance_mode(new_appearance_mode)
-
-
-class _TextboxProxy:
-    def __init__(self, emit: Callable[[str], None]):
-        self._emit = emit
-
-    def insert(self, *_args):
-        if len(_args) >= 2:
-            self._emit(str(_args[1]))
-
-    def see(self, *_args):
-        pass
-
-    def configure(self, **_kwargs):
-        pass
-
-    def delete(self, *_args, **_kwargs):
-        pass
 
 
 def process_logic(
@@ -1407,15 +1237,8 @@ def process_logic(
     log_emit: Callable[[str], None],
     report_emit: Callable[[str], None],
 ) -> Tuple[str, int, int]:
-    """Run the Memo Match logic with callbacks for Pycro Station."""
-    app = App.__new__(App)
-    app.full_master_file_path = master_paths
-    app.full_report_file_paths = report_paths
-    app.third_frame_textbox_1 = _TextboxProxy(log_emit)
-    app.second_frame_textbox_1 = _TextboxProxy(report_emit)
-    app.timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return App.process_files(app)
-
+    """Run Memo Match with Pycro Station callbacks."""
+    return MemoMatchEngine(master_paths, report_paths, log_emit, report_emit).process_files()
 
 class MainWidget(QWidget):
     log_message = Signal(str)
@@ -1429,12 +1252,7 @@ class MainWidget(QWidget):
         self._connect_signals()
 
     def _build_ui(self):
-        self.desc_label = QLabel(
-            "Match PPM memo reports against OCCC master files. "
-            "Output files are auto-generated next to each master as "
-            "'<master>_UPDATED_yyyymmdd-hhmmss.xlsx' and 'New_PO_List_yyyymmdd-hhmmss.xlsx'.",
-            self,
-        )
+        self.desc_label = QLabel("", self)
         self.desc_label.setWordWrap(True)
         self.desc_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.desc_label.setStyleSheet(
@@ -1442,6 +1260,11 @@ class MainWidget(QWidget):
             "border: 1px solid #3a3a3a; border-radius: 6px;"
         )
         self.desc_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.set_long_description(
+            "Match PPM memo reports against OCCC master files. "
+            "Outputs match the original MMU.py naming: "
+            "'<master_path>_UPDATED.xlsx' and 'New_PO_List.xlsx'."
+        )
 
         label_style = "color: #dcdcdc; background: transparent; padding-left: 2px;"
         field_style = (
@@ -1513,6 +1336,15 @@ class MainWidget(QWidget):
         row_logs.addWidget(self.reports_box)
         row_logs.addWidget(self.log_box)
         main_layout.addLayout(row_logs, 2)
+
+    def set_long_description(self, text: str):
+        clean = (text or "").strip()
+        if clean:
+            self.desc_label.setText(clean)
+            self.desc_label.show()
+        else:
+            self.desc_label.clear()
+            self.desc_label.hide()
 
     def _connect_signals(self):
         self.select_master_btn.clicked.connect(self.select_master_files)
