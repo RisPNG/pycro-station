@@ -45,6 +45,9 @@ HIDDEN_PACKAGES_EXACT: set[str] = {
     'typing_extensions',
     'wheel',
     'zipp',
+    'numpy',
+    'colorthief',
+    'scipy'
 }
 # Also compare in lower-case to avoid case-only mismatches while keeping exact-name intent
 _HIDDEN_PACKAGES_LOWER = {s.lower() for s in HIDDEN_PACKAGES_EXACT}
