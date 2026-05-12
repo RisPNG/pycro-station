@@ -97,14 +97,21 @@ class MainWidget(QWidget):
         )
         self.set_long_description("")
 
+        self.select_overview_btn = PrimaryPushButton("Select Existing Overview Workbook (Optional)", self)
         self.select_files_btn = PrimaryPushButton("Select Payment Excel Files", self)
         self.run_btn = PrimaryPushButton("Run", self)
 
+        self.overview_label = QLabel("Selected overview workbook (optional)", self)
         self.files_label = QLabel("Selected payment files", self)
         self.logs_label = QLabel("Process logs", self)
-        for label in (self.files_label, self.logs_label):
+        for label in (self.overview_label, self.files_label, self.logs_label):
             label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             label.setStyleSheet("color: #dcdcdc; background: transparent; padding-left: 2px;")
+
+        self.overview_box = QTextEdit(self)
+        self.overview_box.setReadOnly(True)
+        self.overview_box.setPlaceholderText("Optional. Leave blank to create a new timestamped overview workbook.")
+        self.overview_box.setFixedHeight(48)
 
         self.files_box = QTextEdit(self)
         self.files_box.setReadOnly(True)
@@ -118,6 +125,7 @@ class MainWidget(QWidget):
             "QTextEdit{background: #1f1f1f; color: #d0d0d0; "
             "border: 1px solid #3a3a3a; border-radius: 6px;}"
         )
+        self.overview_box.setStyleSheet(text_box_style)
         self.files_box.setStyleSheet(text_box_style)
         self.log_box.setStyleSheet(text_box_style)
 
@@ -126,6 +134,15 @@ class MainWidget(QWidget):
         main_layout.setSpacing(12)
 
         main_layout.addWidget(self.desc_label, 1)
+
+        overview_btn_row = QHBoxLayout()
+        overview_btn_row.addStretch(1)
+        overview_btn_row.addWidget(self.select_overview_btn, 1)
+        overview_btn_row.addStretch(1)
+        main_layout.addLayout(overview_btn_row, 0)
+
+        main_layout.addWidget(self.overview_label, 0)
+        main_layout.addWidget(self.overview_box, 0)
 
         source_btn_row = QHBoxLayout()
         source_btn_row.addStretch(1)
@@ -159,10 +176,23 @@ class MainWidget(QWidget):
             self.desc_label.hide()
 
     def _connect_signals(self):
+        self.select_overview_btn.clicked.connect(self.select_overview_workbook)
         self.select_files_btn.clicked.connect(self.select_payment_files)
         self.run_btn.clicked.connect(self.run_process)
         self.log_message.connect(self.append_log)
         self.processing_done.connect(self.on_processing_done)
+
+    def select_overview_workbook(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Existing VTEC Payment Overview Workbook",
+            "",
+            "Excel Workbooks (*.xlsx *.xlsm)",
+        )
+        if file_path:
+            self.overview_box.setPlainText(file_path)
+        else:
+            self.overview_box.clear()
 
     def select_payment_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -176,6 +206,13 @@ class MainWidget(QWidget):
         else:
             self.files_box.clear()
 
+    def _selected_overview_workbook(self) -> Optional[str]:
+        text = self.overview_box.toPlainText().strip()
+        if not text:
+            return None
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        return first_line or None
+
     def _selected_files(self) -> List[str]:
         text = self.files_box.toPlainText().strip()
         if not text:
@@ -184,6 +221,7 @@ class MainWidget(QWidget):
 
     def run_process(self):
         source_files = self._selected_files()
+        overview_workbook = self._selected_overview_workbook()
         if not source_files:
             MessageBox("Warning", "Nothing to process. Please select payment file(s).", self).exec()
             return
@@ -194,7 +232,7 @@ class MainWidget(QWidget):
 
         def worker():
             try:
-                result = process_payment_files(source_files, self.log_message.emit)
+                result = process_payment_files(source_files, self.log_message.emit, overview_workbook)
             except Exception as exc:
                 result = ProcessingResult(success=False, failed_files=len(source_files), message=str(exc))
                 self.log_message.emit(f"ERROR: {exc}")
@@ -203,6 +241,7 @@ class MainWidget(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _set_buttons_enabled(self, enabled: bool):
+        self.select_overview_btn.setEnabled(enabled)
         self.select_files_btn.setEnabled(enabled)
         self.run_btn.setEnabled(enabled)
 
@@ -256,9 +295,10 @@ def get_widget():
 def process_payment_files(
     source_paths: Sequence[str],
     log_emit: Optional[Callable[[str], None]] = None,
+    overview_workbook_path: Optional[str] = None,
 ) -> ProcessingResult:
     processor = VTECPaymentProcessor(log_emit)
-    return processor.process(source_paths)
+    return processor.process(source_paths, overview_workbook_path)
 
 
 class VTECPaymentProcessor:
@@ -272,7 +312,11 @@ class VTECPaymentProcessor:
         except Exception:
             pass
 
-    def process(self, source_paths: Sequence[str]) -> ProcessingResult:
+    def process(
+        self,
+        source_paths: Sequence[str],
+        overview_workbook_path: Optional[str] = None,
+    ) -> ProcessingResult:
         clean_sources = [os.path.abspath(os.fspath(path)) for path in source_paths if os.fspath(path).strip()]
         if not clean_sources:
             raise ValueError("No source payment files were selected.")
@@ -281,20 +325,26 @@ class VTECPaymentProcessor:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"Source file not found: {path}")
 
-        output_path = self._resolve_output_path(clean_sources)
+        output_path, wb_out, created_new = self._open_or_create_output_workbook(clean_sources, overview_workbook_path)
 
         result = ProcessingResult(output_path=output_path)
-        self.log(f"Output workbook: {output_path}")
+        if created_new:
+            self.log(f"Created output workbook: {output_path}")
+        else:
+            self.log(f"Using existing overview workbook: {output_path}")
 
-        wb_out = self._create_output_workbook()
         try:
-            overview_ws = wb_out[OVERVIEW_SHEET_NAME]
-            dup_ws = wb_out[DUPLICATES_SHEET_NAME]
-            log_ws = wb_out[LOG_SHEET_NAME]
+            overview_ws = get_or_create_sheet(wb_out, OVERVIEW_SHEET_NAME)
+            dup_ws = get_or_create_sheet(wb_out, DUPLICATES_SHEET_NAME)
+            log_ws = get_or_create_sheet(wb_out, LOG_SHEET_NAME)
+
+            ensure_overview_sheet(overview_ws)
+            ensure_overview_sheet(dup_ws)
+            ensure_log_headers(log_ws)
 
             processed_log = load_processed_log(log_ws)
-            current_summary_row = DATA_START_ROW
-            current_dup_row = DATA_START_ROW
+            current_summary_row = max(DATA_START_ROW, last_used_row_in_column(overview_ws, 1) + 1)
+            current_dup_row = max(DATA_START_ROW, last_used_row_in_column(dup_ws, 1) + 1)
 
             new_rows: List[List[Any]] = []
 
@@ -374,6 +424,29 @@ class VTECPaymentProcessor:
         first_source_dir = os.path.dirname(os.path.abspath(source_paths[0]))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return os.path.join(first_source_dir, f"VTEC Payment Overview {timestamp}.xlsx")
+
+    def _open_or_create_output_workbook(
+        self,
+        source_paths: Sequence[str],
+        overview_workbook_path: Optional[str],
+    ) -> Tuple[str, Any, bool]:
+        selected_path = (overview_workbook_path or "").strip()
+        if selected_path:
+            output_path = os.path.abspath(selected_path)
+            if not os.path.isfile(output_path):
+                raise FileNotFoundError(f"Overview workbook not found: {output_path}")
+
+            ext = os.path.splitext(output_path)[1].lower()
+            if ext not in {".xlsx", ".xlsm"}:
+                raise ValueError("Existing overview workbook must be an .xlsx or .xlsm file.")
+
+            keep_vba = ext == ".xlsm"
+            workbook = load_workbook(output_path, keep_vba=keep_vba)
+            return output_path, workbook, False
+
+        output_path = self._resolve_output_path(source_paths)
+        workbook = self._create_output_workbook()
+        return output_path, workbook, True
 
     def _create_output_workbook(self):
         wb = Workbook()
@@ -826,6 +899,11 @@ def worksheet_is_empty(ws) -> bool:
             if not is_blank(cell.value):
                 return False
     return True
+
+
+def ensure_overview_sheet(ws):
+    if is_blank(ws.cell(row=1, column=1).value):
+        write_headers(ws)
 
 
 def write_headers(ws):
