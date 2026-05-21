@@ -255,6 +255,48 @@ class SmartsheetImporterProcessor:
 
         return None
 
+    def click_existing_grid_row(self, driver, row_index: int, row_height: int):
+        scroll_container_xpath = (
+            '//div[contains(@class, "ReactVirtualized__Grid") '
+            'and contains(@class, "ReactVirtualized__Table__Grid")]'
+        )
+        target_row_xpath = (
+            f'//div[@role="row" and contains(@class, "data-row") '
+            f'and @data-row-index="{row_index}"]'
+        )
+        target_top = row_index * row_height
+        scroll_container = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, scroll_container_xpath))
+        )
+
+        for scroll_top in (target_top, max(0, target_top - (row_height * 5))):
+            driver.execute_script(
+                """
+                arguments[0].scrollTop = arguments[1];
+                arguments[0].dispatchEvent(new Event('scroll', { bubbles: true }));
+                """,
+                scroll_container,
+                scroll_top,
+            )
+
+            try:
+                target_row = WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.XPATH, target_row_xpath))
+                )
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+                    target_row,
+                )
+                target_row = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH, target_row_xpath))
+                )
+                target_row.click()
+                return
+            except TimeoutException:
+                continue
+
+        raise TimeoutException(f"Could not find existing grid row index {row_index}.")
+
     def process(self, file_paths: List[str]) -> Tuple[int, int]:
         for idx, path in enumerate(file_paths, start=1):
             if self.is_stopped:
@@ -320,8 +362,8 @@ class SmartsheetImporterProcessor:
                 self.success_count += leading_skip_count
                 row_index = leading_skip_count
                 self.log(
-                    f"Skipped {leading_skip_count} leading workbook rows marked Skip=YES "
-                    "without opening Smartsheet rows."
+                    f"Skipped {leading_skip_count} leading workbook row(s) marked Skip=YES "
+                    f"without opening Smartsheet rows. Next row to process is Excel row {row_index + 2}."
                 )
 
             for row in data[row_index:]:
@@ -353,6 +395,10 @@ class SmartsheetImporterProcessor:
                             existing_row_count is not None
                             and row_index >= existing_row_count
                         )
+                        edit_existing_by_count = (
+                            existing_row_count is not None
+                            and row_index < existing_row_count
+                        )
 
                         while True:
                             if self.is_stopped:
@@ -368,6 +414,15 @@ class SmartsheetImporterProcessor:
                                         EC.element_to_be_clickable((By.XPATH, self.button_by_text_xpath("New")))
                                     )
                                     new_button.click()
+                                    break
+
+                                if edit_existing_by_count:
+                                    self.log(
+                                        f"Workbook row {row_index + 2} maps to existing "
+                                        f"Dynamic View row {row_index + 1}. Opening it for edit."
+                                    )
+                                    self.click_existing_grid_row(driver, row_index, row_height)
+                                    self.log(f"Clicked existing row at index {row_index}.")
                                     break
 
                                 container = WebDriverWait(driver, 10).until(
