@@ -1,7 +1,8 @@
 import os
+import re
 import time
 import threading
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
 
 # PySide6 & qfluentwidgets UI imports
@@ -215,6 +216,45 @@ class SmartsheetImporterProcessor:
     def stop(self):
         self.is_stopped = True
 
+    def button_by_text_xpath(self, text: str) -> str:
+        return f'//button[normalize-space(.)="{text}"]'
+
+    def is_skip_row(self, row: Dict[str, Any]) -> bool:
+        return str(row.get("Skip") or "").strip().upper() == "YES"
+
+    def count_leading_skip_rows(self, data: List[Dict[str, Any]]) -> int:
+        count = 0
+        for row in data:
+            if not self.is_skip_row(row):
+                break
+            count += 1
+        return count
+
+    def detect_existing_row_count(self, driver) -> Optional[int]:
+        try:
+            grid = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '[role="grid"][aria-rowcount]'))
+            )
+            row_count = grid.get_attribute("aria-rowcount")
+            if row_count:
+                parsed_count = int(row_count)
+                if parsed_count >= 0:
+                    return parsed_count
+        except Exception as e:
+            self.log(f"Could not read grid row count from aria-rowcount: {e}")
+
+        try:
+            rows = driver.find_elements(By.XPATH, '//div[@role="row" and contains(@class, "data-row")]')
+            for visible_row in rows:
+                label = visible_row.get_attribute("aria-label") or ""
+                match = re.search(r"Row\s+\d+\s+of\s+(\d+)", label)
+                if match:
+                    return int(match.group(1))
+        except Exception as e:
+            self.log(f"Could not read grid row count from visible row labels: {e}")
+
+        return None
+
     def process(self, file_paths: List[str]) -> Tuple[int, int]:
         for idx, path in enumerate(file_paths, start=1):
             if self.is_stopped:
@@ -262,10 +302,36 @@ class SmartsheetImporterProcessor:
                 self.log(f"Login timeout or error: {e}")
                 return
 
+            existing_row_count = self.detect_existing_row_count(driver)
+            leading_skip_count = self.count_leading_skip_rows(data)
+            if existing_row_count is not None:
+                self.log(f"Detected {existing_row_count} existing rows in Dynamic View.")
+                if leading_skip_count != existing_row_count:
+                    self.log(
+                        "Workbook/page row-count mismatch: "
+                        f"{leading_skip_count} leading Skip=YES rows, "
+                        f"{existing_row_count} rows currently on the page."
+                    )
+            else:
+                self.log("Could not detect existing row count; falling back to scroll-based row lookup.")
+
             row_index = 0
-            for row in data:
+            if leading_skip_count:
+                self.success_count += leading_skip_count
+                row_index = leading_skip_count
+                self.log(
+                    f"Skipped {leading_skip_count} leading workbook rows marked Skip=YES "
+                    "without opening Smartsheet rows."
+                )
+
+            for row in data[row_index:]:
                 if self.is_stopped:
                     break
+
+                if self.is_skip_row(row):
+                    self.success_count += 1
+                    row_index += 1
+                    continue
 
                 retry_attempts = 10
                 row_successful = False
@@ -283,12 +349,27 @@ class SmartsheetImporterProcessor:
                         row_xpath = './/div[@role="row" and contains(@class, "data-row")]'
 
                         skip = False
+                        append_to_new_row = (
+                            existing_row_count is not None
+                            and row_index >= existing_row_count
+                        )
 
                         while True:
                             if self.is_stopped:
                                 break
 
                             try:
+                                if append_to_new_row:
+                                    self.log(
+                                        f"Workbook row {row_index + 2} is beyond the "
+                                        f"{existing_row_count} existing rows. Clicking New."
+                                    )
+                                    new_button = WebDriverWait(driver, 10).until(
+                                        EC.element_to_be_clickable((By.XPATH, self.button_by_text_xpath("New")))
+                                    )
+                                    new_button.click()
+                                    break
+
                                 container = WebDriverWait(driver, 10).until(
                                     EC.presence_of_element_located((By.XPATH, container_xpath))
                                 )
@@ -318,7 +399,7 @@ class SmartsheetImporterProcessor:
                                             rows = container.find_elements(By.XPATH, row_xpath)
                                             current_row = rows[visible_row_index]
 
-                                            if (row.get("Skip") or "").upper() == "YES":
+                                            if self.is_skip_row(row):
                                                 self.log("Skipping row...")
                                                 skip = True
                                                 break
@@ -337,7 +418,7 @@ class SmartsheetImporterProcessor:
                                         self.log(f"Row index {row_index} is not visible. Loading new records.")
                                         try:
                                             new_button = WebDriverWait(driver, 10).until(
-                                                EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "New")]'))
+                                                EC.element_to_be_clickable((By.XPATH, self.button_by_text_xpath("New")))
                                             )
                                             new_button.click()
                                         except StaleElementReferenceException:
@@ -363,7 +444,7 @@ class SmartsheetImporterProcessor:
                                             rows = container.find_elements(By.XPATH, row_xpath)
                                             current_row = rows[visible_row_index]
 
-                                            if (row.get("Skip") or "").upper() == "YES":
+                                            if self.is_skip_row(row):
                                                 self.log("Skipping row...")
                                                 skip = True
                                                 break
@@ -379,7 +460,7 @@ class SmartsheetImporterProcessor:
                                             self.log(f"Row index {row_index} is still not visible even at bottom. Loading new records.")
                                             try:
                                                 new_button = WebDriverWait(driver, 10).until(
-                                                    EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "New")]'))
+                                                    EC.element_to_be_clickable((By.XPATH, self.button_by_text_xpath("New")))
                                                 )
                                                 new_button.click()
                                             except StaleElementReferenceException:
@@ -532,12 +613,12 @@ class SmartsheetImporterProcessor:
                                 self.log("Saving...")
                                 try:
                                     save_button = WebDriverWait(driver, 10).until(
-                                        EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "Save")]'))
+                                        EC.element_to_be_clickable((By.XPATH, self.button_by_text_xpath("Save")))
                                     )
                                     save_button.click()
                                 except StaleElementReferenceException:
                                     save_button = WebDriverWait(driver, 10).until(
-                                        EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "Save")]'))
+                                        EC.element_to_be_clickable((By.XPATH, self.button_by_text_xpath("Save")))
                                     )
                                     save_button.click()
 
