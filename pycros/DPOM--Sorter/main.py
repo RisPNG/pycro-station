@@ -353,13 +353,13 @@ class ProcessingLogic:
             # Get season rank
             seas = str(raw[COL_SEASON]).upper()
             season_rank = 9
-            if "SP" in seas:
+            if "FA" in seas:
                 season_rank = 1
-            elif "SU" in seas:
-                season_rank = 2
-            elif "FA" in seas:
-                season_rank = 3
             elif "HO" in seas:
+                season_rank = 2
+            elif "SP" in seas:
+                season_rank = 3
+            elif "SU" in seas:
                 season_rank = 4
 
             # Extract style components
@@ -389,10 +389,10 @@ class ProcessingLogic:
             }
             pivoted_rows.append(obj)
 
-        # Step 5: Sort records (Year + Style + Season + OGAC first)
+        # Step 5: Sort records (Style + Year + Season + OGAC first)
         pivoted_rows.sort(key=lambda x: (
-            year_sort_value(x.get('year')),
             x['style_head'],
+            year_sort_value(x.get('year')),
             x['season_rank'],
             x['ogac_dt'] or datetime.max,
             x['po'],
@@ -475,17 +475,17 @@ class ProcessingLogic:
             """Preserve SortRecord ordering across style groups (esp. split materials)."""
             items = style_groups.get(k, [])
             if not items:
-                return (0, "", datetime.max, datetime.max, 9, "", "", "", "", "", k)
+                return ("", 0, 9, datetime.max, datetime.max, "", "", 0, "", "", k)
 
             first = items[0]
             ogac_vals = [i.get('ogac_dt') for i in items if isinstance(i.get('ogac_dt'), datetime)]
             max_ogac = max(ogac_vals) if ogac_vals else datetime.max
             return (
-                year_sort_value(first.get('year')),
                 first.get('style_head', ""),
+                year_sort_value(first.get('year')),
+                first.get('season_rank', 9),
                 first.get('ogac_dt') or datetime.max,
                 max_ogac,
-                first.get('season_rank', 9),
                 first.get('po', ""),
                 first.get('style_cw', ""),
                 first.get('po_line_sort', 0),

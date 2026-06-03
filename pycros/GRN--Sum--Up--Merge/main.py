@@ -184,17 +184,17 @@ def capture_cell_style(cell) -> CellStyle:
 
 def apply_cell_style(cell, style: CellStyle) -> None:
     if "font" in style:
-        cell.font = copy(style["font"])
+        cell.font = style["font"]
     if "fill" in style:
-        cell.fill = copy(style["fill"])
+        cell.fill = style["fill"]
     if "border" in style:
-        cell.border = copy(style["border"])
+        cell.border = style["border"]
     if "alignment" in style:
-        cell.alignment = copy(style["alignment"])
+        cell.alignment = style["alignment"]
     if "number_format" in style:
         cell.number_format = style["number_format"]
     if "protection" in style:
-        cell.protection = copy(style["protection"])
+        cell.protection = style["protection"]
 
 
 def make_styled_cell(worksheet, value, style: CellStyle):
@@ -350,15 +350,28 @@ def whse_is_vn(row: list[object]) -> bool:
     return normalize_text(row[WHSE_COL - 1]) == "VN"
 
 
-def sort_rows(rows: list[tuple[int, list[object]]]) -> list[list[object]]:
-    rows.sort(
+def sort_and_split_rows(rows: list[tuple[int, list[object]]]) -> tuple[list[list[object]], list[list[object]]]:
+    non_vn: list[tuple[int, list[object]]] = []
+    vn: list[tuple[int, list[object]]] = []
+    for seq, row in rows:
+        if whse_is_vn(row):
+            vn.append((seq, row))
+        else:
+            non_vn.append((seq, row))
+
+    non_vn.sort(
         key=lambda item: (
-            1 if whse_is_vn(item[1]) else 0,
             *parse_doc_date(item[1][DOC_DATE_COL - 1] if len(item[1]) >= DOC_DATE_COL else None),
             item[0],
         )
     )
-    return [row for _, row in rows]
+    vn.sort(
+        key=lambda item: (
+            *parse_doc_date(item[1][DOC_DATE_COL - 1] if len(item[1]) >= DOC_DATE_COL else None),
+            item[0],
+        )
+    )
+    return [row for _, row in non_vn], [row for _, row in vn]
 
 
 def collect_rows(files: list[Path], log_emit=None) -> tuple[list[object], list[tuple[int, list[object]]], Path, int, int]:
@@ -427,12 +440,7 @@ def collect_rows(files: list[Path], log_emit=None) -> tuple[list[object], list[t
     return header, rows, template_path, ok_files, fail_files
 
 
-def write_output(path: Path, header: list[object], rows: list[list[object]], visual_template: VisualTemplate, log_emit=None) -> None:
-    workbook = Workbook(write_only=True)
-    worksheet = workbook.create_sheet(SHEET_NAME)
-    width = len(header)
-    apply_visual_template(worksheet, visual_template, width)
-
+def _write_sheet(worksheet, header: list[object], rows: list[list[object]], visual_template: VisualTemplate, width: int) -> None:
     header_cells = [
         make_styled_cell(worksheet, value, visual_template["header_styles"][column_index])
         for column_index, value in enumerate(header)
@@ -441,14 +449,49 @@ def write_output(path: Path, header: list[object], rows: list[list[object]], vis
 
     data_row_has_visual = row_dimension_has_visual(visual_template["data_row_dimension"])
     data_styles = visual_template["data_styles"]
+    # Pre-extract style attributes to avoid dict lookups in the hot loop
+    fonts = [s.get("font") for s in data_styles]
+    fills = [s.get("fill") for s in data_styles]
+    borders = [s.get("border") for s in data_styles]
+    alignments = [s.get("alignment") for s in data_styles]
+    number_formats = [s.get("number_format") for s in data_styles]
+    protections = [s.get("protection") for s in data_styles]
+
     for row_index, row in enumerate(rows, start=2):
         if data_row_has_visual:
             apply_row_dimension(worksheet, row_index, visual_template["data_row_dimension"])
-        styled_row = [
-            make_styled_cell(worksheet, row[column_index] if column_index < len(row) else None, data_styles[column_index])
-            for column_index in range(width)
-        ]
+        styled_row: list[object] = []
+        for column_index in range(width):
+            cell = WriteOnlyCell(worksheet, value=row[column_index] if column_index < len(row) else None)
+            if fonts[column_index] is not None:
+                cell.font = fonts[column_index]
+            if fills[column_index] is not None:
+                cell.fill = fills[column_index]
+            if borders[column_index] is not None:
+                cell.border = borders[column_index]
+            if alignments[column_index] is not None:
+                cell.alignment = alignments[column_index]
+            if number_formats[column_index] is not None:
+                cell.number_format = number_formats[column_index]
+            if protections[column_index] is not None:
+                cell.protection = protections[column_index]
+            styled_row.append(cell)
         worksheet.append(styled_row)
+
+
+def write_output(path: Path, header: list[object], non_vn_rows: list[list[object]], vn_rows: list[list[object]], visual_template: VisualTemplate, log_emit=None) -> None:
+    workbook = Workbook(write_only=True)
+    width = len(header)
+
+    non_vn_sheet = workbook.create_sheet(SHEET_NAME)
+    apply_visual_template(non_vn_sheet, visual_template, width)
+    _write_sheet(non_vn_sheet, header, non_vn_rows, visual_template, width)
+    _emit(log_emit, f"[SHEET] {SHEET_NAME}: {len(non_vn_rows)} row(s)")
+
+    vn_sheet = workbook.create_sheet(f"{SHEET_NAME} VN")
+    apply_visual_template(vn_sheet, visual_template, width)
+    _write_sheet(vn_sheet, header, vn_rows, visual_template, width)
+    _emit(log_emit, f"[SHEET] {SHEET_NAME} VN: {len(vn_rows)} row(s)")
 
     workbook.save(path)
     _emit(log_emit, f"[DONE] Output saved: {path}")
@@ -466,13 +509,13 @@ def process_files(
     _emit(log_emit, f"Files to process: {len(files)}")
     header, indexed_rows, template_path, ok_files, fail_files = collect_rows(files, log_emit=log_emit)
     _emit(log_emit, f"Rows collected: {len(indexed_rows)}")
-    _emit(log_emit, "Sorting rows: non-VN by Doc Date first, then VN by Doc Date.")
-    sorted_data_rows = sort_rows(indexed_rows)
+    _emit(log_emit, "Sorting rows: non-VN by Doc Date, VN by Doc Date (separate sheets).")
+    non_vn_rows, vn_rows = sort_and_split_rows(indexed_rows)
 
     out_path = ensure_unique_path(output) if output else proposed_output_path(files)
     visual_template = load_visual_template(template_path, len(header), log_emit=log_emit)
-    write_output(out_path, header, sorted_data_rows, visual_template, log_emit=log_emit)
-    return str(out_path), ok_files, fail_files, len(sorted_data_rows)
+    write_output(out_path, header, non_vn_rows, vn_rows, visual_template, log_emit=log_emit)
+    return str(out_path), ok_files, fail_files, len(non_vn_rows) + len(vn_rows)
 
 
 def main() -> None:
