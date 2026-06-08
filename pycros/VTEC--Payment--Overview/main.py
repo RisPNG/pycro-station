@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -37,6 +38,7 @@ LOG_SHEET_NAME = "Processing Log"
 DATA_START_ROW = 4
 HEADER_ROW = 3
 NUM_OUTPUT_COLS = 19
+CONDITIONAL_USD_MAP_KEY = 0
 
 HEADERS: Tuple[str, ...] = (
     "Supplier Name",
@@ -98,13 +100,15 @@ class MainWidget(QWidget):
         self.set_long_description("")
 
         self.select_overview_btn = PrimaryPushButton("Select Existing Overview Workbook (Optional)", self)
+        self.select_output_btn = PrimaryPushButton("Select New Output Workbook Location (Optional)", self)
         self.select_files_btn = PrimaryPushButton("Select Payment Excel Files", self)
         self.run_btn = PrimaryPushButton("Run", self)
 
         self.overview_label = QLabel("Selected overview workbook (optional)", self)
+        self.output_label = QLabel("Selected new output workbook (optional)", self)
         self.files_label = QLabel("Selected payment files", self)
         self.logs_label = QLabel("Process logs", self)
-        for label in (self.overview_label, self.files_label, self.logs_label):
+        for label in (self.overview_label, self.output_label, self.files_label, self.logs_label):
             label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             label.setStyleSheet("color: #dcdcdc; background: transparent; padding-left: 2px;")
 
@@ -112,6 +116,11 @@ class MainWidget(QWidget):
         self.overview_box.setReadOnly(True)
         self.overview_box.setPlaceholderText("Optional. Leave blank to create a new timestamped overview workbook.")
         self.overview_box.setFixedHeight(48)
+
+        self.output_box = QTextEdit(self)
+        self.output_box.setReadOnly(True)
+        self.output_box.setPlaceholderText("Optional. Used only when no existing overview workbook is selected.")
+        self.output_box.setFixedHeight(48)
 
         self.files_box = QTextEdit(self)
         self.files_box.setReadOnly(True)
@@ -126,6 +135,7 @@ class MainWidget(QWidget):
             "border: 1px solid #3a3a3a; border-radius: 6px;}"
         )
         self.overview_box.setStyleSheet(text_box_style)
+        self.output_box.setStyleSheet(text_box_style)
         self.files_box.setStyleSheet(text_box_style)
         self.log_box.setStyleSheet(text_box_style)
 
@@ -143,6 +153,15 @@ class MainWidget(QWidget):
 
         main_layout.addWidget(self.overview_label, 0)
         main_layout.addWidget(self.overview_box, 0)
+
+        output_btn_row = QHBoxLayout()
+        output_btn_row.addStretch(1)
+        output_btn_row.addWidget(self.select_output_btn, 1)
+        output_btn_row.addStretch(1)
+        main_layout.addLayout(output_btn_row, 0)
+
+        main_layout.addWidget(self.output_label, 0)
+        main_layout.addWidget(self.output_box, 0)
 
         source_btn_row = QHBoxLayout()
         source_btn_row.addStretch(1)
@@ -177,6 +196,7 @@ class MainWidget(QWidget):
 
     def _connect_signals(self):
         self.select_overview_btn.clicked.connect(self.select_overview_workbook)
+        self.select_output_btn.clicked.connect(self.select_output_workbook)
         self.select_files_btn.clicked.connect(self.select_payment_files)
         self.run_btn.clicked.connect(self.run_process)
         self.log_message.connect(self.append_log)
@@ -193,6 +213,20 @@ class MainWidget(QWidget):
             self.overview_box.setPlainText(file_path)
         else:
             self.overview_box.clear()
+
+    def select_output_workbook(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select New VTEC Payment Overview Output Workbook",
+            "",
+            "Excel Workbooks (*.xlsx)",
+        )
+        if file_path:
+            if not os.path.splitext(file_path)[1]:
+                file_path = f"{file_path}.xlsx"
+            self.output_box.setPlainText(file_path)
+        else:
+            self.output_box.clear()
 
     def select_payment_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -213,6 +247,13 @@ class MainWidget(QWidget):
         first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
         return first_line or None
 
+    def _selected_output_workbook(self) -> Optional[str]:
+        text = self.output_box.toPlainText().strip()
+        if not text:
+            return None
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        return first_line or None
+
     def _selected_files(self) -> List[str]:
         text = self.files_box.toPlainText().strip()
         if not text:
@@ -222,6 +263,7 @@ class MainWidget(QWidget):
     def run_process(self):
         source_files = self._selected_files()
         overview_workbook = self._selected_overview_workbook()
+        output_workbook = self._selected_output_workbook()
         if not source_files:
             MessageBox("Warning", "Nothing to process. Please select payment file(s).", self).exec()
             return
@@ -232,7 +274,12 @@ class MainWidget(QWidget):
 
         def worker():
             try:
-                result = process_payment_files(source_files, self.log_message.emit, overview_workbook)
+                result = process_payment_files(
+                    source_files,
+                    self.log_message.emit,
+                    overview_workbook,
+                    output_workbook,
+                )
             except Exception as exc:
                 result = ProcessingResult(success=False, failed_files=len(source_files), message=str(exc))
                 self.log_message.emit(f"ERROR: {exc}")
@@ -242,6 +289,7 @@ class MainWidget(QWidget):
 
     def _set_buttons_enabled(self, enabled: bool):
         self.select_overview_btn.setEnabled(enabled)
+        self.select_output_btn.setEnabled(enabled)
         self.select_files_btn.setEnabled(enabled)
         self.run_btn.setEnabled(enabled)
 
@@ -296,9 +344,10 @@ def process_payment_files(
     source_paths: Sequence[str],
     log_emit: Optional[Callable[[str], None]] = None,
     overview_workbook_path: Optional[str] = None,
+    output_workbook_path: Optional[str] = None,
 ) -> ProcessingResult:
     processor = VTECPaymentProcessor(log_emit)
-    return processor.process(source_paths, overview_workbook_path)
+    return processor.process(source_paths, overview_workbook_path, output_workbook_path)
 
 
 class VTECPaymentProcessor:
@@ -316,6 +365,7 @@ class VTECPaymentProcessor:
         self,
         source_paths: Sequence[str],
         overview_workbook_path: Optional[str] = None,
+        output_workbook_path: Optional[str] = None,
     ) -> ProcessingResult:
         clean_sources = [os.path.abspath(os.fspath(path)) for path in source_paths if os.fspath(path).strip()]
         if not clean_sources:
@@ -325,7 +375,11 @@ class VTECPaymentProcessor:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"Source file not found: {path}")
 
-        output_path, wb_out, created_new = self._open_or_create_output_workbook(clean_sources, overview_workbook_path)
+        output_path, wb_out, created_new = self._open_or_create_output_workbook(
+            clean_sources,
+            overview_workbook_path,
+            output_workbook_path,
+        )
 
         result = ProcessingResult(output_path=output_path)
         if created_new:
@@ -365,7 +419,8 @@ class VTECPaymentProcessor:
                             self.log(f"Skipped already processed sheet: {source_book.name} -> {sheet.name}")
                             continue
 
-                        if "payment" not in sheet.name.lower():
+                        sheet_name_lower = sheet.name.lower()
+                        if "payment" not in sheet_name_lower or "(v)" not in sheet_name_lower:
                             continue
 
                         rows_from_sheet = self._collect_rows_from_payment_sheet(
@@ -420,7 +475,22 @@ class VTECPaymentProcessor:
             except Exception:
                 pass
 
-    def _resolve_output_path(self, source_paths: Sequence[str]) -> str:
+    def _resolve_output_path(
+        self,
+        source_paths: Sequence[str],
+        output_workbook_path: Optional[str] = None,
+    ) -> str:
+        selected_path = (output_workbook_path or "").strip()
+        if selected_path:
+            output_path = os.path.abspath(selected_path)
+            ext = os.path.splitext(output_path)[1].lower()
+            if not ext:
+                output_path = f"{output_path}.xlsx"
+                ext = ".xlsx"
+            if ext != ".xlsx":
+                raise ValueError("New output workbook must be an .xlsx file.")
+            return output_path
+
         first_source_dir = os.path.dirname(os.path.abspath(source_paths[0]))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return os.path.join(first_source_dir, f"VTEC Payment Overview {timestamp}.xlsx")
@@ -429,9 +499,12 @@ class VTECPaymentProcessor:
         self,
         source_paths: Sequence[str],
         overview_workbook_path: Optional[str],
+        output_workbook_path: Optional[str],
     ) -> Tuple[str, Any, bool]:
         selected_path = (overview_workbook_path or "").strip()
         if selected_path:
+            if (output_workbook_path or "").strip():
+                self.log("Selected new output workbook location ignored because an existing overview workbook was selected.")
             output_path = os.path.abspath(selected_path)
             if not os.path.isfile(output_path):
                 raise FileNotFoundError(f"Overview workbook not found: {output_path}")
@@ -444,7 +517,7 @@ class VTECPaymentProcessor:
             workbook = load_workbook(output_path, keep_vba=keep_vba)
             return output_path, workbook, False
 
-        output_path = self._resolve_output_path(source_paths)
+        output_path = self._resolve_output_path(source_paths, output_workbook_path)
         workbook = self._create_output_workbook()
         return output_path, workbook, True
 
@@ -499,6 +572,14 @@ class VTECPaymentProcessor:
                 source_col = column_map[output_idx]
                 if source_col > 0:
                     output_row[output_idx - 1] = sheet.cell(row_idx, source_col)
+
+            conditional_usd_col = column_map.get(CONDITIONAL_USD_MAP_KEY, 0)
+            if conditional_usd_col > 0:
+                usd_value = sheet.cell(row_idx, conditional_usd_col)
+                if not is_blank(usd_value):
+                    usd_output_idx = 10 if not is_blank(output_row[6]) else 8
+                    if is_blank(output_row[usd_output_idx - 1]):
+                        output_row[usd_output_idx - 1] = usd_value
 
             if is_blank(output_row[0]):
                 output_row[0] = lookup_supplier_name_from_dict(
@@ -663,13 +744,15 @@ def identify_columns(sheet: SheetReader, header_row: int, last_col: int) -> dict
             column_map[7] = col
         elif "total" in header_text and "usd" in header_text:
             column_map[10] = col
+        elif header_trimmed == "usd" and column_map.get(CONDITIONAL_USD_MAP_KEY, 0) == 0:
+            column_map[CONDITIONAL_USD_MAP_KEY] = col
         elif "supplier name" in header_text:
             column_map[1] = col
         elif "payment term" in header_text:
             column_map[2] = col
         elif "other references" in header_text:
             column_map[4] = col
-        elif "currency rate" in header_text:
+        elif "currency rate" in header_text or "exchange rate" in header_text:
             column_map[12] = col
         elif "purchaser" in header_text:
             column_map[13] = col
@@ -785,8 +868,8 @@ def move_later_duplicates(overview_ws, dup_ws, current_dup_row: int) -> int:
         if not vat_invoice:
             continue
 
-        po_amount_usd = row_data[7] if len(row_data) >= 8 else None
-        key = f"{vat_invoice}|{number_key(po_amount_usd)}"
+        po_amount_vnd = row_data[4] if len(row_data) >= 5 else None
+        key = f"{vat_invoice_match_key(vat_invoice)}|{number_key(po_amount_vnd)}"
         key_counts[key] = key_counts.get(key, 0) + 1
 
         payment_date = row_data[17] if len(row_data) >= 18 else None
@@ -813,8 +896,8 @@ def move_later_duplicates(overview_ws, dup_ws, current_dup_row: int) -> int:
             full_row.append(None)
 
         vat_invoice = value_to_str(full_row[2]).strip()
-        po_amount_usd = full_row[7]
-        key = f"{vat_invoice}|{number_key(po_amount_usd)}"
+        po_amount_vnd = full_row[4]
+        key = f"{vat_invoice_match_key(vat_invoice)}|{number_key(po_amount_vnd)}"
 
         if not vat_invoice:
             keep_rows.append(full_row)
@@ -1034,6 +1117,14 @@ def value_to_str(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
+
+
+def vat_invoice_match_key(value: Any) -> str:
+    text = value_to_str(value).strip()
+    numeric_tokens = re.findall(r"\d+", text)
+    if not numeric_tokens:
+        return text
+    return numeric_tokens[-1].lstrip("0") or "0"
 
 
 def clean_number_text(value: Any) -> str:
