@@ -100,12 +100,12 @@ class MainWidget(QWidget):
         self.set_long_description("")
 
         self.select_overview_btn = PrimaryPushButton("Select Existing Overview Workbook (Optional)", self)
-        self.select_output_btn = PrimaryPushButton("Select New Output Workbook Location (Optional)", self)
+        self.select_output_btn = PrimaryPushButton("Select New Output Folder (Optional)", self)
         self.select_files_btn = PrimaryPushButton("Select Payment Excel Files", self)
         self.run_btn = PrimaryPushButton("Run", self)
 
         self.overview_label = QLabel("Selected overview workbook (optional)", self)
-        self.output_label = QLabel("Selected new output workbook (optional)", self)
+        self.output_label = QLabel("Selected new output folder (optional)", self)
         self.files_label = QLabel("Selected payment files", self)
         self.logs_label = QLabel("Process logs", self)
         for label in (self.overview_label, self.output_label, self.files_label, self.logs_label):
@@ -196,7 +196,7 @@ class MainWidget(QWidget):
 
     def _connect_signals(self):
         self.select_overview_btn.clicked.connect(self.select_overview_workbook)
-        self.select_output_btn.clicked.connect(self.select_output_workbook)
+        self.select_output_btn.clicked.connect(self.select_output_folder)
         self.select_files_btn.clicked.connect(self.select_payment_files)
         self.run_btn.clicked.connect(self.run_process)
         self.log_message.connect(self.append_log)
@@ -214,17 +214,14 @@ class MainWidget(QWidget):
         else:
             self.overview_box.clear()
 
-    def select_output_workbook(self):
-        file_path, _ = QFileDialog.getSaveFileName(
+    def select_output_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
             self,
-            "Select New VTEC Payment Overview Output Workbook",
+            "Select New VTEC Payment Overview Output Folder",
             "",
-            "Excel Workbooks (*.xlsx)",
         )
-        if file_path:
-            if not os.path.splitext(file_path)[1]:
-                file_path = f"{file_path}.xlsx"
-            self.output_box.setPlainText(file_path)
+        if folder_path:
+            self.output_box.setPlainText(folder_path)
         else:
             self.output_box.clear()
 
@@ -247,7 +244,7 @@ class MainWidget(QWidget):
         first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
         return first_line or None
 
-    def _selected_output_workbook(self) -> Optional[str]:
+    def _selected_output_folder(self) -> Optional[str]:
         text = self.output_box.toPlainText().strip()
         if not text:
             return None
@@ -263,7 +260,7 @@ class MainWidget(QWidget):
     def run_process(self):
         source_files = self._selected_files()
         overview_workbook = self._selected_overview_workbook()
-        output_workbook = self._selected_output_workbook()
+        output_folder = self._selected_output_folder()
         if not source_files:
             MessageBox("Warning", "Nothing to process. Please select payment file(s).", self).exec()
             return
@@ -278,7 +275,7 @@ class MainWidget(QWidget):
                     source_files,
                     self.log_message.emit,
                     overview_workbook,
-                    output_workbook,
+                    output_folder,
                 )
             except Exception as exc:
                 result = ProcessingResult(success=False, failed_files=len(source_files), message=str(exc))
@@ -344,10 +341,10 @@ def process_payment_files(
     source_paths: Sequence[str],
     log_emit: Optional[Callable[[str], None]] = None,
     overview_workbook_path: Optional[str] = None,
-    output_workbook_path: Optional[str] = None,
+    output_folder_path: Optional[str] = None,
 ) -> ProcessingResult:
     processor = VTECPaymentProcessor(log_emit)
-    return processor.process(source_paths, overview_workbook_path, output_workbook_path)
+    return processor.process(source_paths, overview_workbook_path, output_folder_path)
 
 
 class VTECPaymentProcessor:
@@ -365,7 +362,7 @@ class VTECPaymentProcessor:
         self,
         source_paths: Sequence[str],
         overview_workbook_path: Optional[str] = None,
-        output_workbook_path: Optional[str] = None,
+        output_folder_path: Optional[str] = None,
     ) -> ProcessingResult:
         clean_sources = [os.path.abspath(os.fspath(path)) for path in source_paths if os.fspath(path).strip()]
         if not clean_sources:
@@ -378,7 +375,7 @@ class VTECPaymentProcessor:
         output_path, wb_out, created_new = self._open_or_create_output_workbook(
             clean_sources,
             overview_workbook_path,
-            output_workbook_path,
+            output_folder_path,
         )
 
         result = ProcessingResult(output_path=output_path)
@@ -478,33 +475,29 @@ class VTECPaymentProcessor:
     def _resolve_output_path(
         self,
         source_paths: Sequence[str],
-        output_workbook_path: Optional[str] = None,
+        output_folder_path: Optional[str] = None,
     ) -> str:
-        selected_path = (output_workbook_path or "").strip()
-        if selected_path:
-            output_path = os.path.abspath(selected_path)
-            ext = os.path.splitext(output_path)[1].lower()
-            if not ext:
-                output_path = f"{output_path}.xlsx"
-                ext = ".xlsx"
-            if ext != ".xlsx":
-                raise ValueError("New output workbook must be an .xlsx file.")
-            return output_path
+        selected_folder = (output_folder_path or "").strip()
+        if selected_folder:
+            output_dir = os.path.abspath(selected_folder)
+            if not os.path.isdir(output_dir):
+                raise NotADirectoryError(f"Output folder not found: {output_dir}")
+        else:
+            output_dir = os.path.dirname(os.path.abspath(source_paths[0]))
 
-        first_source_dir = os.path.dirname(os.path.abspath(source_paths[0]))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(first_source_dir, f"VTEC Payment Overview {timestamp}.xlsx")
+        return os.path.join(output_dir, f"VTEC Payment Overview {timestamp}.xlsx")
 
     def _open_or_create_output_workbook(
         self,
         source_paths: Sequence[str],
         overview_workbook_path: Optional[str],
-        output_workbook_path: Optional[str],
+        output_folder_path: Optional[str],
     ) -> Tuple[str, Any, bool]:
         selected_path = (overview_workbook_path or "").strip()
         if selected_path:
-            if (output_workbook_path or "").strip():
-                self.log("Selected new output workbook location ignored because an existing overview workbook was selected.")
+            if (output_folder_path or "").strip():
+                self.log("Selected new output folder ignored because an existing overview workbook was selected.")
             output_path = os.path.abspath(selected_path)
             if not os.path.isfile(output_path):
                 raise FileNotFoundError(f"Overview workbook not found: {output_path}")
@@ -517,7 +510,7 @@ class VTECPaymentProcessor:
             workbook = load_workbook(output_path, keep_vba=keep_vba)
             return output_path, workbook, False
 
-        output_path = self._resolve_output_path(source_paths, output_workbook_path)
+        output_path = self._resolve_output_path(source_paths, output_folder_path)
         workbook = self._create_output_workbook()
         return output_path, workbook, True
 
