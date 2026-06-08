@@ -394,7 +394,7 @@ class VTECPaymentProcessor:
             ensure_overview_sheet(overview_ws)
             ensure_overview_sheet(dup_ws)
             ensure_log_headers(log_ws)
-            ensure_rejected_log_headers(rejected_log_ws)
+            reset_rejected_log_sheet(rejected_log_ws)
 
             processed_log = load_processed_log(log_ws)
             current_summary_row = max(DATA_START_ROW, last_used_row_in_column(overview_ws, 1) + 1)
@@ -975,6 +975,13 @@ def ensure_rejected_log_headers(log_ws):
     log_ws.cell(row=1, column=4, value="Rejected Reason")
     for col in range(1, 5):
         log_ws.cell(row=1, column=col).font = Font(bold=True)
+
+
+def reset_rejected_log_sheet(log_ws):
+    max_row = log_ws.max_row or 0
+    if max_row:
+        log_ws.delete_rows(1, max_row)
+    ensure_rejected_log_headers(log_ws)
 
 
 def log_processed_sheet(log_ws, file_name: str, worksheet_name: str):
