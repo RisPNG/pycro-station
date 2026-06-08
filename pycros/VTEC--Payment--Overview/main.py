@@ -715,10 +715,14 @@ def find_header_row(sheet: SheetReader) -> int:
     for row in range(1, scan_rows + 1):
         temp_last_col = sheet.last_col_in_row(row)
         for col in range(1, temp_last_col + 1):
-            if "vat invoice number" in value_to_str(sheet.cell(row, col)).lower():
+            if is_vat_invoice_header(value_to_str(sheet.cell(row, col)).lower()):
                 return row
 
     return 0
+
+
+def is_vat_invoice_header(header_text: str) -> bool:
+    return "vat invoice number" in header_text or "so number" in header_text
 
 
 def identify_columns(sheet: SheetReader, header_row: int, last_col: int) -> dict[int, int]:
@@ -734,7 +738,7 @@ def identify_columns(sheet: SheetReader, header_row: int, last_col: int) -> dict
             column_map[18] = col
         elif "sig due date" in header_text:
             column_map[17] = col
-        elif "vat invoice number" in header_text:
+        elif is_vat_invoice_header(header_text):
             column_map[3] = col
         elif "vat invoice date" in header_text:
             column_map[11] = col
