@@ -34,6 +34,7 @@ except Exception:  # pragma: no cover - Pycro Station installs requirements befo
 OVERVIEW_SHEET_NAME = "VTEC Payment Overview"
 DUPLICATES_SHEET_NAME = "VTEC Payment Duplicates"
 LOG_SHEET_NAME = "Processing Log"
+REJECTED_LOG_SHEET_NAME = "Rejected Log"
 
 DATA_START_ROW = 4
 HEADER_ROW = 3
@@ -388,10 +389,12 @@ class VTECPaymentProcessor:
             overview_ws = get_or_create_sheet(wb_out, OVERVIEW_SHEET_NAME)
             dup_ws = get_or_create_sheet(wb_out, DUPLICATES_SHEET_NAME)
             log_ws = get_or_create_sheet(wb_out, LOG_SHEET_NAME)
+            rejected_log_ws = get_or_create_sheet_after(wb_out, REJECTED_LOG_SHEET_NAME, LOG_SHEET_NAME)
 
             ensure_overview_sheet(overview_ws)
             ensure_overview_sheet(dup_ws)
             ensure_log_headers(log_ws)
+            ensure_rejected_log_headers(rejected_log_ws)
 
             processed_log = load_processed_log(log_ws)
             current_summary_row = max(DATA_START_ROW, last_used_row_in_column(overview_ws, 1) + 1)
@@ -411,23 +414,32 @@ class VTECPaymentProcessor:
                     for sheet in source_book.sheets:
                         log_key = f"{source_book.name}|{sheet.name}"
 
-                        if log_key.lower() in processed_log:
-                            result.skipped_sheets += 1
-                            self.log(f"Skipped already processed sheet: {source_book.name} -> {sheet.name}")
-                            continue
-
                         sheet_name_lower = sheet.name.lower()
                         if "payment" not in sheet_name_lower or "(v)" not in sheet_name_lower:
                             continue
 
-                        rows_from_sheet = self._collect_rows_from_payment_sheet(
+                        if log_key.lower() in processed_log:
+                            result.skipped_sheets += 1
+                            log_rejected_sheet(
+                                rejected_log_ws,
+                                source_book.name,
+                                sheet.name,
+                                "Already processed in Processing Log",
+                            )
+                            self.log(f"Skipped already processed sheet: {source_book.name} -> {sheet.name}")
+                            continue
+
+                        rows_from_sheet, rejection_reason = self._collect_rows_from_payment_sheet(
                             source_book,
                             sheet,
                             supplier_lookup,
                         )
 
                         if not rows_from_sheet:
-                            self.log(f"No usable payment rows found: {source_book.name} -> {sheet.name}")
+                            result.skipped_sheets += 1
+                            reason = rejection_reason or "No usable payment rows found"
+                            log_rejected_sheet(rejected_log_ws, source_book.name, sheet.name, reason)
+                            self.log(f"Rejected sheet: {source_book.name} -> {sheet.name} ({reason})")
                             continue
 
                         new_rows.extend(rows_from_sheet)
@@ -461,6 +473,7 @@ class VTECPaymentProcessor:
             apply_formatting(overview_ws)
             apply_formatting(dup_ws)
             autofit_log_sheet(log_ws)
+            autofit_rejected_log_sheet(rejected_log_ws)
 
             ensure_parent_folder(output_path)
             wb_out.save(output_path)
@@ -520,10 +533,12 @@ class VTECPaymentProcessor:
         overview_ws.title = OVERVIEW_SHEET_NAME
         dup_ws = wb.create_sheet(DUPLICATES_SHEET_NAME)
         log_ws = wb.create_sheet(LOG_SHEET_NAME)
+        rejected_log_ws = wb.create_sheet(REJECTED_LOG_SHEET_NAME)
 
         write_headers(overview_ws)
         write_headers(dup_ws)
         ensure_log_headers(log_ws)
+        ensure_rejected_log_headers(rejected_log_ws)
 
         return wb
 
@@ -532,25 +547,20 @@ class VTECPaymentProcessor:
         source_book: "SourceWorkbookReader",
         sheet: "SheetReader",
         supplier_lookup: dict[str, str],
-    ) -> List[List[Any]]:
+    ) -> Tuple[List[List[Any]], str]:
         header_row = find_header_row(sheet)
         if header_row == 0:
-            self.log(f"Skipped sheet with no detected header row: {source_book.name} -> {sheet.name}")
-            return []
+            return [], "No detected header row"
 
         last_row = sheet.last_row_in_column(1)
         if last_row <= header_row:
-            return []
+            return [], "No data rows below header row"
 
         last_col = sheet.last_col_in_row(header_row)
         column_map = identify_columns(sheet, header_row, last_col)
 
         if column_map[3] == 0:
-            self.log(
-                "Warning: Could not find 'VAT Invoice Number' column in "
-                f"{source_book.name} -> {sheet.name}. Sheet skipped."
-            )
-            return []
+            return [], "Missing VAT Invoice Number column"
 
         collected: List[List[Any]] = []
         vat_col = column_map[3]
@@ -586,7 +596,10 @@ class VTECPaymentProcessor:
 
             collected.append(output_row)
 
-        return collected
+        if not collected:
+            return [], "No usable rows with VAT Invoice Number"
+
+        return collected, ""
 
 
 # =====================================================================================
@@ -949,6 +962,17 @@ def ensure_log_headers(log_ws):
         log_ws.cell(row=1, column=col).font = Font(bold=True)
 
 
+def ensure_rejected_log_headers(log_ws):
+    if not is_blank(log_ws.cell(row=1, column=1).value):
+        return
+    log_ws.cell(row=1, column=1, value="Source FileName")
+    log_ws.cell(row=1, column=2, value="Source Worksheet")
+    log_ws.cell(row=1, column=3, value="Timestamp")
+    log_ws.cell(row=1, column=4, value="Rejected Reason")
+    for col in range(1, 5):
+        log_ws.cell(row=1, column=col).font = Font(bold=True)
+
+
 def log_processed_sheet(log_ws, file_name: str, worksheet_name: str):
     ensure_log_headers(log_ws)
     next_row = last_used_row_in_column(log_ws, 1) + 1
@@ -958,6 +982,16 @@ def log_processed_sheet(log_ws, file_name: str, worksheet_name: str):
     timestamp_cell.number_format = "yyyy-mm-dd hh:mm:ss"
 
 
+def log_rejected_sheet(log_ws, file_name: str, worksheet_name: str, reason: str):
+    ensure_rejected_log_headers(log_ws)
+    next_row = last_used_row_in_column(log_ws, 1) + 1
+    log_ws.cell(row=next_row, column=1, value=file_name)
+    log_ws.cell(row=next_row, column=2, value=worksheet_name)
+    timestamp_cell = log_ws.cell(row=next_row, column=3, value=datetime.now())
+    timestamp_cell.number_format = "yyyy-mm-dd hh:mm:ss"
+    log_ws.cell(row=next_row, column=4, value=reason)
+
+
 def get_or_create_sheet(wb, sheet_name: str):
     if sheet_name in wb.sheetnames:
         return wb[sheet_name]
@@ -965,6 +999,16 @@ def get_or_create_sheet(wb, sheet_name: str):
     if len(wb.worksheets) == 1 and wb.active.title == "Sheet" and worksheet_is_empty(wb.active):
         wb.active.title = sheet_name
         return wb.active
+
+    return wb.create_sheet(title=sheet_name)
+
+
+def get_or_create_sheet_after(wb, sheet_name: str, after_sheet_name: str):
+    if sheet_name in wb.sheetnames:
+        return wb[sheet_name]
+
+    if after_sheet_name in wb.sheetnames:
+        return wb.create_sheet(title=sheet_name, index=wb.sheetnames.index(after_sheet_name) + 1)
 
     return wb.create_sheet(title=sheet_name)
 
@@ -1081,6 +1125,12 @@ def autofit_log_sheet(log_ws):
     ensure_log_headers(log_ws)
     max_row = max(1, log_ws.max_row or 1)
     auto_fit_columns(log_ws, 1, 3, max_row)
+
+
+def autofit_rejected_log_sheet(log_ws):
+    ensure_rejected_log_headers(log_ws)
+    max_row = max(1, log_ws.max_row or 1)
+    auto_fit_columns(log_ws, 1, 4, max_row)
 
 
 def last_used_row_in_column(ws, col_idx: int) -> int:
