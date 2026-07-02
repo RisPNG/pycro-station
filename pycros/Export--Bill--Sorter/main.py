@@ -19,6 +19,17 @@ from openpyxl.utils import get_column_letter
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+PDF_MONEY_RE = r"\(?[\d,]+\.\d{2}\)?"
+PDF_INVOICE_ROW_RE = re.compile(
+    rf"^(?P<ref>\d{{2}}V\d{{5}})\s+"
+    rf"(?P<amount>{PDF_MONEY_RE})\s+(?P<currency>[A-Z]{{3}})\s+"
+    rf"(?P<invoice_amount>{PDF_MONEY_RE})\s+(?P<invoice_currency>[A-Z]{{3}})"
+    rf"(?:\s+(?P<rate>(?!{PDF_MONEY_RE}\s+[A-Z]{{3}}$)\S+))?"
+    rf"(?:\s+(?P<settlement_amount>{PDF_MONEY_RE})\s+(?P<settlement_currency>[A-Z]{{3}}))?$"
+)
+PDF_FEE_ROW_RE = re.compile(r"^Invoice Fee\s+\((?P<amount>[\d,]+\.\d{2})\s+(?P<currency>[A-Z]{3})\)$")
+PDF_FEE_SECTION_RE = re.compile(r"Fees \(([A-Z]{3})\) \(([\d,]+\.\d{2}) ([A-Z]{3})\)")
+
 # Default 2026 MY public holidays (editable in UI). These are commonly used national holidays;
 # some Malaysia holidays are state-specific, so users can add/remove as needed.
 DEFAULT_MY_HOLIDAYS_2026 = [
@@ -557,6 +568,14 @@ class AmountMismatch:
     export_bill_amount: float
 
 
+@dataclass(frozen=True)
+class TradeCardData:
+    source_name: str
+    value_date: date
+    payment_num: Optional[str]
+    entries: list[tuple[str, Optional[float]]]
+
+
 def read_vn_records(path: str, sheet_name: str, *, log_emit=None) -> list[ExportRecord]:
     _emit(log_emit, f"[VN] Opening: {path}")
     wb = load_workbook(path, data_only=True, read_only=True)
@@ -838,10 +857,227 @@ def find_payment_ref(ws) -> Optional[str]:
     return None
 
 
-def read_trade_card(path: str, *, log_emit=None) -> tuple[date, Optional[str], list[tuple[str, Optional[float]]]]:
-    _emit(log_emit, f"[TRADE CARD] Opening: {path}")
-    wb = load_workbook(path, data_only=True, read_only=True)
+def read_converted_trade_cards_excel(wb, path: str, *, log_emit=None) -> list[TradeCardData]:
+    if "Invoice Lines" not in wb.sheetnames:
+        return []
+
+    invoice_ws = wb["Invoice Lines"]
+    invoice_header_row = None
+    invoice_headers: dict[str, int] = {}
+    for row_idx, row in enumerate(invoice_ws.iter_rows(values_only=True), start=1):
+        values = [str(v).strip() if v is not None else "" for v in row]
+        if "Reference Number" in values and "Amount" in values:
+            invoice_header_row = row_idx
+            for idx, value in enumerate(values):
+                if value and value not in invoice_headers:
+                    invoice_headers[value] = idx
+            break
+
+    if invoice_header_row is None:
+        return []
+
+    ref_i = invoice_headers["Reference Number"]
+    amount_i = invoice_headers["Amount"]
+
+    if "Payment Summary" in wb.sheetnames:
+        ws = wb["Payment Summary"]
+        summary: dict[str, object] = {}
+        for row in ws.iter_rows(values_only=True):
+            if len(row) < 2 or row[0] is None:
+                continue
+            key = str(row[0]).strip().upper()
+            if key:
+                summary[key] = row[1]
+
+        value_date = parse_date_any(summary.get("VALUE DATE"))
+        if not value_date:
+            raise ValueError("[TRADE CARD] Converted workbook missing/invalid Payment Summary Value Date.")
+
+        payment_num = normalize_invoice(summary.get("PAYMENT ID")) or normalize_invoice(summary.get("PAYMENT REFERENCE"))
+        entries: list[tuple[str, Optional[float]]] = []
+        for row in invoice_ws.iter_rows(min_row=invoice_header_row + 1, values_only=True):
+            inv = normalize_invoice(row[ref_i] if ref_i < len(row) else None)
+            if not inv:
+                continue
+            amt = parse_money(row[amount_i] if amount_i < len(row) else None)
+            entries.append((inv, amt))
+
+        if not entries:
+            raise ValueError("[TRADE CARD] Converted workbook has no invoice rows.")
+
+        source_name = normalize_invoice(summary.get("SOURCE FILE")) or os.path.basename(path)
+        _emit(log_emit, f"[TRADE CARD] Converted workbook found {len(entries)} invoice row(s).")
+        return [TradeCardData(source_name=source_name, value_date=value_date, payment_num=payment_num, entries=entries)]
+
+    if "Consistency Summary" not in wb.sheetnames:
+        return []
+
+    summary_ws = wb["Consistency Summary"]
+    summary_header_row = None
+    summary_headers: dict[str, int] = {}
+    for row_idx, row in enumerate(summary_ws.iter_rows(values_only=True), start=1):
+        values = [str(v).strip() if v is not None else "" for v in row]
+        if "Payment ID" in values and "Value Date" in values:
+            summary_header_row = row_idx
+            for idx, value in enumerate(values):
+                if value and value not in summary_headers:
+                    summary_headers[value] = idx
+            break
+
+    if summary_header_row is None:
+        return []
+
+    payment_i = summary_headers.get("Payment ID")
+    payment_ref_i = summary_headers.get("Payment Reference")
+    value_date_i = summary_headers.get("Value Date")
+    source_file_i = summary_headers.get("Source File")
+    checks_pass_i = summary_headers.get("Core Checks Pass")
+    if value_date_i is None or (payment_i is None and payment_ref_i is None):
+        return []
+
+    docs: dict[str, tuple[str, date, Optional[str]]] = {}
+    for row in summary_ws.iter_rows(min_row=summary_header_row + 1, values_only=True):
+        payment_num = normalize_invoice(row[payment_i] if payment_i is not None and payment_i < len(row) else None)
+        if not payment_num:
+            payment_num = normalize_invoice(row[payment_ref_i] if payment_ref_i is not None and payment_ref_i < len(row) else None)
+        if not payment_num:
+            continue
+
+        if checks_pass_i is not None and checks_pass_i < len(row):
+            checks_pass = row[checks_pass_i]
+            if checks_pass is False or str(checks_pass).strip().upper() in {"FALSE", "NO", "0"}:
+                raise ValueError(f"[TRADE CARD] Converted workbook failed checks for payment {payment_num}.")
+
+        value_date = parse_date_any(row[value_date_i] if value_date_i < len(row) else None)
+        if not value_date:
+            raise ValueError(f"[TRADE CARD] Converted workbook missing/invalid Value Date for payment {payment_num}.")
+
+        source_name = normalize_invoice(row[source_file_i] if source_file_i is not None and source_file_i < len(row) else None)
+        docs[payment_num] = (source_name or os.path.basename(path), value_date, payment_num)
+
+    if not docs:
+        return []
+
+    entries_by_payment: dict[str, list[tuple[str, Optional[float]]]] = {payment_num: [] for payment_num in docs}
+    invoice_payment_i = invoice_headers.get("Payment ID")
+    single_payment = next(iter(docs)) if len(docs) == 1 else ""
+    for row in invoice_ws.iter_rows(min_row=invoice_header_row + 1, values_only=True):
+        inv = normalize_invoice(row[ref_i] if ref_i < len(row) else None)
+        if not inv:
+            continue
+        payment_num = ""
+        if invoice_payment_i is not None and invoice_payment_i < len(row):
+            payment_num = normalize_invoice(row[invoice_payment_i])
+        if not payment_num:
+            payment_num = single_payment
+        if not payment_num or payment_num not in entries_by_payment:
+            continue
+        amt = parse_money(row[amount_i] if amount_i < len(row) else None)
+        entries_by_payment[payment_num].append((inv, amt))
+
+    cards: list[TradeCardData] = []
+    for payment_num, (source_name, value_date, payment_value) in docs.items():
+        entries = entries_by_payment.get(payment_num, [])
+        if not entries:
+            raise ValueError(f"[TRADE CARD] Converted workbook has no invoice rows for payment {payment_num}.")
+        cards.append(
+            TradeCardData(
+                source_name=source_name,
+                value_date=value_date,
+                payment_num=payment_value,
+                entries=entries,
+            )
+        )
+
+    _emit(log_emit, f"[TRADE CARD] Converted workbook found {sum(len(c.entries) for c in cards)} invoice row(s) across {len(cards)} payment(s).")
+    return cards
+
+
+def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
     try:
+        import pdfplumber  # type: ignore
+    except Exception as e:
+        raise ValueError("[TRADE CARD PDF] Missing dependency: pdfplumber. Install this Pycro's requirements and try again.") from e
+
+    _emit(log_emit, f"[TRADE CARD PDF] Opening: {path}")
+    page_texts: list[str] = []
+    entries: list[tuple[str, Optional[float]]] = []
+    suspicious: list[str] = []
+    fee_total = 0.0
+
+    with pdfplumber.open(path) as pdf:
+        for page_no, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text(x_tolerance=2, y_tolerance=3) or ""
+            page_texts.append(text)
+            for raw_line in text.splitlines():
+                line = " ".join(raw_line.split())
+                row_match = PDF_INVOICE_ROW_RE.match(line)
+                if row_match:
+                    inv = normalize_invoice(row_match.group("ref"))
+                    amt = parse_money(row_match.group("amount"))
+                    entries.append((inv, amt))
+                    continue
+
+                fee_match = PDF_FEE_ROW_RE.match(line)
+                if fee_match:
+                    fee_amount = parse_money(fee_match.group("amount"))
+                    if fee_amount is not None:
+                        fee_total -= abs(fee_amount)
+                    continue
+
+                if re.match(r"^\d{2}V\d{5}\b", line) or line.startswith("Invoice Fee"):
+                    suspicious.append(f"page {page_no}: {line}")
+
+    full_text = "\n".join(page_texts)
+    payment_match = re.search(r"Payment\s*-\s*(\d+)", full_text)
+    payment_num = payment_match.group(1).strip() if payment_match else ""
+    value_date_match = re.search(r"Value Date\s+(\d{4}-\d{2}-\d{2})", full_text)
+    value_date = parse_date_any(value_date_match.group(1)) if value_date_match else None
+
+    if not payment_num:
+        raise ValueError(f"[TRADE CARD PDF] Payment ID not found: {os.path.basename(path)}")
+    if not value_date:
+        raise ValueError(f"[TRADE CARD PDF] Value Date not found or invalid: {os.path.basename(path)}")
+    if not entries:
+        raise ValueError(f"[TRADE CARD PDF] No invoice rows found: {os.path.basename(path)}")
+    if suspicious:
+        raise ValueError(f"[TRADE CARD PDF] Unparsed invoice/fee row in {os.path.basename(path)}: {suspicious[0]}")
+
+    principal_match = re.search(r"Principal Amount\s+([\d,]+\.\d{2})\s+USD", full_text)
+    principal = parse_money(principal_match.group(1)) if principal_match else None
+    if principal is not None:
+        total = round(sum(float(amt or 0) for _, amt in entries), 2)
+        if abs(total - float(principal)) > 0.01:
+            raise ValueError(
+                f"[TRADE CARD PDF] Invoice total does not match principal amount in {os.path.basename(path)}: {total} vs {principal}"
+            )
+
+    fee_section_match = PDF_FEE_SECTION_RE.search(full_text)
+    if fee_section_match:
+        fee_section_total = parse_money(fee_section_match.group(2))
+        if fee_section_total is not None and abs(fee_total + abs(float(fee_section_total))) > 0.01:
+            raise ValueError(
+                f"[TRADE CARD PDF] Fee total does not match fee section in {os.path.basename(path)}: {fee_total} vs -{fee_section_total}"
+            )
+
+    _emit(log_emit, f"[TRADE CARD PDF] Found {len(entries)} invoice row(s).")
+    return TradeCardData(source_name=os.path.basename(path), value_date=value_date, payment_num=payment_num, entries=entries)
+
+
+def read_trade_cards(path: str, *, log_emit=None) -> list[TradeCardData]:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return [read_trade_card_pdf(path, log_emit=log_emit)]
+    if ext not in {".xlsx", ".xlsm"}:
+        raise ValueError(f"[TRADE CARD] Unsupported file type: {path}")
+
+    _emit(log_emit, f"[TRADE CARD] Opening: {path}")
+    wb = load_workbook(path, data_only=True)
+    try:
+        converted_cards = read_converted_trade_cards_excel(wb, path, log_emit=log_emit)
+        if converted_cards:
+            return converted_cards
+
         if not wb.worksheets:
             raise ValueError("[TRADE CARD] No sheets found.")
 
@@ -870,7 +1106,7 @@ def read_trade_card(path: str, *, log_emit=None) -> tuple[date, Optional[str], l
             entries.append((inv, amt))
 
         _emit(log_emit, f"[TRADE CARD] Found {len(entries)} invoice row(s).")
-        return value_date, payment_num, entries
+        return [TradeCardData(source_name=os.path.basename(path), value_date=value_date, payment_num=payment_num, entries=entries)]
     finally:
         wb.close()
 
@@ -1048,21 +1284,21 @@ class ProcessingLogic:
             mismatched_total = 0
             mismatch_rows: list[AmountMismatch] = []
             for tc_path in trade_card_paths:
-                value_date, payment_num, tc_entries = read_trade_card(tc_path, log_emit=self.log_emit)
-                updated, missing, mismatched = update_export_bill_from_trade_card(
-                    export_wb,
-                    value_date,
-                    payment_num,
-                    tc_entries,
-                    holidays,
-                    invoice_index,
-                    mismatch_rows,
-                    os.path.basename(tc_path),
-                    log_emit=self.log_emit,
-                )
-                updated_total += updated
-                missing_total += missing
-                mismatched_total += mismatched
+                for trade_card in read_trade_cards(tc_path, log_emit=self.log_emit):
+                    updated, missing, mismatched = update_export_bill_from_trade_card(
+                        export_wb,
+                        trade_card.value_date,
+                        trade_card.payment_num,
+                        trade_card.entries,
+                        holidays,
+                        invoice_index,
+                        mismatch_rows,
+                        trade_card.source_name,
+                        log_emit=self.log_emit,
+                    )
+                    updated_total += updated
+                    missing_total += missing
+                    mismatched_total += mismatched
 
             # Regroup/sort rows by Value Date (col E) then FEAC order of Payment No (col J)
             for ws in export_wb.worksheets:
@@ -1121,7 +1357,7 @@ class MainWidget(QWidget):
         self.export_box.setMaximumHeight(42)
         self.export_box.setStyleSheet(shared_box_style)
 
-        self.trade_btn = PrimaryPushButton("Select Trade Card(s)", self)
+        self.trade_btn = PrimaryPushButton("Select Trade Card(s) (.pdf/.xlsx)", self)
         self.trade_box = QTextEdit(self)
         self.trade_box.setReadOnly(True)
         self.trade_box.setMaximumHeight(80)
@@ -1245,7 +1481,13 @@ class MainWidget(QWidget):
         self.vn_btn.clicked.connect(lambda: self._pick_files(self.vn_box, "Select VN Weekly Export Chart(s)"))
         self.local_btn.clicked.connect(lambda: self._pick_files(self.local_box, "Select Local Weekly Export Chart(s)"))
         self.export_btn.clicked.connect(lambda: self._pick_file(self.export_box, "Select Export Bill"))
-        self.trade_btn.clicked.connect(lambda: self._pick_files(self.trade_box, "Select Trade Card(s)"))
+        self.trade_btn.clicked.connect(
+            lambda: self._pick_files(
+                self.trade_box,
+                "Select Trade Card(s)",
+                "Trade Card Files (*.pdf *.xlsx *.xlsm);;PDF Files (*.pdf);;Excel Files (*.xlsx *.xlsm)",
+            )
+        )
         self.feac_btn.clicked.connect(lambda: self._pick_file(self.feac_box, "Select Foreign Exchange Administrative Control Chart"))
 
         self.log_message.connect(self._append_log)
@@ -1256,14 +1498,14 @@ class MainWidget(QWidget):
 
         self.run_btn.clicked.connect(self._run)
 
-    def _pick_file(self, target_box: QTextEdit, title: str):
-        path, _ = QFileDialog.getOpenFileName(self, title, "", "Excel Files (*.xlsx *.xlsm)")
+    def _pick_file(self, target_box: QTextEdit, title: str, file_filter: str = "Excel Files (*.xlsx *.xlsm)"):
+        path, _ = QFileDialog.getOpenFileName(self, title, "", file_filter)
         if path:
             target_box.setText(path)
         self._check_ready()
 
-    def _pick_files(self, target_box: QTextEdit, title: str):
-        paths, _ = QFileDialog.getOpenFileNames(self, title, "", "Excel Files (*.xlsx *.xlsm)")
+    def _pick_files(self, target_box: QTextEdit, title: str, file_filter: str = "Excel Files (*.xlsx *.xlsm)"):
+        paths, _ = QFileDialog.getOpenFileNames(self, title, "", file_filter)
         if paths:
             target_box.setText("\n".join(paths))
         self._check_ready()
