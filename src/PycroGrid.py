@@ -14,6 +14,7 @@ from PySide6.QtGui import QIcon, QCursor, QAction, QPainter
 from qfluentwidgets import (
     PrimaryPushButton,
     TransparentToolButton,
+    MessageBox,
     isDarkTheme,
     FluentIcon as FIF,
     LineEdit,
@@ -1180,12 +1181,26 @@ class PycroCard(QWidget):
         self._proc = QProcess(self)
         self._proc.setProgram(sys.executable)
         self._proc.setArguments(['-m', 'pip', 'install', '-r', self.info.requirements])
-        self._proc.finished.connect(lambda *_: self._on_install_finished())
+        self._proc.setProcessChannelMode(QProcess.MergedChannels)
+        self._proc.finished.connect(self._on_install_finished)
         self._proc.start()
 
-    def _on_install_finished(self):
+    def _on_install_finished(self, exit_code: int = 0, exit_status: QProcess.ExitStatus = QProcess.NormalExit):
+        output = ""
+        if self._proc is not None:
+            try:
+                output = bytes(self._proc.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
+            except Exception:
+                output = ""
         self._proc = None
         self._update_requirements_state(installing=False)
+        if exit_status != QProcess.NormalExit or exit_code != 0:
+            text = output[-4000:] if output else f"pip exited with code {exit_code}"
+            msg = MessageBox("Install failed", text, self.window() or self)
+            msg.yesButton.setText("OK")
+            msg.cancelButton.hide()
+            msg.exec()
+            return
         try:
             window = self.window()
             packages_page = getattr(window, 'packagesPage', None)
