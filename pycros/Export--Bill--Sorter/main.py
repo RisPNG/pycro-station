@@ -19,9 +19,10 @@ from openpyxl.utils import get_column_letter
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+PDF_INVOICE_REF_RE = r"\d{2}[A-Z]\d{4,5}"
 PDF_MONEY_RE = r"\(?[\d,]+\.\d{2}\)?"
 PDF_INVOICE_ROW_RE = re.compile(
-    rf"^(?P<ref>\d{{2}}V\d{{5}})\s+"
+    rf"^(?P<ref>{PDF_INVOICE_REF_RE})\s+"
     rf"(?P<amount>{PDF_MONEY_RE})\s+(?P<currency>[A-Z]{{3}})\s+"
     rf"(?P<invoice_amount>{PDF_MONEY_RE})\s+(?P<invoice_currency>[A-Z]{{3}})"
     rf"(?:\s+(?P<rate>(?!{PDF_MONEY_RE}\s+[A-Z]{{3}}$)\S+))?"
@@ -1004,6 +1005,7 @@ def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
     entries: list[tuple[str, Optional[float]]] = []
     suspicious: list[str] = []
     fee_total = 0.0
+    in_invoice_lines = False
 
     with pdfplumber.open(path) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
@@ -1011,12 +1013,19 @@ def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
             page_texts.append(text)
             for raw_line in text.splitlines():
                 line = " ".join(raw_line.split())
-                row_match = PDF_INVOICE_ROW_RE.match(line)
-                if row_match:
-                    inv = normalize_invoice(row_match.group("ref"))
-                    amt = parse_money(row_match.group("amount"))
-                    entries.append((inv, amt))
+                if "Reference Number Amount" in line:
+                    in_invoice_lines = True
                     continue
+                if line.startswith("Fees (") or line == "TRANSACTION DETAIL":
+                    in_invoice_lines = False
+
+                if in_invoice_lines:
+                    row_match = PDF_INVOICE_ROW_RE.match(line)
+                    if row_match:
+                        inv = normalize_invoice(row_match.group("ref"))
+                        amt = parse_money(row_match.group("amount"))
+                        entries.append((inv, amt))
+                        continue
 
                 fee_match = PDF_FEE_ROW_RE.match(line)
                 if fee_match:
@@ -1025,7 +1034,7 @@ def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
                         fee_total -= abs(fee_amount)
                     continue
 
-                if re.match(r"^\d{2}V\d{5}\b", line) or line.startswith("Invoice Fee"):
+                if in_invoice_lines and re.match(rf"^{PDF_INVOICE_REF_RE}\b", line):
                     suspicious.append(f"page {page_no}: {line}")
 
     full_text = "\n".join(page_texts)
