@@ -262,6 +262,11 @@ SIZE_HEADERS: List[object] = [
     "XSTT", "STT", "MTT", "LTT", "XLTT", "2XLTT", "3XLTT", "4XLTT", "5XLTT",
 ]
 
+NEW_START_COL = 1
+ORI_START_COL = 72
+NOW_START_COL = 143
+SECTION_WIDTH = 70
+
 REQUIRED_SEARCH_HEADERS = [
     "Purchase Order Number",
     "PO Line Item Number",
@@ -326,6 +331,16 @@ class DivertEvent:
 
 
 @dataclass
+class DivertFromEvent:
+    source_po: int
+    source_line: int
+    source_ordinal: int
+    qty: int
+    event_order: int
+    raw_source_code: str
+
+
+@dataclass
 class TargetResult:
     target_key: Tuple[int, int]
     source_keys: List[Tuple[int, int]]
@@ -366,7 +381,7 @@ class PODivertProcessor:
         self._require_files(search_results_path, pdf_paths)
 
         self.log("Reading PO search-results workbook...")
-        search_groups, events = read_search_results(search_results_path)
+        search_groups, events = read_search_results(search_results_path, self.log)
         self.log(f"Loaded {len(search_groups)} PO/line groups from search results.")
         self.log(f"Parsed {len(events)} diverted-to item-text events from search results.")
 
@@ -382,16 +397,9 @@ class PODivertProcessor:
             raise ValueError("No diverted target PO lines were found. Check the Item Text column and selected files.")
         self.log(f"Built {len(target_results)} diverted target block(s).")
 
-        size_headers = determine_used_size_headers(target_results, search_groups, original_groups)
-        stripped_count = max(0, len(SIZE_HEADERS_AS_TEXT) - len([s for s in size_headers if s in SIZE_HEADERS_AS_TEXT]))
-        self.log(
-            f"Output will include {len(size_headers)} utilized size column(s); "
-            f"stripped {stripped_count} unused standard size column(s)."
-        )
-
         out_path = proposed_output_path(search_results_path)
         self.log("Writing output workbook...")
-        write_output_workbook(out_path, target_results, search_groups, original_groups, self.log.lines, size_headers)
+        write_output_workbook(out_path, target_results, search_groups, original_groups, self.log.lines)
         self.log(f"Saved output workbook: {out_path}")
         return out_path
 
@@ -411,44 +419,74 @@ class PODivertProcessor:
 # -----------------------------------------------------------------------------
 
 
-def read_search_results(path: str) -> Tuple[Dict[Tuple[int, int], POGroup], List[DivertEvent]]:
+def read_search_results(path: str, log: Optional[Callable[[str], None]] = None) -> Tuple[Dict[Tuple[int, int], POGroup], List[DivertEvent]]:
+    logger = log or (lambda _msg: None)
     wb = load_workbook(path, data_only=True, read_only=True)
     try:
-        ws = wb.active
-        headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-        header_map = build_header_map(headers)
-        missing = [h for h in REQUIRED_SEARCH_HEADERS if canonical_header(h) not in header_map]
-        if missing:
-            raise ValueError("Missing required column(s): " + ", ".join(missing))
-
         groups: Dict[Tuple[int, int], POGroup] = {}
         row_order_by_key: Dict[Tuple[int, int], int] = {}
+        processed_sheets: List[str] = []
+        skipped_sheets: List[str] = []
+        global_row_order = 0
 
-        for row_index, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            po = to_optional_int(get_by_header(row, header_map, "Purchase Order Number"))
-            line = to_optional_int(get_by_header(row, header_map, "PO Line Item Number"))
-            if po is None or line is None:
+        for ws in wb.worksheets:
+            try:
+                header_row = next(ws.iter_rows(min_row=1, max_row=1))
+            except StopIteration:
+                skipped_sheets.append(f"{ws.title} (empty)")
                 continue
 
-            key = (po, line)
-            if key not in groups:
-                groups[key] = POGroup(po=po, line=line, first_row_index=row_index)
-                row_order_by_key[key] = row_index
+            headers = [cell.value for cell in header_row]
+            header_map = build_header_map(headers)
+            missing = [h for h in REQUIRED_SEARCH_HEADERS if canonical_header(h) not in header_map]
+            if missing:
+                skipped_sheets.append(f"{ws.title} (missing: {', '.join(missing)})")
+                continue
 
-            group = groups[key]
-            group.add_size(
-                get_by_header(row, header_map, "Size Description"),
-                get_by_header(row, header_map, "Size Quantity"),
+            processed_sheets.append(ws.title)
+            sheet_data_rows = 0
+
+            for row_index, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                po = to_optional_int(get_by_header(row, header_map, "Purchase Order Number"))
+                line = to_optional_int(get_by_header(row, header_map, "PO Line Item Number"))
+                if po is None or line is None:
+                    continue
+
+                global_row_order += 1
+                sheet_data_rows += 1
+
+                key = (po, line)
+                if key not in groups:
+                    groups[key] = POGroup(po=po, line=line, first_row_index=global_row_order)
+                    row_order_by_key[key] = global_row_order
+
+                group = groups[key]
+                group.add_size(
+                    get_by_header(row, header_map, "Size Description"),
+                    get_by_header(row, header_map, "Size Quantity"),
+                )
+                total = to_optional_int(get_by_header(row, header_map, "Total Item Quantity"))
+                if total is not None:
+                    group.total_item_quantity = total
+                item_text = clean_text(get_by_header(row, header_map, "Item Text"))
+                if item_text and not group.item_text:
+                    group.item_text = item_text
+                moved_to = clean_text(get_by_header(row, header_map, "Moved To"))
+                if moved_to and not group.moved_to:
+                    group.moved_to = moved_to
+
+            logger(f"Read worksheet '{ws.title}': {sheet_data_rows} PO search-result row(s).")
+
+        if not processed_sheets:
+            detail = "; ".join(skipped_sheets) if skipped_sheets else "No worksheets were found."
+            raise ValueError(
+                "No worksheet with the required PO search-results headers was found. "
+                f"Checked: {detail}"
             )
-            total = to_optional_int(get_by_header(row, header_map, "Total Item Quantity"))
-            if total is not None:
-                group.total_item_quantity = total
-            item_text = clean_text(get_by_header(row, header_map, "Item Text"))
-            if item_text and not group.item_text:
-                group.item_text = item_text
-            moved_to = clean_text(get_by_header(row, header_map, "Moved To"))
-            if moved_to and not group.moved_to:
-                group.moved_to = moved_to
+
+        if skipped_sheets:
+            logger("Skipped worksheet(s) without the required PO search-results headers: " + "; ".join(skipped_sheets))
+        logger("Processed PO search-results worksheet(s): " + ", ".join(processed_sheets))
 
         events: List[DivertEvent] = []
         for key in sorted(groups, key=lambda k: row_order_by_key.get(k, 10**9)):
@@ -470,7 +508,6 @@ def read_search_results(path: str) -> Tuple[Dict[Tuple[int, int], POGroup], List
         return groups, events
     finally:
         wb.close()
-
 
 def build_header_map(headers: List[object]) -> Dict[str, int]:
     result: Dict[str, int] = {}
@@ -513,6 +550,28 @@ def parse_divert_from_events(text: str) -> Iterable[Tuple[int, int, str]]:
         source_po = int(match.group(2))
         source_code = match.group(3)
         results.append((qty, source_po, source_code))
+    return results
+
+
+def parse_divert_from_records(text: str) -> List[DivertFromEvent]:
+    if not text:
+        return []
+    results: List[DivertFromEvent] = []
+    for event_order, match in enumerate(DIVERT_FROM_RE.finditer(text)):
+        qty = to_int(match.group(1))
+        source_po = int(match.group(2))
+        source_code = match.group(3)
+        source_line, source_ordinal = split_line_item_code(source_code)
+        results.append(
+            DivertFromEvent(
+                source_po=source_po,
+                source_line=source_line,
+                source_ordinal=source_ordinal,
+                qty=qty,
+                event_order=event_order,
+                raw_source_code=source_code,
+            )
+        )
     return results
 
 
@@ -629,6 +688,152 @@ def parse_pdf_total_line(line: str) -> Optional[int]:
 # -----------------------------------------------------------------------------
 
 
+def build_allocations_from_divert_from_records(
+    target_group: POGroup,
+    records: List[DivertFromEvent],
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[TargetResult]:
+    """
+    Some SAP search-result rows only show the complete source breakdown in the
+    target row's "Diverted from" text.  Those records do not reliably expose the
+    target size ordinal, so we assign the quantities by solving them against the
+    target line's final size quantities.
+
+    Example:
+        target XS/S/M/L/XL = 48/36/168/444/504
+        records = 15,20,13,36,117,51,137,136,171,91,102,311
+
+    The solver groups those records into exact target-size totals:
+        XS = 15+20+13, S = 36, M = 117+51, L = 137+136+171, XL = 91+102+311
+
+    If the records cannot exactly fill the target sizes, return None so the
+    older direct "Diverted to" logic can still run as a fallback.
+    """
+    logger = log or (lambda _msg: None)
+    usable_records = [record for record in records if record.qty > 0]
+    if not usable_records:
+        return None
+
+    target_sizes = OrderedDict((size, qty) for size, qty in target_group.sizes.items() if qty)
+    if not target_sizes:
+        return None
+
+    assignments = solve_event_partition(usable_records, target_sizes)
+    if assignments is None:
+        return None
+
+    allocations: DefaultDict[Tuple[int, int], DefaultDict[str, int]] = defaultdict(lambda: defaultdict(int))
+    used_indices: set[int] = set()
+    for size, record_indices in assignments.items():
+        for record_index in record_indices:
+            record = usable_records[record_index]
+            source_key = (record.source_po, record.source_line)
+            allocations[source_key][size] += record.qty
+            used_indices.add(record_index)
+
+    unused_records = [record for idx, record in enumerate(usable_records) if idx not in used_indices]
+    for record in unused_records:
+        logger(
+            f"Skipped unused diverted-from event: {record.qty} from "
+            f"{record.source_po}-{record.source_line} on {record.raw_source_code} "
+            f"for target {target_group.po}-{target_group.line}."
+        )
+
+    source_keys = sorted(allocations.keys(), key=lambda k: (k[0], k[1]))
+    return TargetResult(
+        target_key=(target_group.po, target_group.line),
+        source_keys=source_keys,
+        allocations={key: dict(value) for key, value in allocations.items()},
+        residuals={},
+    )
+
+
+def solve_event_partition(
+    records: List[DivertFromEvent],
+    target_sizes: "OrderedDict[str, int]",
+) -> Optional["OrderedDict[str, Tuple[int, ...]]"]:
+    size_targets = [(size, qty) for size, qty in target_sizes.items() if qty > 0]
+    total_target = sum(qty for _size, qty in size_targets)
+    total_records = sum(record.qty for record in records)
+    if total_records < total_target:
+        return None
+
+    all_indices = tuple(range(len(records)))
+    failed_states: set[Tuple[int, Tuple[int, ...]]] = set()
+
+    def solve_size(size_index: int, remaining: Tuple[int, ...]) -> Optional[List[Tuple[str, Tuple[int, ...]]]]:
+        state = (size_index, remaining)
+        if state in failed_states:
+            return None
+
+        if size_index >= len(size_targets):
+            return []
+
+        size, required_qty = size_targets[size_index]
+        for subset in candidate_record_subsets(records, remaining, required_qty):
+            subset_set = set(subset)
+            next_remaining = tuple(idx for idx in remaining if idx not in subset_set)
+            tail = solve_size(size_index + 1, next_remaining)
+            if tail is not None:
+                return [(size, subset)] + tail
+
+        failed_states.add(state)
+        return None
+
+    solved = solve_size(0, all_indices)
+    if solved is None:
+        return None
+    return OrderedDict(solved)
+
+
+def candidate_record_subsets(
+    records: List[DivertFromEvent],
+    remaining: Tuple[int, ...],
+    target_qty: int,
+    max_candidates: int = 2500,
+) -> List[Tuple[int, ...]]:
+    if target_qty <= 0:
+        return [tuple()]
+
+    ordered_indices = sorted(remaining, key=lambda idx: (-records[idx].qty, records[idx].event_order, idx))
+    suffix_sums = [0] * (len(ordered_indices) + 1)
+    for pos in range(len(ordered_indices) - 1, -1, -1):
+        suffix_sums[pos] = suffix_sums[pos + 1] + records[ordered_indices[pos]].qty
+
+    candidates: List[Tuple[int, ...]] = []
+
+    def dfs(pos: int, current_qty: int, chosen: List[int]) -> bool:
+        if current_qty == target_qty:
+            candidates.append(tuple(sorted(chosen)))
+            return len(candidates) >= max_candidates
+        if current_qty > target_qty:
+            return False
+        if pos >= len(ordered_indices):
+            return False
+        if current_qty + suffix_sums[pos] < target_qty:
+            return False
+
+        previous_qty_at_level: Optional[int] = None
+        for next_pos in range(pos, len(ordered_indices)):
+            record_index = ordered_indices[next_pos]
+            qty = records[record_index].qty
+            if previous_qty_at_level == qty:
+                continue
+            previous_qty_at_level = qty
+            if current_qty + qty > target_qty:
+                continue
+            chosen.append(record_index)
+            should_stop = dfs(next_pos + 1, current_qty + qty, chosen)
+            chosen.pop()
+            if should_stop:
+                return True
+        return False
+
+    dfs(0, 0, [])
+    candidates.sort(key=lambda subset: (len(subset), [records[idx].event_order for idx in subset]))
+    return candidates
+
+
 def build_target_results(
     search_groups: Dict[Tuple[int, int], POGroup],
     original_groups: Dict[Tuple[int, int], OrderedDict[str, int]],
@@ -664,6 +869,17 @@ def build_target_results(
         target_group = search_groups.get(target_key)
         if target_group is None:
             continue
+
+        divert_from_records = parse_divert_from_records(target_group.item_text)
+        from_result = build_allocations_from_divert_from_records(target_group, divert_from_records, logger)
+        if from_result is not None:
+            results.append(from_result)
+            continue
+        if divert_from_records:
+            logger(
+                f"Warning: target {target_key[0]}-{target_key[1]} diverted-from records could not be "
+                "matched exactly to target sizes. Falling back to diverted-to/source-delta matching."
+            )
 
         target_size_order = list(target_group.sizes.keys())
         target_remaining: Dict[str, int] = dict(target_group.sizes)
@@ -729,65 +945,6 @@ def build_target_results(
 
 # The header values are mixed strings/integers for Excel, but all data keys use strings.
 SIZE_HEADERS_AS_TEXT = [str(h).strip().upper() for h in SIZE_HEADERS]
-SIZE_HEADERS_STANDARD_SET = set(SIZE_HEADERS_AS_TEXT)
-SECTION_GAP = 1
-
-
-def determine_used_size_headers(
-    target_results: List[TargetResult],
-    search_groups: Dict[Tuple[int, int], POGroup],
-    original_groups: Dict[Tuple[int, int], OrderedDict[str, int]],
-) -> List[str]:
-    """Return only size headers that are actually used in the final report.
-
-    The report used to write every standard size column, which left many empty
-    columns in every NEW/ORI/NOW section. This keeps the normal Nike/SAP size
-    order for recognized sizes, appends any unexpected/custom sizes after that,
-    and removes sizes that have no non-zero quantity anywhere in the final output.
-    """
-    used: "OrderedDict[str, None]" = OrderedDict()
-
-    def mark_values(values: Optional[Dict[str, int]]):
-        if not values:
-            return
-        for raw_size, raw_qty in values.items():
-            size = normalize_size(raw_size)
-            if not size:
-                continue
-            if to_int(raw_qty) == 0:
-                continue
-            used.setdefault(size, None)
-
-    for result in target_results:
-        target_group = search_groups.get(result.target_key)
-        if target_group is not None:
-            mark_values(target_group.sizes)
-
-        mark_values(result.residuals)
-
-        for source_key in result.source_keys:
-            mark_values(result.allocations.get(source_key, {}))
-            mark_values(original_groups.get(source_key, {}))
-
-            now_group = search_groups.get(source_key)
-            if now_group is not None:
-                mark_values(now_group.sizes)
-
-    ordered_standard_sizes = [size for size in SIZE_HEADERS_AS_TEXT if size in used]
-    extra_sizes = [size for size in used.keys() if size not in SIZE_HEADERS_STANDARD_SET]
-    return ordered_standard_sizes + extra_sizes
-
-
-def report_section_width(size_headers: List[str]) -> int:
-    return 2 + len(size_headers) + 1
-
-
-def report_section_starts(size_headers: List[str]) -> Tuple[int, int, int, int]:
-    section_width = report_section_width(size_headers)
-    new_start_col = 1
-    ori_start_col = new_start_col + section_width + SECTION_GAP
-    now_start_col = ori_start_col + section_width + SECTION_GAP
-    return new_start_col, ori_start_col, now_start_col, section_width
 
 
 # -----------------------------------------------------------------------------
@@ -801,55 +958,101 @@ def write_output_workbook(
     search_groups: Dict[Tuple[int, int], POGroup],
     original_groups: Dict[Tuple[int, int], OrderedDict[str, int]],
     log_lines: List[str],
-    size_headers: List[str],
 ):
+    report_size_headers = determine_report_size_headers(target_results, search_groups, original_groups)
+    report_size_keys = [str(header).strip().upper() for header in report_size_headers]
+    section_starts, section_width = build_report_layout(report_size_headers)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Chart (2)"
 
-    write_report_headers(ws, size_headers)
+    write_report_headers(ws, section_starts, report_size_headers)
     current_row = 3
-    new_start_col, _ori_start_col, _now_start_col, _section_width = report_section_starts(size_headers)
-
     for result in target_results:
         target_group = search_groups[result.target_key]
         target_row = current_row
-        write_new_section_row(ws, target_row, result.target_key, target_group.sizes, size_headers)
+        write_new_section_row(ws, target_row, result.target_key, target_group.sizes, section_starts, report_size_keys)
 
         first_source_row = current_row + 1
         for offset, source_key in enumerate(result.source_keys):
             row = first_source_row + offset
-            write_new_section_row(ws, row, source_key, result.allocations.get(source_key, {}), size_headers)
-            write_ori_now_rows(ws, row, source_key, original_groups, search_groups, size_headers)
+            write_new_section_row(ws, row, source_key, result.allocations.get(source_key, {}), section_starts, report_size_keys)
+            write_ori_now_rows(ws, row, source_key, original_groups, search_groups, section_starts, report_size_keys)
 
         check_row = first_source_row + len(result.source_keys)
-        write_check_row(ws, check_row, target_row, first_source_row, check_row - 1, size_headers)
+        write_check_row(ws, check_row, target_row, first_source_row, check_row - 1, section_starts, len(report_size_headers))
         current_row = check_row + 2
 
-    apply_report_formatting(ws, max_row=max(2, current_row - 1), size_headers=size_headers)
+    apply_report_formatting(ws, max_row=max(2, current_row - 1), section_starts=section_starts, section_width=section_width)
     write_log_sheet(wb, log_lines)
     wb.save(out_path)
 
 
-def write_report_headers(ws, size_headers: List[str]):
-    new_start_col, ori_start_col, now_start_col, _section_width = report_section_starts(size_headers)
+def determine_report_size_headers(
+    target_results: List[TargetResult],
+    search_groups: Dict[Tuple[int, int], POGroup],
+    original_groups: Dict[Tuple[int, int], OrderedDict[str, int]],
+) -> List[object]:
+    used_sizes: set[str] = set()
+
+    def mark(size_values: Dict[str, int]):
+        for size, qty in (size_values or {}).items():
+            if to_int(qty) != 0:
+                used_sizes.add(normalize_size(size))
+
+    for result in target_results:
+        target_group = search_groups.get(result.target_key)
+        if target_group is not None:
+            mark(target_group.sizes)
+        mark(result.residuals)
+        for source_key in result.source_keys:
+            mark(result.allocations.get(source_key, {}))
+            mark(original_groups.get(source_key, {}))
+            now_group = search_groups.get(source_key)
+            if now_group is not None:
+                mark(now_group.sizes)
+
+    headers = [header for header in SIZE_HEADERS if str(header).strip().upper() in used_sizes]
+    extra_sizes = sorted(size for size in used_sizes if size not in {str(header).strip().upper() for header in SIZE_HEADERS})
+    headers.extend(extra_sizes)
+    return headers or ["1SIZE"]
+
+
+def build_report_layout(size_headers: List[object]) -> Tuple[Dict[str, int], int]:
+    section_width = 2 + len(size_headers) + 1
+    section_starts = {
+        "NEW": 1,
+        "ORI": 1 + section_width + 1,
+        "NOW": 1 + (section_width + 1) * 2,
+    }
+    return section_starts, section_width
+
+
+def write_report_headers(ws, section_starts: Dict[str, int], size_headers: List[object]):
     sections = [
-        (new_start_col, "Size Breakdown (NEW)"),
-        (ori_start_col, "Size Breakdown (ORI)"),
-        (now_start_col, "Size Breakdown (NOW)"),
+        (section_starts["NEW"], "Size Breakdown (NEW)"),
+        (section_starts["ORI"], "Size Breakdown (ORI)"),
+        (section_starts["NOW"], "Size Breakdown (NOW)"),
     ]
     for start_col, title in sections:
         ws.cell(row=1, column=start_col + 2, value=title)
         ws.cell(row=2, column=start_col, value="Divert PO#")
         ws.cell(row=2, column=start_col + 1, value="PO line")
-        for offset, header in enumerate(size_headers):
-            ws.cell(row=2, column=start_col + 2 + offset, value=display_size_header(header))
+        for idx, header in enumerate(size_headers, start=start_col + 2):
+            ws.cell(row=2, column=idx, value=header)
         ws.cell(row=2, column=start_col + 2 + len(size_headers), value="Total")
 
 
-def write_new_section_row(ws, row: int, key: Tuple[int, int], size_values: Dict[str, int], size_headers: List[str]):
-    new_start_col, _ori_start_col, _now_start_col, _section_width = report_section_starts(size_headers)
-    write_section_row(ws, row, new_start_col, key, size_values, size_headers)
+def write_new_section_row(
+    ws,
+    row: int,
+    key: Tuple[int, int],
+    size_values: Dict[str, int],
+    section_starts: Dict[str, int],
+    size_headers_as_text: List[str],
+):
+    write_section_row(ws, row, section_starts["NEW"], key, size_values, size_headers_as_text)
 
 
 def write_ori_now_rows(
@@ -858,47 +1061,52 @@ def write_ori_now_rows(
     source_key: Tuple[int, int],
     original_groups: Dict[Tuple[int, int], OrderedDict[str, int]],
     search_groups: Dict[Tuple[int, int], POGroup],
-    size_headers: List[str],
+    section_starts: Dict[str, int],
+    size_headers_as_text: List[str],
 ):
-    _new_start_col, ori_start_col, now_start_col, _section_width = report_section_starts(size_headers)
-    write_section_row(ws, row, ori_start_col, source_key, original_groups.get(source_key, {}), size_headers)
+    write_section_row(ws, row, section_starts["ORI"], source_key, original_groups.get(source_key, {}), size_headers_as_text)
     now_group = search_groups.get(source_key)
     now_values = now_group.sizes if now_group else {}
-    write_section_row(ws, row, now_start_col, source_key, now_values, size_headers)
+    write_section_row(ws, row, section_starts["NOW"], source_key, now_values, size_headers_as_text)
 
 
-def write_section_row(ws, row: int, start_col: int, key: Tuple[int, int], size_values: Dict[str, int], size_headers: List[str]):
+def write_section_row(
+    ws,
+    row: int,
+    start_col: int,
+    key: Tuple[int, int],
+    size_values: Dict[str, int],
+    size_headers_as_text: List[str],
+):
     ws.cell(row=row, column=start_col, value=key[0])
     ws.cell(row=row, column=start_col + 1, value=key[1])
     size_start = start_col + 2
-    total_col = start_col + 2 + len(size_headers)
+    total_col = start_col + 2 + len(size_headers_as_text)
 
-    normalized_values: Dict[str, int] = {}
-    for raw_size, raw_qty in (size_values or {}).items():
-        size = normalize_size(raw_size)
-        if not size:
-            continue
-        normalized_values[size] = normalized_values.get(size, 0) + to_int(raw_qty)
-
-    for offset, header in enumerate(size_headers):
+    normalized_values = {normalize_size(size): to_int(qty) for size, qty in (size_values or {}).items()}
+    for offset, header in enumerate(size_headers_as_text):
         value = normalized_values.get(header, 0)
         if value != 0:
             ws.cell(row=row, column=size_start + offset, value=value)
         elif header in normalized_values:
             ws.cell(row=row, column=size_start + offset, value=0)
 
-    if size_headers:
-        first_size_letter = get_column_letter(size_start)
-        last_size_letter = get_column_letter(total_col - 1)
-        ws.cell(row=row, column=total_col, value=f"=SUM({first_size_letter}{row}:{last_size_letter}{row})")
-    else:
-        ws.cell(row=row, column=total_col, value=0)
+    first_size_letter = get_column_letter(size_start)
+    last_size_letter = get_column_letter(total_col - 1)
+    ws.cell(row=row, column=total_col, value=f"=SUM({first_size_letter}{row}:{last_size_letter}{row})")
 
 
-def write_check_row(ws, row: int, target_row: int, first_source_row: int, last_source_row: int, size_headers: List[str]):
-    new_start_col, _ori_start_col, _now_start_col, _section_width = report_section_starts(size_headers)
-    size_start = new_start_col + 2
-    total_col = new_start_col + 2 + len(size_headers)
+def write_check_row(
+    ws,
+    row: int,
+    target_row: int,
+    first_source_row: int,
+    last_source_row: int,
+    section_starts: Dict[str, int],
+    size_count: int,
+):
+    size_start = section_starts["NEW"] + 2
+    total_col = section_starts["NEW"] + 2 + size_count
     if first_source_row > last_source_row:
         for col in range(size_start, total_col + 1):
             col_letter = get_column_letter(col)
@@ -911,7 +1119,7 @@ def write_check_row(ws, row: int, target_row: int, first_source_row: int, last_s
         ws.cell(row=row, column=col, value=f"={col_letter}{target_row}-{source_refs}")
 
 
-def apply_report_formatting(ws, max_row: int, size_headers: List[str]):
+def apply_report_formatting(ws, max_row: int, section_starts: Dict[str, int], section_width: int):
     thin = Side(style="thin", color="FFB7B7B7")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     title_fill = PatternFill("solid", fgColor="FF333333")
@@ -921,17 +1129,14 @@ def apply_report_formatting(ws, max_row: int, size_headers: List[str]):
     header_font = Font(name="Calibri", size=10, bold=True, color="FF000000")
     body_font = Font(name="Calibri", size=10, color="FF000000")
 
-    new_start_col, ori_start_col, now_start_col, section_width = report_section_starts(size_headers)
-    section_starts = (new_start_col, ori_start_col, now_start_col)
-    final_col = now_start_col + section_width - 1
-
-    for col in range(1, final_col + 1):
+    last_col = section_starts["NOW"] + section_width - 1
+    for col in range(1, last_col + 1):
         ws.column_dimensions[get_column_letter(col)].width = 8
-    for col in section_starts:
-        ws.column_dimensions[get_column_letter(col)].width = 14
-        ws.column_dimensions[get_column_letter(col + 1)].width = 10
+    for start_col in section_starts.values():
+        ws.column_dimensions[get_column_letter(start_col)].width = 14
+        ws.column_dimensions[get_column_letter(start_col + 1)].width = 10
 
-    for start_col in section_starts:
+    for start_col in section_starts.values():
         title_cell = ws.cell(row=1, column=start_col + 2)
         title_cell.fill = title_fill
         title_cell.font = title_font
@@ -945,28 +1150,19 @@ def apply_report_formatting(ws, max_row: int, size_headers: List[str]):
             cell.border = border
 
     for row in range(3, max_row + 1):
-        is_check_row = not ws.cell(row=row, column=new_start_col).value and not ws.cell(row=row, column=new_start_col + 1).value
-        for start_col in section_starts:
+        is_check_row = not ws.cell(row=row, column=section_starts["NEW"]).value and not ws.cell(row=row, column=section_starts["NEW"] + 1).value
+        for section_name, start_col in section_starts.items():
             for col in range(start_col, start_col + section_width):
                 cell = ws.cell(row=row, column=col)
                 cell.font = body_font
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.border = border
-                if is_check_row and start_col == new_start_col:
+                if is_check_row and section_name == "NEW":
                     cell.fill = check_fill
 
     ws.row_dimensions[1].height = 18
     ws.row_dimensions[2].height = 30
     ws.freeze_panes = "A3"
-
-
-def display_size_header(size: str) -> object:
-    """Use the original mixed-type header display where possible."""
-    normalized = normalize_size(size)
-    for raw_header, text_header in zip(SIZE_HEADERS, SIZE_HEADERS_AS_TEXT):
-        if text_header == normalized:
-            return raw_header
-    return normalized
 
 
 def write_log_sheet(wb: Workbook, log_lines: List[str]):
