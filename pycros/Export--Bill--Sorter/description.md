@@ -12,3 +12,5 @@ Takes **VN Weekly Export Chart**, **Local Weekly Export Chart**, **Export Bill**
 - Inserts new invoices into `Export Bill.xlsx` (NK / Patagonia / NK Local Export)
 - Updates value dates, payment refs, and lead-time formulas from Trade Card PDF/Excel files
 - Regroups matched invoices by Value Date (col E) and sorts by FEAC Ref. No. order (col J)
+- Uses FEAC Date as a grouping fallback when col E is not usable but col J has a TC ref
+- Supports separate additional VN and Local weekly sheet names in the same run

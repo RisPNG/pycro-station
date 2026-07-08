@@ -18,6 +18,7 @@ from openpyxl.utils import get_column_letter
 
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+EXPORT_BILL_TARGET_SHEETS = {"NK", "NK Local Export", "Patagonia"}
 
 PDF_INVOICE_REF_RE = r"\d{2}[A-Z]\d{4,5}"
 PDF_MONEY_RE = r"\(?[\d,]+\.\d{2}\)?"
@@ -252,9 +253,9 @@ def _find_cell_with_value(ws, needle: str, *, max_rows: int = 80, max_cols: int 
     return None
 
 
-def read_feac_ref_order(path: str, *, log_emit=None) -> dict[str, int]:
+def read_feac_ref_data(path: str, *, log_emit=None) -> tuple[dict[str, int], dict[str, date]]:
     """
-    Reads FEAC chart and returns an order map for Ref numbers.
+    Reads FEAC chart and returns order/date maps for Ref numbers.
     For each sheet (in workbook order): find cell 'Ref. No.' and read values under it (same column),
     appending to one continuous list.
     """
@@ -262,6 +263,7 @@ def read_feac_ref_order(path: str, *, log_emit=None) -> dict[str, int]:
     wb = load_workbook(path, data_only=True, read_only=True)
     try:
         order: dict[str, int] = {}
+        ref_dates: dict[str, date] = {}
         seq = 0
         for ws in wb.worksheets:
             pos = _find_cell_with_value(ws, "Ref. No.")
@@ -269,9 +271,20 @@ def read_feac_ref_order(path: str, *, log_emit=None) -> dict[str, int]:
                 _emit(log_emit, f"[FEAC] '{ws.title}': 'Ref. No.' not found (skipped).")
                 continue
             header_r, header_c = pos
+            date_c = None
+            for c in range(1, header_c + 1):
+                v = ws.cell(header_r, c).value
+                if v is not None and str(v).strip().upper() == "DATE":
+                    date_c = c
+                    break
             blanks_in_a_row = 0
             started = False
+            current_date = None
             for r in range(header_r + 1, (ws.max_row or header_r) + 1):
+                if date_c is not None:
+                    row_date = parse_date_any(ws.cell(r, date_c).value)
+                    if row_date:
+                        current_date = row_date
                 v = ws.cell(r, header_c).value
                 if v is None or str(v).strip() == "":
                     blanks_in_a_row += 1
@@ -286,8 +299,10 @@ def read_feac_ref_order(path: str, *, log_emit=None) -> dict[str, int]:
                 if ref not in order:
                     order[ref] = seq
                     seq += 1
-        _emit(log_emit, f"[FEAC] Loaded {len(order)} Ref. No. item(s).")
-        return order
+                if current_date and ref not in ref_dates:
+                    ref_dates[ref] = current_date
+        _emit(log_emit, f"[FEAC] Loaded {len(order)} Ref. No. item(s), {len(ref_dates)} date(s).")
+        return order, ref_dates
     finally:
         wb.close()
 
@@ -409,10 +424,17 @@ def _find_first_data_row_export_bill(ws, *, amount_col: int = 2) -> Optional[int
     return None
 
 
-def regroup_and_sort_export_bill_sheet(ws, ref_order: dict[str, int], *, log_emit=None) -> None:
+def regroup_and_sort_export_bill_sheet(
+    ws,
+    ref_order: dict[str, int],
+    ref_dates: dict[str, date],
+    *,
+    log_emit=None,
+) -> None:
     """
     Rebuilds the grouped area so that:
     - Rows with Value Date (col E) are grouped by that date, ascending
+    - Rows with Payment No (col J) but no usable Value Date are grouped by FEAC Date
     - Within each date group, rows are sorted by FEAC order of column J (Payment No)
     - Rows with no Value Date stay in the last group (\"no tradecard\") with its own total
     """
@@ -430,6 +452,8 @@ def regroup_and_sort_export_bill_sheet(ws, ref_order: dict[str, int], *, log_emi
     blank_template: Optional[_RowSnap] = None
     date_groups: dict[date, list[_RowSnap]] = {}
     unmatched: list[_RowSnap] = []
+    seen_invoices: set[str] = set()
+    feac_date_fallbacks = 0
 
     for row_idx, row_cells in enumerate(
         ws.iter_rows(min_row=start, max_row=end, min_col=1, max_col=max_col),
@@ -449,11 +473,20 @@ def regroup_and_sort_export_bill_sheet(ws, ref_order: dict[str, int], *, log_emi
         inv = normalize_invoice(row_cells[0].value if row_cells else ws.cell(row_idx, 1).value)
         if not inv:
             continue
+        if inv in seen_invoices:
+            continue
+        seen_invoices.add(inv)
 
         snap = _snapshot_row(row_cells, row_idx, ws)
 
         e_val = row_cells[4].value if len(row_cells) >= 5 else ws.cell(row_idx, 5).value
         e_date = parse_date_any(e_val)
+        if not e_date:
+            j_val = row_cells[9].value if len(row_cells) >= 10 else ws.cell(row_idx, 10).value
+            ref = normalize_ref_no(j_val)
+            e_date = ref_dates.get(ref)
+            if e_date:
+                feac_date_fallbacks += 1
         if e_date:
             date_groups.setdefault(e_date, []).append(snap)
         else:
@@ -511,7 +544,11 @@ def regroup_and_sort_export_bill_sheet(ws, ref_order: dict[str, int], *, log_emi
             _apply_total_row(ws, write_row, total_template, max_col, int(group_start), int(group_end))
         write_row += 1
 
-    _emit(log_emit, f"[SORT] {ws.title}: regrouped {sum(len(v) for v in date_groups.values())} matched row(s), {len(unmatched)} unmatched.")
+    _emit(
+        log_emit,
+        f"[SORT] {ws.title}: regrouped {sum(len(v) for v in date_groups.values())} matched row(s), "
+        f"{len(unmatched)} unmatched, {feac_date_fallbacks} FEAC date fallback(s).",
+    )
 
 def find_header_row_by_value(ws, needle: str, *, max_scan_rows: Optional[int] = None) -> Optional[int]:
     target = needle.strip().upper()
@@ -575,6 +612,7 @@ class TradeCardData:
     value_date: date
     payment_num: Optional[str]
     entries: list[tuple[str, Optional[float]]]
+    dest_sheet: Optional[str] = None
 
 
 def read_vn_records(path: str, sheet_name: str, *, log_emit=None) -> list[ExportRecord]:
@@ -706,6 +744,8 @@ def read_local_records(path: str, sheet_name: str, *, log_emit=None) -> list[Exp
 def scan_existing_invoices(wb) -> set[str]:
     seen: set[str] = set()
     for ws in wb.worksheets:
+        if ws.title not in EXPORT_BILL_TARGET_SHEETS:
+            continue
         max_row = ws.max_row or 0
         for r in range(1, max_row + 1):
             inv = normalize_invoice(ws.cell(r, 1).value)
@@ -812,6 +852,8 @@ def recalc_last_group_total(ws, *, amount_col: int = 2, log_emit=None) -> None:
 def build_invoice_index(wb) -> dict[str, tuple[str, int]]:
     idx: dict[str, tuple[str, int]] = {}
     for ws in wb.worksheets:
+        if ws.title not in EXPORT_BILL_TARGET_SHEETS:
+            continue
         max_row = ws.max_row or 0
         for r in range(1, max_row + 1):
             inv = normalize_invoice(ws.cell(r, 1).value)
@@ -907,8 +949,18 @@ def read_converted_trade_cards_excel(wb, path: str, *, log_emit=None) -> list[Tr
             raise ValueError("[TRADE CARD] Converted workbook has no invoice rows.")
 
         source_name = normalize_invoice(summary.get("SOURCE FILE")) or os.path.basename(path)
+        payer = _norm_str(summary.get("PAYER ORG NAME")).upper()
+        dest_sheet = "Patagonia" if "PATAGONIA" in payer else "NK" if "NIKE" in payer else None
         _emit(log_emit, f"[TRADE CARD] Converted workbook found {len(entries)} invoice row(s).")
-        return [TradeCardData(source_name=source_name, value_date=value_date, payment_num=payment_num, entries=entries)]
+        return [
+            TradeCardData(
+                source_name=source_name,
+                value_date=value_date,
+                payment_num=payment_num,
+                entries=entries,
+                dest_sheet=dest_sheet,
+            )
+        ]
 
     if "Consistency Summary" not in wb.sheetnames:
         return []
@@ -1069,8 +1121,18 @@ def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
                 f"[TRADE CARD PDF] Fee total does not match fee section in {os.path.basename(path)}: {fee_total} vs -{fee_section_total}"
             )
 
+    payer_match = re.search(r"Payer\(s\) Org Name\s+([^\n]+)", full_text)
+    payer = _norm_str(payer_match.group(1) if payer_match else "").upper()
+    dest_sheet = "Patagonia" if "PATAGONIA" in payer else "NK" if "NIKE" in payer else None
+
     _emit(log_emit, f"[TRADE CARD PDF] Found {len(entries)} invoice row(s).")
-    return TradeCardData(source_name=os.path.basename(path), value_date=value_date, payment_num=payment_num, entries=entries)
+    return TradeCardData(
+        source_name=os.path.basename(path),
+        value_date=value_date,
+        payment_num=payment_num,
+        entries=entries,
+        dest_sheet=dest_sheet,
+    )
 
 
 def read_trade_cards(path: str, *, log_emit=None) -> list[TradeCardData]:
@@ -1247,6 +1309,9 @@ class ProcessingLogic:
         local_month_abbrev: str,
         local_week: int,
         holidays: set[date],
+        extra_vn_sheet_names: Optional[list[str]] = None,
+        extra_local_sheet_names: Optional[list[str]] = None,
+        extra_sheet_names: Optional[list[str]] = None,
     ) -> tuple[str, int, int, int, int, int, str]:
         ensure_olefile_available(self.log_emit)
         vn_sheet_name = format_sheet_name(vn_month_abbrev, vn_year, vn_week)
@@ -1254,13 +1319,37 @@ class ProcessingLogic:
         _emit(self.log_emit, f"[INPUT] VN sheet name: {vn_sheet_name}")
         _emit(self.log_emit, f"[INPUT] Local sheet name: {local_sheet_name}")
 
-        records: list[ExportRecord] = []
-        for p in vn_weekly_paths:
-            records.extend(read_vn_records(p, vn_sheet_name, log_emit=self.log_emit))
-        for p in local_weekly_paths:
-            records.extend(read_local_records(p, local_sheet_name, log_emit=self.log_emit))
+        shared_extra_sheets = [s.strip() for s in (extra_sheet_names or []) if s.strip()]
+        extra_vn_sheets = list(dict.fromkeys([*shared_extra_sheets, *[s.strip() for s in (extra_vn_sheet_names or []) if s.strip()]]))
+        extra_local_sheets = list(dict.fromkeys([*shared_extra_sheets, *[s.strip() for s in (extra_local_sheet_names or []) if s.strip()]]))
+        if extra_vn_sheets:
+            _emit(self.log_emit, f"[INPUT] Additional VN sheet(s): {', '.join(extra_vn_sheets)}")
+        if extra_local_sheets:
+            _emit(self.log_emit, f"[INPUT] Additional Local sheet(s): {', '.join(extra_local_sheets)}")
 
-        ref_order = read_feac_ref_order(feac_chart_path, log_emit=self.log_emit)
+        records: list[ExportRecord] = []
+        vn_sheet_names = list(dict.fromkeys([vn_sheet_name, *extra_vn_sheets]))
+        for p in vn_weekly_paths:
+            for sheet_name in vn_sheet_names:
+                try:
+                    records.extend(read_vn_records(p, sheet_name, log_emit=self.log_emit))
+                except ValueError as e:
+                    if sheet_name != vn_sheet_name and "Sheet not found" in str(e):
+                        _emit(self.log_emit, f"[VN] Extra sheet not found in {os.path.basename(p)}: {sheet_name} (skipped).")
+                        continue
+                    raise
+        local_sheet_names = list(dict.fromkeys([local_sheet_name, *extra_local_sheets]))
+        for p in local_weekly_paths:
+            for sheet_name in local_sheet_names:
+                try:
+                    records.extend(read_local_records(p, sheet_name, log_emit=self.log_emit))
+                except ValueError as e:
+                    if sheet_name != local_sheet_name and "Sheet not found" in str(e):
+                        _emit(self.log_emit, f"[LOCAL] Extra sheet not found in {os.path.basename(p)}: {sheet_name} (skipped).")
+                        continue
+                    raise
+
+        ref_order, ref_dates = read_feac_ref_data(feac_chart_path, log_emit=self.log_emit)
 
         keep_vba = export_bill_path.lower().endswith(".xlsm")
         _emit(self.log_emit, f"[EXPORT BILL] Opening: {export_bill_path}")
@@ -1287,31 +1376,62 @@ class ProcessingLogic:
             for sheet in sorted(touched_sheets):
                 recalc_last_group_total(export_wb[sheet], log_emit=self.log_emit)
 
+            trade_cards: list[TradeCardData] = []
+            for tc_path in trade_card_paths:
+                trade_cards.extend(read_trade_cards(tc_path, log_emit=self.log_emit))
+
+            invoice_index = build_invoice_index(export_wb)
+            known_invoices = set(invoice_index)
+            for trade_card in trade_cards:
+                for inv, tc_amt in trade_card.entries:
+                    if inv in known_invoices or tc_amt is None:
+                        continue
+
+                    inv_u = inv.strip().upper()
+                    dest_sheet = "NK Local Export" if re.match(r"^\d{2}M", inv_u) else trade_card.dest_sheet
+                    if not dest_sheet or dest_sheet not in export_wb.sheetnames:
+                        continue
+
+                    ws = export_wb[dest_sheet]
+                    total_row = find_last_total_row(ws)
+                    if total_row is None:
+                        total_row = (ws.max_row or 0) + 1
+                    ws.insert_rows(total_row, 1)
+                    new_row = total_row
+                    copy_row_style(ws, max(new_row - 1, 1), new_row, min_col=1, max_col=12)
+                    ws.cell(new_row, 1).value = inv
+                    ws.cell(new_row, 2).value = float(tc_amt)
+                    known_invoices.add(inv)
+                    inserted += 1
+                    touched_sheets.add(dest_sheet)
+                    _emit(self.log_emit, f"[EXPORT BILL] Inserted trade-card invoice {inv} into '{dest_sheet}' at row {new_row}.")
+
             invoice_index = build_invoice_index(export_wb)
             updated_total = 0
             missing_total = 0
             mismatched_total = 0
             mismatch_rows: list[AmountMismatch] = []
-            for tc_path in trade_card_paths:
-                for trade_card in read_trade_cards(tc_path, log_emit=self.log_emit):
-                    updated, missing, mismatched = update_export_bill_from_trade_card(
-                        export_wb,
-                        trade_card.value_date,
-                        trade_card.payment_num,
-                        trade_card.entries,
-                        holidays,
-                        invoice_index,
-                        mismatch_rows,
-                        trade_card.source_name,
-                        log_emit=self.log_emit,
-                    )
-                    updated_total += updated
-                    missing_total += missing
-                    mismatched_total += mismatched
+            for trade_card in trade_cards:
+                updated, missing, mismatched = update_export_bill_from_trade_card(
+                    export_wb,
+                    trade_card.value_date,
+                    trade_card.payment_num,
+                    trade_card.entries,
+                    holidays,
+                    invoice_index,
+                    mismatch_rows,
+                    trade_card.source_name,
+                    log_emit=self.log_emit,
+                )
+                updated_total += updated
+                missing_total += missing
+                mismatched_total += mismatched
 
             # Regroup/sort rows by Value Date (col E) then FEAC order of Payment No (col J)
             for ws in export_wb.worksheets:
-                regroup_and_sort_export_bill_sheet(ws, ref_order, log_emit=self.log_emit)
+                if ws.title not in EXPORT_BILL_TARGET_SHEETS:
+                    continue
+                regroup_and_sort_export_bill_sheet(ws, ref_order, ref_dates, log_emit=self.log_emit)
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             base, ext = os.path.splitext(export_bill_path)
@@ -1419,6 +1539,42 @@ class MainWidget(QWidget):
         self.local_week_combo.addItems([str(i) for i in range(1, 7)])
         self.local_week_combo.setCurrentIndex(0)
 
+        self.vn_extra_label = QLabel("Additional VN Sheets", self)
+        self.vn_extra_label.setStyleSheet(label_style)
+        self.vn_extra_sheets_box = QTextEdit(self)
+        self.vn_extra_sheets_box.setStyleSheet(shared_box_style)
+        self.vn_extra_sheets_box.setPlaceholderText("Jun'26 Wk 5")
+        self.vn_extra_sheets_box.setMaximumHeight(66)
+        self.vn_extra_year_combo = ComboBox(self)
+        self.vn_extra_year_combo.addItems(years)
+        self.vn_extra_year_combo.setCurrentText(str(current_year))
+        self.vn_extra_month_combo = ComboBox(self)
+        self.vn_extra_month_combo.addItems(MONTHS)
+        self.vn_extra_month_combo.setCurrentIndex(max(0, datetime.now().month - 1))
+        self.vn_extra_week_combo = ComboBox(self)
+        self.vn_extra_week_combo.addItems([str(i) for i in range(1, 7)])
+        self.vn_extra_week_combo.setCurrentIndex(0)
+        self.vn_extra_add_btn = PrimaryPushButton("+", self)
+        self.vn_extra_add_btn.setMaximumWidth(44)
+
+        self.local_extra_label = QLabel("Additional Local Sheets", self)
+        self.local_extra_label.setStyleSheet(label_style)
+        self.local_extra_sheets_box = QTextEdit(self)
+        self.local_extra_sheets_box.setStyleSheet(shared_box_style)
+        self.local_extra_sheets_box.setPlaceholderText("Jun'26 Wk 5")
+        self.local_extra_sheets_box.setMaximumHeight(66)
+        self.local_extra_year_combo = ComboBox(self)
+        self.local_extra_year_combo.addItems(years)
+        self.local_extra_year_combo.setCurrentText(str(current_year))
+        self.local_extra_month_combo = ComboBox(self)
+        self.local_extra_month_combo.addItems(MONTHS)
+        self.local_extra_month_combo.setCurrentIndex(max(0, datetime.now().month - 1))
+        self.local_extra_week_combo = ComboBox(self)
+        self.local_extra_week_combo.addItems([str(i) for i in range(1, 7)])
+        self.local_extra_week_combo.setCurrentIndex(0)
+        self.local_extra_add_btn = PrimaryPushButton("+", self)
+        self.local_extra_add_btn.setMaximumWidth(44)
+
         self.holidays_label = QLabel("MY Public Holidays (one per line, YYYY-MM-DD)", self)
         self.holidays_label.setStyleSheet(label_style)
         self.holidays_box = QTextEdit(self)
@@ -1477,6 +1633,29 @@ class MainWidget(QWidget):
         local_inputs_row.addStretch(1)
         layout.addLayout(local_inputs_row)
 
+        extra_sheets_row = QHBoxLayout()
+        vn_extra_col = QVBoxLayout()
+        vn_extra_col.addWidget(self.vn_extra_label)
+        vn_extra_col.addWidget(self.vn_extra_sheets_box)
+        vn_extra_picker_row = QHBoxLayout()
+        vn_extra_picker_row.addWidget(self.vn_extra_year_combo)
+        vn_extra_picker_row.addWidget(self.vn_extra_month_combo)
+        vn_extra_picker_row.addWidget(self.vn_extra_week_combo)
+        vn_extra_picker_row.addWidget(self.vn_extra_add_btn)
+        vn_extra_col.addLayout(vn_extra_picker_row)
+        local_extra_col = QVBoxLayout()
+        local_extra_col.addWidget(self.local_extra_label)
+        local_extra_col.addWidget(self.local_extra_sheets_box)
+        local_extra_picker_row = QHBoxLayout()
+        local_extra_picker_row.addWidget(self.local_extra_year_combo)
+        local_extra_picker_row.addWidget(self.local_extra_month_combo)
+        local_extra_picker_row.addWidget(self.local_extra_week_combo)
+        local_extra_picker_row.addWidget(self.local_extra_add_btn)
+        local_extra_col.addLayout(local_extra_picker_row)
+        extra_sheets_row.addLayout(vn_extra_col)
+        extra_sheets_row.addLayout(local_extra_col)
+        layout.addLayout(extra_sheets_row)
+
         add_row(self.export_btn, self.export_box)
         add_row(self.trade_btn, self.trade_box)
         add_row(self.feac_btn, self.feac_box)
@@ -1501,6 +1680,24 @@ class MainWidget(QWidget):
 
         self.log_message.connect(self._append_log)
         self.processing_done.connect(self._on_done)
+        self.vn_extra_add_btn.clicked.connect(
+            lambda: self.vn_extra_sheets_box.append(
+                format_sheet_name(
+                    self.vn_extra_month_combo.currentText(),
+                    int(self.vn_extra_year_combo.currentText()),
+                    int(self.vn_extra_week_combo.currentText()),
+                )
+            )
+        )
+        self.local_extra_add_btn.clicked.connect(
+            lambda: self.local_extra_sheets_box.append(
+                format_sheet_name(
+                    self.local_extra_month_combo.currentText(),
+                    int(self.local_extra_year_combo.currentText()),
+                    int(self.local_extra_week_combo.currentText()),
+                )
+            )
+        )
 
         for box in (self.vn_box, self.local_box, self.export_box, self.trade_box, self.feac_box):
             box.textChanged.connect(self._check_ready)
@@ -1543,6 +1740,16 @@ class MainWidget(QWidget):
             self.local_year_combo,
             self.local_month_combo,
             self.local_week_combo,
+            self.vn_extra_sheets_box,
+            self.vn_extra_year_combo,
+            self.vn_extra_month_combo,
+            self.vn_extra_week_combo,
+            self.vn_extra_add_btn,
+            self.local_extra_sheets_box,
+            self.local_extra_year_combo,
+            self.local_extra_month_combo,
+            self.local_extra_week_combo,
+            self.local_extra_add_btn,
             self.holidays_box,
             self.vn_box,
             self.local_box,
@@ -1562,6 +1769,8 @@ class MainWidget(QWidget):
         export_lines = split_lines(self.export_box.toPlainText())
         trade_paths = split_lines(self.trade_box.toPlainText())
         feac_lines = split_lines(self.feac_box.toPlainText())
+        extra_vn_sheet_names = split_lines(self.vn_extra_sheets_box.toPlainText())
+        extra_local_sheet_names = split_lines(self.local_extra_sheets_box.toPlainText())
 
         if len(export_lines) != 1:
             MessageBox("Invalid Export Bill", "Please select exactly one Export Bill file.", self).exec()
@@ -1623,6 +1832,8 @@ class MainWidget(QWidget):
                     local_month_abbrev=local_month,
                     local_week=local_week,
                     holidays=holidays,
+                    extra_vn_sheet_names=extra_vn_sheet_names,
+                    extra_local_sheet_names=extra_local_sheet_names,
                 )
                 msg = (
                     "Done!\n\n"
