@@ -2,7 +2,7 @@
     "repo_url": "https://github.com/RisPNG/pycro-station.git",
     "repo_branch": "main",
     "repo_directory": "pycros",
-    "update_remote_on_launch": false,
+    "update_remote_on_launch": true,
     "app_repo_url": "https://github.com/RisPNG/pycro-station.git",
     "app_repo_branch": "main",
     "app_repo_directory": "src",
@@ -12,17 +12,6 @@
     "stars_sort_mode": "alphabetical",
     "stars_show_remote_pycros": true,
     "recently_launched": [
-        "local:VTEC--Payment--Overview",
-        "local:Printing--Masterlist--Importer",
-        "local:Memo--Match--Utility",
-        "local:FOB--Price--Diff",
-        "local:DPOM--Sorter",
-        "local:SSI--Smartsheet--Importer",
-        "local:BoM--to--MSL",
-        "local:Excel--Duper",
-        "local:Costing--Data--Transformer",
-        "local:FAL--Sorter",
-        "local:PDF--to--Excel--LightOnOCR-2",
         "local:Export--Bill--Sorter"
     ],
     "starred_pycros": []

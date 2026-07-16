@@ -788,7 +788,14 @@ class PycroGrid(QScrollArea):
         except Exception:
             pass
 
-        v.addWidget(widget, 1)
+        scroll = QScrollArea(page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea{background: transparent; border: none;}")
+        scroll.viewport().setStyleSheet("background: transparent;")
+        scroll.setWidget(widget)
+
+        v.addWidget(scroll, 1)
         return page
 
     @staticmethod

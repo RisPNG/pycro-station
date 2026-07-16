@@ -1486,7 +1486,8 @@ class MainWidget(QWidget):
         self.export_box.setMaximumHeight(42)
         self.export_box.setStyleSheet(shared_box_style)
 
-        self.trade_btn = PrimaryPushButton("Select Trade Card(s) (.pdf/.xlsx)", self)
+        self.trade_btn = PrimaryPushButton("Select Trade Card File(s) (.pdf/.xlsx)", self)
+        self.trade_folder_btn = PrimaryPushButton("Select Trade Card Folder", self)
         self.trade_box = QTextEdit(self)
         self.trade_box.setReadOnly(True)
         self.trade_box.setMaximumHeight(80)
@@ -1657,7 +1658,13 @@ class MainWidget(QWidget):
         layout.addLayout(extra_sheets_row)
 
         add_row(self.export_btn, self.export_box)
-        add_row(self.trade_btn, self.trade_box)
+        trade_row = QHBoxLayout()
+        trade_btn_col = QVBoxLayout()
+        trade_btn_col.addWidget(self.trade_btn)
+        trade_btn_col.addWidget(self.trade_folder_btn)
+        trade_row.addLayout(trade_btn_col, 2)
+        trade_row.addWidget(self.trade_box, 3)
+        layout.addLayout(trade_row)
         add_row(self.feac_btn, self.feac_box)
 
         layout.addWidget(self.holidays_label)
@@ -1676,6 +1683,7 @@ class MainWidget(QWidget):
                 "Trade Card Files (*.pdf *.xlsx *.xlsm);;PDF Files (*.pdf);;Excel Files (*.xlsx *.xlsm)",
             )
         )
+        self.trade_folder_btn.clicked.connect(self._pick_trade_folder)
         self.feac_btn.clicked.connect(lambda: self._pick_file(self.feac_box, "Select Foreign Exchange Administrative Control Chart"))
 
         self.log_message.connect(self._append_log)
@@ -1716,6 +1724,27 @@ class MainWidget(QWidget):
             target_box.setText("\n".join(paths))
         self._check_ready()
 
+    def _pick_trade_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Trade Card Folder")
+        if not folder:
+            self._check_ready()
+            return
+        found: list[str] = []
+        for root, _dirs, files in os.walk(folder):
+            for name in files:
+                if name.startswith("~$"):
+                    continue
+                if os.path.splitext(name)[1].lower() not in {".pdf", ".xlsx", ".xlsm"}:
+                    continue
+                found.append(os.path.join(root, name))
+        found.sort()
+        if not found:
+            MessageBox("No trade cards found", f"No .pdf/.xlsx/.xlsm files found in:\n{folder}", self).exec()
+            return
+        existing = [line.strip() for line in (self.trade_box.toPlainText() or "").splitlines() if line.strip()]
+        self.trade_box.setText("\n".join(dict.fromkeys([*existing, *found])))
+        self._check_ready()
+
     def _check_ready(self):
         def has_any_line(box: QTextEdit) -> bool:
             return any(line.strip() for line in (box.toPlainText() or "").splitlines())
@@ -1733,6 +1762,7 @@ class MainWidget(QWidget):
             self.local_btn,
             self.export_btn,
             self.trade_btn,
+            self.trade_folder_btn,
             self.feac_btn,
             self.vn_year_combo,
             self.vn_month_combo,
