@@ -13,12 +13,15 @@ from qfluentwidgets import ComboBox, MessageBox, PrimaryPushButton
 
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
+from openpyxl.styles import Color
 from openpyxl.utils.datetime import from_excel
 from openpyxl.utils import get_column_letter
 
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 EXPORT_BILL_TARGET_SHEETS = {"NK", "NK Local Export", "Patagonia"}
+TRADE_CARD_RED = Color(rgb="FFFF0000")
+DEFAULT_TEXT_COLOR = Color(auto=True)
 
 PDF_INVOICE_REF_RE = r"\d{2}[A-Z]\d{4,5}"
 PDF_MONEY_RE = r"\(?[\d,]+\.\d{2}\)?"
@@ -408,8 +411,10 @@ def _apply_total_row(
 
     if group_end_row >= group_start_row:
         ws.cell(dst_row, 2).value = f"=SUM(B{group_start_row}:B{group_end_row})"
+        ws.cell(dst_row, 9).value = f"=SUM(I{group_start_row}:I{group_end_row})"
     else:
         ws.cell(dst_row, 2).value = "=0"
+        ws.cell(dst_row, 9).value = "=0"
 
 
 def _find_first_data_row_export_bill(ws, *, amount_col: int = 2) -> Optional[int]:
@@ -741,6 +746,29 @@ def read_local_records(path: str, sheet_name: str, *, log_emit=None) -> list[Exp
         wb.close()
 
 
+def scan_chart_invoices(path: str, *, log_emit=None) -> set[str]:
+    _emit(log_emit, f"[SHIPPING] Scanning all invoices: {path}")
+    invoices: set[str] = set()
+    wb = load_workbook(path, data_only=True)
+    try:
+        for ws in wb.worksheets:
+            header_row_idx = find_header_row_by_value(ws, "JOB NO.")
+            if not header_row_idx:
+                continue
+            header_row = next(ws.iter_rows(min_row=header_row_idx, max_row=header_row_idx, values_only=True))
+            idx_inv = header_indices(header_row, "INV #")
+            if not idx_inv:
+                continue
+            inv_i = idx_inv[0]
+            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+                inv = normalize_invoice(row[inv_i] if inv_i < len(row) else None)
+                if inv:
+                    invoices.add(inv)
+    finally:
+        wb.close()
+    return invoices
+
+
 def scan_existing_invoices(wb) -> set[str]:
     seen: set[str] = set()
     for ws in wb.worksheets:
@@ -809,6 +837,16 @@ def copy_row_style(ws, src_row: int, dst_row: int, *, min_col: int = 1, max_col:
         dst.protection = copy_style(src.protection)
 
 
+def set_row_text_color(ws, row: int, color: Color, *, max_col: int = 12) -> None:
+    from copy import copy as copy_style
+
+    for col in range(1, max_col + 1):
+        cell = ws.cell(row, col)
+        font = copy_style(cell.font)
+        font.color = copy_style(color)
+        cell.font = font
+
+
 def insert_export_bill_record(ws, rec: ExportRecord, *, log_emit=None) -> int:
     total_row = find_last_total_row(ws)
     if total_row is None:
@@ -846,7 +884,8 @@ def recalc_last_group_total(ws, *, amount_col: int = 2, log_emit=None) -> None:
     if col_letter is None:
         return
     ws.cell(total_row, amount_col).value = f"=SUM({col_letter}{start}:{col_letter}{end})"
-    _emit(log_emit, f"[EXPORT BILL] Recalculated '{ws.title}' total row {total_row}: SUM({col_letter}{start}:{col_letter}{end}).")
+    ws.cell(total_row, 9).value = f"=SUM(I{start}:I{end})"
+    _emit(log_emit, f"[EXPORT BILL] Recalculated '{ws.title}' total row {total_row}: SUM({col_letter}{start}:{col_letter}{end}) and SUM(I{start}:I{end}).")
 
 
 def build_invoice_index(wb) -> dict[str, tuple[str, int]]:
@@ -1215,7 +1254,7 @@ def update_export_bill_from_trade_card(
         eb_amt = parse_money(ws.cell(row, 2).value)
         if tc_amt is not None and eb_amt is not None:
             if abs(float(tc_amt) - float(eb_amt)) > 0.01:
-                _emit(log_emit, f"[AMOUNT MISMATCH] {inv} ({sheet_name} row {row}): TradeCard={tc_amt} vs ExportBill={eb_amt}")
+                _emit(log_emit, f"[AMOUNT MISMATCH] {inv} ({sheet_name} row {row}): replaced ExportBill={eb_amt} with TradeCard={tc_amt}")
                 mismatched += 1
                 if mismatches is not None:
                     mismatches.append(
@@ -1228,6 +1267,7 @@ def update_export_bill_from_trade_card(
                             export_bill_amount=float(eb_amt),
                         )
                     )
+                ws.cell(row, 2).value = float(tc_amt)
 
         for col in (5, 6):
             c = ws.cell(row, col)
@@ -1276,6 +1316,7 @@ def write_mismatch_log_txt(output_xlsx_path: str, export_wb, mismatches: list[Am
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Output workbook: {output_xlsx_path}\n")
             f.write("\n")
+            f.write("Note: export_bill_amount was replaced with trade_card_amount in the output workbook.\n")
             f.write("Columns: trade_card_file | invoice | sheet | row | trade_card_amount | export_bill_amount\n")
             for m in mismatches:
                 row = sheet_inv_row.get((m.export_bill_sheet, m.invoice), m.export_bill_row)
@@ -1426,6 +1467,24 @@ class ProcessingLogic:
                 updated_total += updated
                 missing_total += missing
                 mismatched_total += mismatched
+
+            # Recolor rows: invoices present anywhere in the VN/Local weekly charts are automatic;
+            # trade-card invoices absent from the charts are red.
+            chart_invoices: set[str] = set()
+            for p in (*vn_weekly_paths, *local_weekly_paths):
+                chart_invoices |= scan_chart_invoices(p, log_emit=self.log_emit)
+            trade_card_invoices = {inv for tc in trade_cards for inv, _ in tc.entries}
+            for ws in export_wb.worksheets:
+                if ws.title not in EXPORT_BILL_TARGET_SHEETS:
+                    continue
+                for r in range(1, (ws.max_row or 0) + 1):
+                    inv = normalize_invoice(ws.cell(r, 1).value)
+                    if not inv:
+                        continue
+                    if inv in chart_invoices:
+                        set_row_text_color(ws, r, DEFAULT_TEXT_COLOR)
+                    elif inv in trade_card_invoices:
+                        set_row_text_color(ws, r, TRADE_CARD_RED)
 
             # Regroup/sort rows by Value Date (col E) then FEAC order of Payment No (col J)
             for ws in export_wb.worksheets:
@@ -1873,7 +1932,7 @@ class MainWidget(QWidget):
                     + f"Skipped existing invoices: {skipped}\n"
                     + f"Trade card updated invoices: {updated}\n"
                     + f"Trade card missing invoices: {missing}\n"
-                    + f"Amount mismatches: {mismatched}"
+                    + f"Amount mismatches (replaced with trade card amount): {mismatched}"
                 )
                 self.processing_done.emit(True, msg)
             except Exception as e:
