@@ -658,8 +658,8 @@ def read_vn_records(path: str, sheet_name: str, *, log_emit=None) -> list[Export
             rows_with_inv += 1
 
             term_val = _norm_str(row[payterm_i] if payterm_i < len(row) else None)
-            term_norm = re.sub(r"\s+", "", term_val.strip().upper())
-            if term_norm != "BYT/C":
+            term_norm = re.sub(r"[\s/]+", "", term_val.strip().upper())
+            if term_norm != "BYTC":
                 skipped_term += 1
                 continue
 
@@ -722,7 +722,7 @@ def read_local_records(path: str, sheet_name: str, *, log_emit=None) -> list[Exp
             rows_with_inv += 1
 
             term_val = _norm_str(row[term_i] if term_i < len(row) else None)
-            term_norm = re.sub(r"\s+", "", term_val.strip().upper())
+            term_norm = re.sub(r"[\s/]+", "", term_val.strip().upper())
             if term_norm != "BYTC":
                 skipped_term += 1
                 continue
