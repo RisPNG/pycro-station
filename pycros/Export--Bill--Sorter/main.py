@@ -3,7 +3,8 @@ import re
 import sys
 import threading
 import types
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Callable, Iterable, Optional
 
@@ -13,7 +14,7 @@ from qfluentwidgets import ComboBox, MessageBox, PrimaryPushButton
 
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
-from openpyxl.styles import Color
+from openpyxl.styles import Border, Color, PatternFill
 from openpyxl.utils.datetime import from_excel
 from openpyxl.utils import get_column_letter
 
@@ -22,6 +23,8 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", 
 EXPORT_BILL_TARGET_SHEETS = {"NK", "NK Local Export", "Patagonia"}
 TRADE_CARD_RED = Color(rgb="FFFF0000")
 DEFAULT_TEXT_COLOR = Color(auto=True)
+TC_GROUP_FILL_COLORS = ("FFFFFF00", "FFFCD5B4")
+DATE_DISPLAY_FORMAT = "d-mmm"
 
 PDF_INVOICE_REF_RE = r"\d{2}[A-Z]\d{4,5}"
 PDF_MONEY_RE = r"\(?[\d,]+\.\d{2}\)?"
@@ -438,7 +441,8 @@ def regroup_and_sort_export_bill_sheet(
 ) -> None:
     """
     Rebuilds the grouped area so that:
-    - Rows with Value Date (col E) are grouped by that date, ascending
+    - Rows with a REC DATE (col G) are grouped first, by that date, ascending
+    - Remaining rows with Value Date (col E) are grouped by that date, ascending
     - Rows with Payment No (col J) but no usable Value Date are grouped by FEAC Date
     - Within each date group, rows are sorted by FEAC order of column J (Payment No)
     - Rows with no Value Date stay in the last group (\"no tradecard\") with its own total
@@ -455,6 +459,7 @@ def regroup_and_sort_export_bill_sheet(
 
     total_template: Optional[_RowSnap] = None
     blank_template: Optional[_RowSnap] = None
+    rec_date_groups: dict[date, list[_RowSnap]] = {}
     date_groups: dict[date, list[_RowSnap]] = {}
     unmatched: list[_RowSnap] = []
     seen_invoices: set[str] = set()
@@ -484,6 +489,12 @@ def regroup_and_sort_export_bill_sheet(
 
         snap = _snapshot_row(row_cells, row_idx, ws)
 
+        g_val = row_cells[6].value if len(row_cells) >= 7 else ws.cell(row_idx, 7).value
+        g_date = parse_date_any(g_val)
+        if g_date:
+            rec_date_groups.setdefault(g_date, []).append(snap)
+            continue
+
         e_val = row_cells[4].value if len(row_cells) >= 5 else ws.cell(row_idx, 5).value
         e_date = parse_date_any(e_val)
         if not e_date:
@@ -497,7 +508,7 @@ def regroup_and_sort_export_bill_sheet(
         else:
             unmatched.append(snap)
 
-    if not date_groups and not unmatched:
+    if not rec_date_groups and not date_groups and not unmatched:
         _emit(log_emit, f"[SORT] {ws.title}: no data rows detected (skipped).")
         return
 
@@ -509,8 +520,12 @@ def regroup_and_sort_export_bill_sheet(
     out_rows: list[tuple[str, object]] = []
     cursor = start
 
-    for idx, d in enumerate(sorted(date_groups.keys())):
-        group = sorted(date_groups[d], key=sort_key)
+    sorted_groups = [
+        sorted(rec_date_groups[d], key=sort_key) for d in sorted(rec_date_groups.keys())
+    ] + [
+        sorted(date_groups[d], key=sort_key) for d in sorted(date_groups.keys())
+    ]
+    for idx, group in enumerate(sorted_groups):
         group_start = cursor
         for s in group:
             out_rows.append(("data", s))
@@ -518,7 +533,7 @@ def regroup_and_sort_export_bill_sheet(
         group_end = cursor - 1
         out_rows.append(("total", (group_start, group_end)))
         cursor += 1
-        if idx != len(date_groups) - 1 or unmatched:
+        if idx != len(sorted_groups) - 1 or unmatched:
             out_rows.append(("blank", None))
             cursor += 1
 
@@ -551,7 +566,8 @@ def regroup_and_sort_export_bill_sheet(
 
     _emit(
         log_emit,
-        f"[SORT] {ws.title}: regrouped {sum(len(v) for v in date_groups.values())} matched row(s), "
+        f"[SORT] {ws.title}: regrouped {sum(len(v) for v in rec_date_groups.values())} rec-date row(s), "
+        f"{sum(len(v) for v in date_groups.values())} value-date row(s), "
         f"{len(unmatched)} unmatched, {feac_date_fallbacks} FEAC date fallback(s).",
     )
 
@@ -601,6 +617,17 @@ class ExportRecord:
     lead_days: int
 
 
+def merge_records_by_invoice(records: list[ExportRecord]) -> list[ExportRecord]:
+    merged: dict[str, ExportRecord] = {}
+    for rec in records:
+        prev = merged.get(rec.invoice)
+        if prev is None:
+            merged[rec.invoice] = rec
+        else:
+            merged[rec.invoice] = replace(prev, amount=round(prev.amount + rec.amount, 2))
+    return list(merged.values())
+
+
 @dataclass(frozen=True)
 class AmountMismatch:
     trade_card_file: str
@@ -618,6 +645,7 @@ class TradeCardData:
     payment_num: Optional[str]
     entries: list[tuple[str, Optional[float]]]
     dest_sheet: Optional[str] = None
+    invoice_fee: Optional[float] = None
 
 
 def read_vn_records(path: str, sheet_name: str, *, log_emit=None) -> list[ExportRecord]:
@@ -683,7 +711,7 @@ def read_vn_records(path: str, sheet_name: str, *, log_emit=None) -> list[Export
 
             out.append(ExportRecord(dest_sheet=dest, invoice=inv, amount=float(amt), exfty=exfty, lead_days=45))
         _emit(log_emit, f"[VN] Found {len(out)} row(s) with INV #. (Skipped {skipped_term}/{rows_with_inv} not BY T/C)")
-        return out
+        return merge_records_by_invoice(out)
     finally:
         wb.close()
 
@@ -741,7 +769,7 @@ def read_local_records(path: str, sheet_name: str, *, log_emit=None) -> list[Exp
             log_emit,
             f"[LOCAL] Found {len(out)} row(s) with INV #. (Skipped {skipped_term}/{rows_with_inv} not BY TC)",
         )
-        return out
+        return merge_records_by_invoice(out)
     finally:
         wb.close()
 
@@ -845,6 +873,34 @@ def set_row_text_color(ws, row: int, color: Color, *, max_col: int = 12) -> None
         font = copy_style(cell.font)
         font.color = copy_style(color)
         cell.font = font
+
+
+def apply_trade_card_group_subtotals(ws, payment_fees: dict[str, float], *, log_emit=None) -> None:
+    fills = [PatternFill(start_color=c, end_color=c, fill_type="solid") for c in TC_GROUP_FILL_COLORS]
+    max_row = ws.max_row or 0
+    group_index = 0
+    r = 1
+    while r <= max_row:
+        pay = str(ws.cell(r, 10).value or "").strip()
+        if pay not in payment_fees:
+            r += 1
+            continue
+        start = r
+        while r + 1 <= max_row and str(ws.cell(r + 1, 10).value or "").strip() == pay:
+            r += 1
+        end = r
+        r = end + 1
+        if any(not isinstance(ws.cell(rr, c).value, (date, datetime)) for rr in range(start, end + 1) for c in (5, 6, 7)):
+            continue
+        fee_str = f"{payment_fees[pay]:.2f}".rstrip("0").rstrip(".")
+        fill = fills[group_index % len(fills)]
+        for rr in range(start, end + 1):
+            ws.cell(rr, 9).value = None
+            ws.cell(rr, 9).fill = fill
+            ws.cell(rr, 10).fill = fill
+        ws.cell(end, 9).value = f"=SUM(B{start}:B{end})-({fee_str}+20+8)"
+        _emit(log_emit, f"[EXPORT BILL] {pay} net subtotal at row {end}: =SUM(B{start}:B{end})-({fee_str}+20+8).")
+        group_index += 1
 
 
 def insert_export_bill_record(ws, rec: ExportRecord, *, log_emit=None) -> int:
@@ -1096,6 +1152,7 @@ def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
     entries: list[tuple[str, Optional[float]]] = []
     suspicious: list[str] = []
     fee_total = 0.0
+    invoice_fee: Optional[float] = None
     in_invoice_lines = False
 
     with pdfplumber.open(path) as pdf:
@@ -1123,6 +1180,7 @@ def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
                     fee_amount = parse_money(fee_match.group("amount"))
                     if fee_amount is not None:
                         fee_total -= abs(fee_amount)
+                        invoice_fee = abs(fee_amount)
                     continue
 
                 if in_invoice_lines and re.match(rf"^{PDF_INVOICE_REF_RE}\b", line):
@@ -1171,6 +1229,7 @@ def read_trade_card_pdf(path: str, *, log_emit=None) -> TradeCardData:
         payment_num=payment_num,
         entries=entries,
         dest_sheet=dest_sheet,
+        invoice_fee=invoice_fee,
     )
 
 
@@ -1279,7 +1338,10 @@ def update_export_bill_from_trade_card(
         if pay_value:
             ws.cell(row, 10).value = pay_value
 
-        ws.cell(row, 12).value = f"=D{row}-G{row}"
+        if sheet_name in ("NK Local Export", "Patagonia"):
+            ws.cell(row, 11).value = f"=D{row}-F{row}"
+        else:
+            ws.cell(row, 12).value = f"=D{row}-G{row}"
         updated += 1
 
     return updated, missing, mismatched
@@ -1399,6 +1461,7 @@ class ProcessingLogic:
             existing = scan_existing_invoices(export_wb)
             inserted = 0
             skipped_existing = 0
+            existing_shipping: list[ExportRecord] = []
 
             touched_sheets: set[str] = set()
             for rec in records:
@@ -1406,6 +1469,7 @@ class ProcessingLogic:
                     raise ValueError(f"[EXPORT BILL] Sheet not found: {rec.dest_sheet}")
                 if rec.invoice in existing:
                     skipped_existing += 1
+                    existing_shipping.append(rec)
                     _emit(self.log_emit, f"[EXPORT BILL] Skipped existing invoice: {rec.invoice}")
                     continue
                 ws = export_wb[rec.dest_sheet]
@@ -1448,6 +1512,17 @@ class ProcessingLogic:
                     _emit(self.log_emit, f"[EXPORT BILL] Inserted trade-card invoice {inv} into '{dest_sheet}' at row {new_row}.")
 
             invoice_index = build_invoice_index(export_wb)
+
+            for rec in existing_shipping:
+                loc = invoice_index.get(rec.invoice)
+                if not loc:
+                    continue
+                sheet_name, row = loc
+                ws = export_wb[sheet_name]
+                if ws.cell(row, 3).value is None:
+                    ws.cell(row, 3).value = rec.exfty
+                    ws.cell(row, 4).value = f"=C{row}+{int(rec.lead_days)}"
+
             updated_total = 0
             missing_total = 0
             mismatched_total = 0
@@ -1491,6 +1566,40 @@ class ProcessingLogic:
                 if ws.title not in EXPORT_BILL_TARGET_SHEETS:
                     continue
                 regroup_and_sort_export_bill_sheet(ws, ref_order, ref_dates, log_emit=self.log_emit)
+
+            payment_fees = {
+                f"TC-{tc.payment_num}": tc.invoice_fee
+                for tc in trade_cards
+                if tc.payment_num and tc.invoice_fee is not None
+            }
+            for ws in export_wb.worksheets:
+                if ws.title not in EXPORT_BILL_TARGET_SHEETS:
+                    continue
+                apply_trade_card_group_subtotals(ws, payment_fees, log_emit=self.log_emit)
+
+            for ws in export_wb.worksheets:
+                if ws.title not in EXPORT_BILL_TARGET_SHEETS:
+                    continue
+                for r in range(1, (ws.max_row or 0) + 1):
+                    iv = ws.cell(r, 9).value
+                    mo = re.match(r"=SUM\(I(\d+):I(\d+)\)$", iv, re.I) if isinstance(iv, str) else None
+                    if mo and not any(
+                        ws.cell(x, 9).value not in (None, "")
+                        for x in range(int(mo.group(1)), int(mo.group(2)) + 1)
+                    ):
+                        cell = ws.cell(r, 9)
+                        cell.value = None
+                        cell._style = copy(cell._style)
+                        cell.border = Border()
+
+            for ws in export_wb.worksheets:
+                if ws.title not in EXPORT_BILL_TARGET_SHEETS:
+                    continue
+                for r in range(1, (ws.max_row or 0) + 1):
+                    for c in range(3, 8):
+                        v = ws.cell(r, c).value
+                        if isinstance(v, (date, datetime)) or (isinstance(v, str) and v.startswith("=")):
+                            ws.cell(r, c).number_format = DATE_DISPLAY_FORMAT
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             base, ext = os.path.splitext(export_bill_path)
