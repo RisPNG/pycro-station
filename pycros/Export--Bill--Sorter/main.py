@@ -25,6 +25,8 @@ TRADE_CARD_RED = Color(rgb="FFFF0000")
 DEFAULT_TEXT_COLOR = Color(auto=True)
 TC_GROUP_FILL_COLORS = ("FFFFFF00", "FFFCD5B4")
 DATE_DISPLAY_FORMAT = "d-mmm"
+AMOUNT_DISPLAY_FORMAT = "#,##0.00"
+PAYMENT_DAYS_DISPLAY_FORMAT = "0"
 
 PDF_INVOICE_REF_RE = r"\d{2}[A-Z]\d{4,5}"
 PDF_MONEY_RE = r"\(?[\d,]+\.\d{2}\)?"
@@ -902,6 +904,9 @@ def apply_trade_card_group_subtotals(ws, payment_fees: dict[str, float], *, log_
         _emit(log_emit, f"[EXPORT BILL] {pay} net subtotal at row {end}: =SUM(B{start}:B{end})-({fee_str}+20+8).")
         group_index += 1
 
+    for row in range(1, max_row + 1):
+        ws.cell(row, 9).number_format = AMOUNT_DISPLAY_FORMAT
+
 
 def insert_export_bill_record(ws, rec: ExportRecord, *, log_emit=None) -> int:
     total_row = find_last_total_row(ws)
@@ -1600,6 +1605,19 @@ class ProcessingLogic:
                         v = ws.cell(r, c).value
                         if isinstance(v, (date, datetime)) or (isinstance(v, str) and v.startswith("=")):
                             ws.cell(r, c).number_format = DATE_DISPLAY_FORMAT
+                payment_days_col = 11 if ws.title in ("NK Local Export", "Patagonia") else 12
+                for r in range(1, (ws.max_row or 0) + 1):
+                    ws.cell(r, payment_days_col).number_format = PAYMENT_DAYS_DISPLAY_FORMAT
+                data_start = _find_first_data_row_export_bill(ws)
+                data_end = find_last_total_row(ws)
+                if data_start is not None and data_end is not None:
+                    for r in range(data_start, data_end + 1):
+                        if not normalize_invoice(ws.cell(r, 1).value) or parse_money(ws.cell(r, 2).value) is None:
+                            continue
+                        for c in range(1, 13):
+                            font = copy(ws.cell(r, c).font)
+                            font.sz = 10
+                            ws.cell(r, c).font = font
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             base, ext = os.path.splitext(export_bill_path)

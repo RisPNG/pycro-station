@@ -8,7 +8,6 @@ from defusedxml import ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, DefaultDict, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -33,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.1.4"
+PYCRO_VERSION = "1.2.0"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -41,7 +40,7 @@ ROLE_LOCAL = "local"
 ROLE_VN = "vn"
 
 ROLE_LABELS = {
-    ROLE_BSD: "BSD / Order Control",
+    ROLE_BSD: "Order Control",
     ROLE_SHIPMENT: "Shipment Forecast",
     ROLE_LOCAL: "Weekly Export Local",
     ROLE_VN: "Weekly Export VN",
@@ -58,6 +57,21 @@ MonthMaps = Dict[str, JobMap]
 LogFn = Callable[[str], None]
 
 
+@dataclass(frozen=True)
+class SourceLine:
+    full_job: str
+    job: str
+    qty: float
+    amount: float
+    invoice: str
+    po: str
+    source: str
+    row_number: int
+
+
+ShipmentLines = Dict[str, List[SourceLine]]
+
+
 @dataclass
 class ProcessingOptions:
     amount_tolerance: float = 0.01
@@ -71,7 +85,7 @@ class ProcessingResult:
     bds_counts: Dict[str, int]
     ann_counts: Dict[str, int]
     weekly_sheets: List[str]
-    alias_changes: List[Tuple[str, str]]
+    unmatched_weekly_jobs: List[str]
     warnings: List[str]
 
 
@@ -282,7 +296,7 @@ def process_reconciliation(
     _validate_input_paths(paths)
     _validate_workbook_signatures(paths, log)
 
-    shipment, ann_counts, months = _read_shipment_forecast(
+    shipment_lines, _shipment_counts, months, shipment_warnings = _read_shipment_forecast(
         paths[ROLE_SHIPMENT],
         log,
     )
@@ -298,9 +312,9 @@ def process_reconciliation(
     canonical_jobs = set()
     for month in months:
         canonical_jobs.update(bds[month].keys())
-        canonical_jobs.update(shipment[month].keys())
+        canonical_jobs.update(line.job for line in shipment_lines[month])
 
-    actual, weekly_sheets, alias_changes, weekly_warnings = _read_weekly_actuals(
+    weekly_lines, weekly_sheets, unmatched_weekly_jobs, weekly_warnings = _read_weekly_actuals(
         paths[ROLE_LOCAL],
         paths[ROLE_VN],
         months[0],
@@ -308,8 +322,16 @@ def process_reconciliation(
         log,
     )
 
-    ann = _build_ann_maps(months, shipment, supplements, actual)
-    warnings = list(weekly_warnings)
+    ann, build_warnings = _build_ann_maps(
+        months,
+        shipment_lines,
+        supplements,
+        bds,
+        weekly_lines,
+        log,
+    )
+    ann_counts = {month: len(ann[month]) for month in months}
+    warnings = list(shipment_warnings) + list(weekly_warnings) + list(build_warnings)
 
     output_dir = output_dir or os.path.dirname(paths[ROLE_BSD])
     os.makedirs(output_dir, exist_ok=True)
@@ -324,7 +346,7 @@ def process_reconciliation(
         bds=bds,
         ann=ann,
         weekly_sheets=weekly_sheets,
-        alias_changes=alias_changes,
+        unmatched_weekly_jobs=unmatched_weekly_jobs,
         warnings=warnings,
         generated_at=generated_at,
     )
@@ -336,7 +358,7 @@ def process_reconciliation(
         bds_counts=bds_counts,
         ann_counts=ann_counts,
         weekly_sheets=weekly_sheets,
-        alias_changes=alias_changes,
+        unmatched_weekly_jobs=unmatched_weekly_jobs,
         warnings=warnings,
     )
 
@@ -451,35 +473,73 @@ def _read_bds(
 def _read_shipment_forecast(
     path: str,
     log: LogFn,
-) -> Tuple[MonthMaps, Dict[str, int], List[str]]:
-    """Read Ann Forecast and derive its full contiguous reconciliation range.
+) -> Tuple[ShipmentLines, Dict[str, int], List[str], List[str]]:
+    """Read Ann Forecast lines and derive the contiguous reconciliation range.
 
-    Only rows that can participate in reconciliation are used for range
-    detection: a valid job, quantity, amount, and PLAN EX-FTY month must all be
-    present. The first and last usable PLAN EX-FTY months become the detected
-    boundaries, and any empty calendar month between them is retained.
+    Exact duplicate source rows are ignored. For each line, actual quantity and
+    actual amount are used when both are available; otherwise the planned
+    quantity and amount are used. Full job codes are retained for exact weekly
+    matching, while reconciliation output remains grouped by the base job code.
     """
     log(f"Reading shipment forecast: {os.path.basename(path)}")
-    discovered: Dict[str, JobMap] = {}
+    discovered: Dict[str, List[SourceLine]] = defaultdict(list)
     ignored_missing_month = 0
+    duplicate_rows = 0
+    duplicate_examples: List[str] = []
+    seen_rows = set()
 
     wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
         ws = wb["SHIPMENTS"]
-        for row in ws.iter_rows(min_row=6, max_col=20, values_only=True):
-            job = _normalise_job(_at(row, 4))
-            qty = _number(_at(row, 5))
-            amount = _number(_at(row, 14))
-            if not job or qty is None or amount is None:
+        for row_number, row in enumerate(
+            ws.iter_rows(min_row=6, max_col=40, values_only=True),
+            start=6,
+        ):
+            full_job = _normalise_job_code(_at(row, 4))
+            if not full_job:
+                continue
+            job = _job_group(full_job)
+
+            planned_qty = _number(_at(row, 5))
+            planned_amount = _number(_at(row, 14))
+            actual_qty = _number(_at(row, 26))
+            actual_amount = _number(_at(row, 27))
+            qty, amount = _actual_or_planned(
+                actual_qty,
+                actual_amount,
+                planned_qty,
+                planned_amount,
+            )
+            if qty is None or amount is None:
                 continue
 
             month = _month_key_from_value(_at(row, 20))  # T / PLAN EX-FTY
             if not month:
                 ignored_missing_month += 1
                 continue
-            if month not in discovered:
-                discovered[month] = _new_job_map()
-            _add_pair(discovered[month], job, qty, amount)
+
+            fingerprint = _row_fingerprint(row)
+            if fingerprint in seen_rows:
+                duplicate_rows += 1
+                if len(duplicate_examples) < 20:
+                    duplicate_examples.append(
+                        f"SHIPMENTS row {row_number}: {_text(_at(row, 4)) or '(blank job)'}"
+                    )
+                continue
+            seen_rows.add(fingerprint)
+
+            discovered[month].append(
+                SourceLine(
+                    full_job=full_job,
+                    job=job,
+                    qty=qty,
+                    amount=amount,
+                    invoice=_normalise_identifier(_at(row, 6)),
+                    po=_normalise_identifier(_at(row, 7)),
+                    source="Shipment Forecast",
+                    row_number=row_number,
+                )
+            )
     finally:
         wb.close()
 
@@ -491,30 +551,41 @@ def _read_shipment_forecast(
         )
 
     months = _month_range(populated_months[0], populated_months[-1])
-    shipment = _new_month_maps(months)
-    for month, jobs in discovered.items():
-        shipment[month] = jobs
+    shipment: ShipmentLines = {month: [] for month in months}
+    for month, lines in discovered.items():
+        shipment[month] = lines
 
+    warnings: List[str] = []
     missing_months = [month for month in months if month not in discovered]
     if missing_months:
-        log(
+        warning = (
             "Ann Forecast has no usable rows in intermediate month(s): "
             + ", ".join(_month_display(month) for month in missing_months)
         )
+        warnings.append(warning)
+        log(warning)
     if ignored_missing_month:
-        log(
+        warning = (
             f"Ignored {ignored_missing_month:,} usable Ann row(s) without a "
             "recognisable PLAN EX-FTY month"
         )
+        warnings.append(warning)
+        log(warning)
+    if duplicate_rows:
+        warning = f"Ignored {duplicate_rows:,} exact duplicate Ann Forecast row(s)."
+        warnings.append(warning)
+        log(warning)
+        warnings.extend(duplicate_examples)
 
     counts = {month: len(shipment[month]) for month in months}
     for month in months:
-        qty, amount = _map_totals(shipment[month])
+        grouped = _aggregate_lines(shipment[month])
+        qty, amount = _map_totals(grouped)
         log(
-            f"Shipment {_month_display(month)}: {counts[month]:,} jobs, "
-            f"qty {qty:,.0f}, amount {amount:,.2f}"
+            f"Shipment {_month_display(month)}: {counts[month]:,} unique lines, "
+            f"{len(grouped):,} jobs, qty {qty:,.0f}, amount {amount:,.2f}"
         )
-    return shipment, counts, months
+    return shipment, counts, months, warnings
 
 
 def _read_weekly_actuals(
@@ -523,17 +594,31 @@ def _read_weekly_actuals(
     current_month: str,
     canonical_jobs: Iterable[str],
     log: LogFn,
-) -> Tuple[JobMap, List[str], List[Tuple[str, str]], List[str]]:
+) -> Tuple[List[SourceLine], List[str], List[str], List[str]]:
+    """Read weekly actuals without correcting or fuzzy-matching job numbers."""
     log(f"Reading weekly actual shipments for {_month_display(current_month)}")
-    raw_actual = _new_job_map()
+    lines: List[SourceLine] = []
     used_sheets: List[str] = []
     warnings: List[str] = []
+    ignored_summary_rows = 0
 
     configs = [
-        (local_path, "Local", 2, 17, 18, 7),
-        (vn_path, "VN", 4, 27, 28, 6),
+        # path, label, job, planned qty, planned amount, actual qty, actual amount, invoice, PO, first row
+        (local_path, "Local", 2, 3, 9, 17, 18, 4, 5, 7),
+        (vn_path, "VN", 4, 5, 14, 27, 28, 6, 7, 6),
     ]
-    for path, label, job_col, qty_col, amount_col, start_row in configs:
+    for (
+        path,
+        label,
+        job_col,
+        planned_qty_col,
+        planned_amount_col,
+        actual_qty_col,
+        actual_amount_col,
+        invoice_col,
+        po_col,
+        start_row,
+    ) in configs:
         wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
         try:
             selected = [
@@ -541,65 +626,178 @@ def _read_weekly_actuals(
                 if _parse_weekly_sheet_month(name) == current_month
             ]
             if not selected:
-                warnings.append(
+                warning = (
                     f"No {_month_display(current_month)} weekly sheet found in {label} workbook."
                 )
+                warnings.append(warning)
+                log(warning)
                 continue
             selected.sort(key=_weekly_sheet_sort_key)
             for sheet_name in selected:
                 ws = wb[sheet_name]
-                max_col = max(job_col, qty_col, amount_col)
-                for row in ws.iter_rows(min_row=start_row, max_col=max_col, values_only=True):
-                    job = _normalise_job(_at(row, job_col))
-                    qty = _number(_at(row, qty_col))
-                    amount = _number(_at(row, amount_col))
-                    if not job or qty is None or amount is None:
+                max_col = max(
+                    job_col,
+                    planned_qty_col,
+                    planned_amount_col,
+                    actual_qty_col,
+                    actual_amount_col,
+                    invoice_col,
+                    po_col,
+                )
+                for row_number, row in enumerate(
+                    ws.iter_rows(min_row=start_row, max_col=max_col, values_only=True),
+                    start=start_row,
+                ):
+                    raw_job = _text(_at(row, job_col))
+                    if _is_weekly_summary_job(raw_job):
+                        ignored_summary_rows += 1
+                        continue
+                    full_job = _normalise_job_code(raw_job)
+                    if not full_job:
+                        continue
+                    job = _job_group(full_job)
+                    qty, amount = _actual_or_planned(
+                        _number(_at(row, actual_qty_col)),
+                        _number(_at(row, actual_amount_col)),
+                        _number(_at(row, planned_qty_col)),
+                        _number(_at(row, planned_amount_col)),
+                    )
+                    if qty is None or amount is None:
                         continue
                     if abs(qty) < 1e-12 and abs(amount) < 1e-12:
                         continue
-                    _add_pair(raw_actual, job, qty, amount)
+                    lines.append(
+                        SourceLine(
+                            full_job=full_job,
+                            job=job,
+                            qty=qty,
+                            amount=amount,
+                            invoice=_normalise_identifier(_at(row, invoice_col)),
+                            po=_normalise_identifier(_at(row, po_col)),
+                            source=f"{label}: {sheet_name}",
+                            row_number=row_number,
+                        )
+                    )
                 used_sheets.append(f"{label}: {sheet_name}")
         finally:
             wb.close()
 
-    canonical = sorted(set(canonical_jobs))
-    actual = _new_job_map()
-    alias_changes: List[Tuple[str, str]] = []
-    for job, pair in raw_actual.items():
-        corrected = _match_canonical_job(job, canonical)
-        if corrected != job:
-            alias_changes.append((job, corrected))
-        _add_pair(actual, corrected, pair[0], pair[1])
-
-    qty, amount = _map_totals(actual)
-    log(
-        f"Weekly actual: {len(actual):,} jobs from {len(used_sheets)} sheets, "
-        f"qty {qty:,.0f}, amount {amount:,.2f}"
+    canonical = set(canonical_jobs)
+    unmatched_weekly_jobs = sorted(
+        {
+            line.job
+            for line in lines
+            if line.job not in canonical and line.job not in {"SAMPLE", "SAMPLES"}
+        }
     )
-    if alias_changes:
-        log(f"Corrected {len(alias_changes)} likely job-code aliases")
-    return actual, used_sheets, alias_changes, warnings
+    for job in unmatched_weekly_jobs:
+        warning = (
+            f"Weekly job '{job}' has no exact job match in BDS or Shipment Forecast. "
+            "No automatic correction was applied."
+        )
+        warnings.append(warning)
+        log(warning)
+
+    if ignored_summary_rows:
+        log(f"Ignored {ignored_summary_rows:,} TOTALWEEK summary row(s)")
+
+    grouped = _aggregate_lines(lines)
+    qty, amount = _map_totals(grouped)
+    log(
+        f"Weekly actual: {len(lines):,} lines / {len(grouped):,} jobs from "
+        f"{len(used_sheets)} sheets, qty {qty:,.0f}, amount {amount:,.2f}"
+    )
+    return lines, used_sheets, unmatched_weekly_jobs, warnings
 
 
 def _build_ann_maps(
     months: Sequence[str],
-    shipment: MonthMaps,
+    shipment: ShipmentLines,
     supplements: MonthMaps,
-    current_actual: JobMap,
-) -> MonthMaps:
+    bds: MonthMaps,
+    current_actual: Sequence[SourceLine],
+    log: LogFn,
+) -> Tuple[MonthMaps, List[str]]:
+    """Build Ann using confirmed source precedence rules.
+
+    The first two detected months use Shipment Forecast. The first month also
+    uses weekly actuals, replacing only the exact forecast line already shipped
+    and retaining all remaining forecast lines. From the third month onward,
+    Ann follows BDS exactly.
+    """
     ann = _new_month_maps(months)
-    for month in months:
-        for job, pair in shipment[month].items():
-            ann[month][job] = pair.copy()
-        # The shipment file is VN-oriented. Add unassigned/local BSD jobs that are absent.
+    warnings: List[str] = []
+
+    for index, month in enumerate(months):
+        if index >= 2:
+            for job, pair in bds[month].items():
+                ann[month][job] = pair.copy()
+            log(f"Ann {_month_display(month)} follows BDS (month {index + 1} onward)")
+            continue
+
+        remaining = list(shipment[month])
+        weekly_for_month: Sequence[SourceLine] = current_actual if index == 0 else ()
+        if weekly_for_month:
+            remaining, match_warnings = _remove_shipped_forecast_lines(
+                remaining,
+                weekly_for_month,
+            )
+            warnings.extend(match_warnings)
+
+        for line in remaining:
+            _add_pair(ann[month], line.job, line.qty, line.amount)
+        for line in weekly_for_month:
+            _add_pair(ann[month], line.job, line.qty, line.amount)
+
+        # The Shipment Forecast is VN-oriented. Preserve the established local
+        # supplement rule only for the two forecast-driven months.
         for job, pair in supplements[month].items():
             if job not in ann[month]:
                 ann[month][job] = pair.copy()
 
-    # Actual weekly exports replace the current-month forecast for the same job.
-    for job, pair in current_actual.items():
-        ann[months[0]][job] = pair.copy()
-    return ann
+    for warning in warnings:
+        log(warning)
+    return ann, warnings
+
+
+def _remove_shipped_forecast_lines(
+    forecast_lines: Sequence[SourceLine],
+    weekly_lines: Sequence[SourceLine],
+) -> Tuple[List[SourceLine], List[str]]:
+    remaining = list(forecast_lines)
+    warnings: List[str] = []
+
+    for weekly in weekly_lines:
+        candidates = [
+            index
+            for index, forecast in enumerate(remaining)
+            if _same_source_line_identity(forecast, weekly)
+        ]
+        if candidates:
+            # Matching is exact on the full job number and shipment identifiers.
+            # When repeated identical lines exist, consume one forecast occurrence
+            # for each weekly occurrence, preserving multiset quantities.
+            remaining.pop(candidates[0])
+    return remaining, warnings
+
+
+def _same_source_line_identity(forecast: SourceLine, weekly: SourceLine) -> bool:
+    if forecast.full_job != weekly.full_job:
+        return False
+
+    invoice_match = bool(forecast.invoice and weekly.invoice and forecast.invoice == weekly.invoice)
+    po_match = bool(forecast.po and weekly.po and forecast.po == weekly.po)
+    qty_match = abs(forecast.qty - weekly.qty) <= 0.5
+    amount_match = abs(forecast.amount - weekly.amount) <= 0.01
+
+    # Exact job plus a shared invoice or PO identifies the same shipment line.
+    # Quantity and amount may legitimately change when planned values become
+    # actual values. If neither identifier exists, require an exact value match.
+    if invoice_match or po_match:
+        return True
+    if not forecast.invoice and not weekly.invoice and not forecast.po and not weekly.po:
+        return qty_match and amount_match
+    return False
 
 
 def _write_result_workbook(
@@ -610,7 +808,7 @@ def _write_result_workbook(
     bds: MonthMaps,
     ann: MonthMaps,
     weekly_sheets: Sequence[str],
-    alias_changes: Sequence[Tuple[str, str]],
+    unmatched_weekly_jobs: Sequence[str],
     warnings: Sequence[str],
     generated_at: datetime,
 ):
@@ -639,7 +837,7 @@ def _write_result_workbook(
         bds,
         ann,
         weekly_sheets,
-        alias_changes,
+        unmatched_weekly_jobs,
         warnings,
         generated_at,
     )
@@ -974,7 +1172,7 @@ def _write_audit_sheet(
     bds: MonthMaps,
     ann: MonthMaps,
     weekly_sheets: Sequence[str],
-    alias_changes: Sequence[Tuple[str, str]],
+    unmatched_weekly_jobs: Sequence[str],
     warnings: Sequence[str],
     generated_at: datetime,
 ):
@@ -1034,17 +1232,21 @@ def _write_audit_sheet(
         ws.cell(row=row, column=1, value=item)
         row += 1
 
-    if alias_changes:
+    if unmatched_weekly_jobs:
         row += 1
-        ws.cell(row=row, column=1, value="Job-code aliases corrected").fill = sub_fill
+        ws.cell(row=row, column=1, value="Unmatched weekly job numbers").fill = sub_fill
         ws.cell(row=row, column=1).font = bold_font
         row += 1
-        ws.cell(row=row, column=1, value="Source code").font = bold_font
-        ws.cell(row=row, column=2, value="Mapped code").font = bold_font
+        ws.cell(row=row, column=1, value="Exact job number").font = bold_font
+        ws.cell(row=row, column=2, value="Action required").font = bold_font
         row += 1
-        for source, mapped in alias_changes:
-            ws.cell(row=row, column=1, value=source)
-            ws.cell(row=row, column=2, value=mapped)
+        for job in unmatched_weekly_jobs:
+            ws.cell(row=row, column=1, value=job)
+            ws.cell(
+                row=row,
+                column=2,
+                value="Correct the source workbook. The Pycro does not guess or merge job numbers.",
+            )
             row += 1
 
     if warnings:
@@ -1060,10 +1262,15 @@ def _write_audit_sheet(
     ws.cell(row=row, column=1, value="Processing rules").fill = sub_fill
     ws.cell(row=row, column=1).font = bold_font
     rules = [
-        "BDS: pcp2012, Jobtype B, excluding source group SIE_VN, grouped by GAC date and normalised job.",
+        "BDS: pcp2012, Jobtype B, excluding source group SIE_VN, grouped by GAC date and base job number.",
         "Reconciliation range: earliest through latest usable Ann Forecast PLAN EX-FTY month, including empty calendar months between them.",
-        "Ann baseline: Shipment Forecast PLAN EX-FTY rows, supplemented by unassigned/local BDS jobs absent from Shipment Forecast.",
-        "First detected month: all matching Local and VN weekly sheets replace the baseline for jobs actually shipped.",
+        "No fuzzy job correction: job numbers must match exactly. Unmatched weekly jobs remain separate and are reported for source correction.",
+        "Weekly summary rows beginning TOTALWEEK are ignored; SAMPLES is included when it has usable quantity and amount.",
+        "Actual quantity and amount are used when both are available; otherwise planned quantity and amount are used.",
+        "Exact duplicate Ann Forecast rows are counted once.",
+        "First two detected months: use Shipment Forecast, supplemented by unassigned/local BDS jobs absent from the forecast.",
+        "First detected month: weekly actuals replace only the exact forecast shipment line already actual; remaining forecast lines are retained.",
+        "Third detected month onward: Ann follows BDS exactly.",
         "Movement remarks are inferred by matching opposite-sign job variances across adjacent months.",
         "The fiscal summary reserves an editable Fx Adjustment row directly below Price Discrepancy. Its month values start at zero and are summed with all other variance reasons. Enter the signed variance shown in the approved reconciliation; a negative value increases Ann and reduces BDS - Ann.",
     ]
@@ -1138,40 +1345,83 @@ def _number(value: object) -> Optional[float]:
         return None
 
 
-def _normalise_job(value: object) -> str:
+def _normalise_job_code(value: object) -> str:
+    """Validate a job code without guessing or correcting its characters.
+
+    Case, outer whitespace, and Unicode dash presentation are standardised. A
+    malformed code is rejected rather than repaired. Valid but different codes
+    such as AM06008MS and AM060008MS remain distinct.
+    """
     text = _text(value).upper().replace("–", "-").replace("—", "-")
     if not text:
         return ""
-    text = text.split("-", 1)[0].strip()
-    text = re.sub(r"\s+", "", text)
+    if text in {"SAMPLE", "SAMPLES"}:
+        return text
     if len(text) < 6 or not any(char.isdigit() for char in text):
         return ""
-    if not re.fullmatch(r"[A-Z0-9]+", text):
+    if not re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)*", text):
         return ""
     return text
 
 
-def _match_canonical_job(job: str, canonical_jobs: Sequence[str]) -> str:
-    if not job or job in canonical_jobs:
-        return job
-    best = ""
-    best_score = 0.0
-    second_score = 0.0
-    for candidate in canonical_jobs:
-        if abs(len(candidate) - len(job)) > 1:
-            continue
-        if candidate[:4] != job[:4]:
-            continue
-        score = SequenceMatcher(None, job, candidate).ratio()
-        if score > best_score:
-            second_score = best_score
-            best_score = score
-            best = candidate
-        elif score > second_score:
-            second_score = score
-    if best_score >= 0.92 and best_score - second_score >= 0.02:
-        return best
-    return job
+def _job_group(full_job: str) -> str:
+    if full_job in {"SAMPLE", "SAMPLES"}:
+        return full_job
+    return full_job.split("-", 1)[0]
+
+
+def _normalise_job(value: object) -> str:
+    full_job = _normalise_job_code(value)
+    return _job_group(full_job) if full_job else ""
+
+
+def _normalise_identifier(value: object) -> str:
+    return re.sub(r"\s+", "", _text(value).upper())
+
+
+def _is_weekly_summary_job(value: object) -> bool:
+    compact = re.sub(r"[^A-Z0-9]", "", _text(value).upper())
+    return compact.startswith("TOTALWEEK")
+
+
+def _actual_or_planned(
+    actual_qty: Optional[float],
+    actual_amount: Optional[float],
+    planned_qty: Optional[float],
+    planned_amount: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    actual_available = (
+        actual_qty is not None
+        and actual_amount is not None
+        and abs(actual_qty) > 1e-12
+        and abs(actual_amount) > 1e-12
+    )
+    if actual_available:
+        return actual_qty, actual_amount
+    return planned_qty, planned_amount
+
+
+def _row_fingerprint(row: Sequence[object]) -> Tuple[object, ...]:
+    values: List[object] = []
+    for value in row:
+        if isinstance(value, datetime):
+            values.append(("datetime", value.isoformat()))
+        elif isinstance(value, date):
+            values.append(("date", value.isoformat()))
+        elif isinstance(value, float):
+            values.append(("number", round(value, 10)))
+        elif value is None:
+            values.append(None)
+        else:
+            values.append(("text", str(value).strip()))
+    return tuple(values)
+
+
+def _aggregate_lines(lines: Sequence[SourceLine]) -> JobMap:
+    result = _new_job_map()
+    for line in lines:
+        _add_pair(result, line.job, line.qty, line.amount)
+    return result
 
 
 def _month_key_from_value(value: object) -> Optional[str]:
