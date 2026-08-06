@@ -1447,6 +1447,16 @@ def process_logic(master_files, ppm_files, pps_files, log_emit, report_emit, deb
                     row_trace_steps.append(f"Raw remarks before consolidation: {'; '.join(remarks)}.")
                     remarks = refine_remarks(remarks, row_trace_steps)
 
+                if matched_ppm_entries and pps_files and remarks and all(
+                    remark == "No matching PPS found"
+                    or (remark.startswith("PPS OFOB missing ") and remark.endswith(" entry"))
+                    for remark in remarks
+                ):
+                    row_trace_steps.append(
+                        "Final consolidation: OCCC and PPM checks passed; PPS-only missing-entry remarks were cleared."
+                    )
+                    remarks = []
+
                 # --- Write Output ---
 
                 # 1. PRICE DIFF REMARKS
