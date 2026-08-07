@@ -85,7 +85,7 @@ class MainWidget(QWidget):
         self.set_long_description("")
 
         self.select_search_btn = PrimaryPushButton("Select PO Search Results Excel", self)
-        self.select_pdf_btn = PrimaryPushButton("Select Original PO PDF(s)", self)
+        self.select_original_btn = PrimaryPushButton("Select Original PO PDF(s) / Excel", self)
         self.run_btn = PrimaryPushButton("Run", self)
 
         self.files_label = QLabel("Selected files", self)
@@ -121,7 +121,7 @@ class MainWidget(QWidget):
         button_row_1 = QHBoxLayout()
         button_row_1.addStretch(1)
         button_row_1.addWidget(self.select_search_btn, 1)
-        button_row_1.addWidget(self.select_pdf_btn, 1)
+        button_row_1.addWidget(self.select_original_btn, 1)
         button_row_1.addStretch(1)
         main_layout.addLayout(button_row_1, 0)
 
@@ -142,7 +142,7 @@ class MainWidget(QWidget):
         main_layout.addLayout(body_row, 4)
 
         self.search_results_path = ""
-        self.pdf_paths: List[str] = []
+        self.original_po_paths: List[str] = []
 
     def set_long_description(self, text: str):
         clean = (text or "").strip()
@@ -155,7 +155,7 @@ class MainWidget(QWidget):
 
     def _connect_signals(self):
         self.select_search_btn.clicked.connect(self.select_search_results)
-        self.select_pdf_btn.clicked.connect(self.select_pdfs)
+        self.select_original_btn.clicked.connect(self.select_original_pos)
         self.run_btn.clicked.connect(self.run_process)
         self.log_message.connect(self.append_log)
         self.processing_done.connect(self.on_processing_done)
@@ -171,15 +171,15 @@ class MainWidget(QWidget):
             self.search_results_path = path
             self._refresh_files_box()
 
-    def select_pdfs(self):
+    def select_original_pos(self):
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select Original PO PDF(s)",
+            "Select Original PO PDF(s) or Excel file(s)",
             "",
-            "PDF files (*.pdf);;All files (*.*)",
+            "Supported files (*.pdf *.xlsx *.xlsm);;PDF files (*.pdf);;Excel files (*.xlsx *.xlsm);;All files (*.*)",
         )
         if files:
-            self.pdf_paths = list(files)
+            self.original_po_paths = list(files)
             self._refresh_files_box()
 
     def _refresh_files_box(self):
@@ -187,30 +187,30 @@ class MainWidget(QWidget):
         if self.search_results_path:
             lines.append("[PO Search Results Excel]")
             lines.append(self.search_results_path)
-        if self.pdf_paths:
+        if self.original_po_paths:
             lines.append("")
-            lines.append("[Original PO PDF(s)]")
-            lines.extend(self.pdf_paths)
+            lines.append("[Original PO PDF(s) / Excel]")
+            lines.extend(self.original_po_paths)
         self.files_box.setPlainText("\n".join(lines))
 
     def run_process(self):
         if not self.search_results_path:
             MessageBox("Warning", "Please select the PO search-results Excel file.", self).exec()
             return
-        if not self.pdf_paths:
-            MessageBox("Warning", "Please select at least one original PO PDF.", self).exec()
+        if not self.original_po_paths:
+            MessageBox("Warning", "Please select at least one original PO PDF or Excel file.", self).exec()
             return
 
         self.log_box.clear()
         self.log_message.emit("Process starts")
         self.run_btn.setEnabled(False)
         self.select_search_btn.setEnabled(False)
-        self.select_pdf_btn.setEnabled(False)
+        self.select_original_btn.setEnabled(False)
 
         def worker():
             ok, fail, out_path = 0, 0, ""
             try:
-                out_path = process_files(self.search_results_path, self.pdf_paths, self.log_message.emit)
+                out_path = process_files(self.search_results_path, self.original_po_paths, self.log_message.emit)
                 ok = 1
             except Exception as exc:
                 fail = 1
@@ -229,7 +229,7 @@ class MainWidget(QWidget):
         self.log_message.emit(f"Completed: {ok} success, {fail} failed.")
         self.run_btn.setEnabled(True)
         self.select_search_btn.setEnabled(True)
-        self.select_pdf_btn.setEnabled(True)
+        self.select_original_btn.setEnabled(True)
 
         title = "Processing complete" if fail == 0 else "Processing finished with issues"
         lines = [f"Success: {ok}", f"Failed: {fail}"]
@@ -273,6 +273,13 @@ REQUIRED_SEARCH_HEADERS = [
     "Size Description",
     "Size Quantity",
     "Item Text",
+]
+
+REQUIRED_ORIGINAL_EXCEL_HEADERS = [
+    "Purchase Order Number",
+    "PO Line Item Number",
+    "Size Description",
+    "Size Quantity",
 ]
 
 DIVERT_TO_RE = re.compile(
@@ -366,10 +373,10 @@ class LogCollector:
 # -----------------------------------------------------------------------------
 
 
-def process_files(search_results_path: str, pdf_paths: List[str], log_emit: Optional[Callable[[str], None]] = None) -> str:
+def process_files(search_results_path: str, original_po_paths: List[str], log_emit: Optional[Callable[[str], None]] = None) -> str:
     logger = LogCollector(log_emit)
     processor = PODivertProcessor(logger)
-    return processor.process(search_results_path, pdf_paths)
+    return processor.process(search_results_path, original_po_paths)
 
 
 class PODivertProcessor:
@@ -377,20 +384,26 @@ class PODivertProcessor:
         self.log = log
         self.warnings: List[str] = []
 
-    def process(self, search_results_path: str, pdf_paths: List[str]) -> str:
-        self._require_files(search_results_path, pdf_paths)
+    def process(self, search_results_path: str, original_po_paths: List[str]) -> str:
+        self._require_files(search_results_path, original_po_paths)
 
         self.log("Reading PO search-results workbook...")
         search_groups, events = read_search_results(search_results_path, self.log)
         self.log(f"Loaded {len(search_groups)} PO/line groups from search results.")
         self.log(f"Parsed {len(events)} diverted-to item-text events from search results.")
 
-        self.log("Reading original PO PDF(s)...")
+        self.log("Reading original PO file(s)...")
         original_groups: Dict[Tuple[int, int], OrderedDict[str, int]] = {}
-        for pdf_path in pdf_paths:
-            pdf_groups = read_original_pdf(pdf_path, self.log)
-            original_groups.update(pdf_groups)
-            self.log(f"Loaded {len(pdf_groups)} original PO line groups from {os.path.basename(pdf_path)}.")
+        for original_po_path in original_po_paths:
+            extension = os.path.splitext(original_po_path)[1].lower()
+            if extension == ".pdf":
+                file_groups = read_original_pdf(original_po_path, self.log)
+            elif extension in {".xlsx", ".xlsm"}:
+                file_groups = read_original_excel(original_po_path, self.log)
+            else:
+                raise ValueError(f"Unsupported original PO file type: {os.path.basename(original_po_path)}")
+            original_groups.update(file_groups)
+            self.log(f"Loaded {len(file_groups)} original PO line groups from {os.path.basename(original_po_path)}.")
 
         target_results = build_target_results(search_groups, original_groups, events, self.log)
         if not target_results:
@@ -404,14 +417,14 @@ class PODivertProcessor:
         return out_path
 
     @staticmethod
-    def _require_files(search_results_path: str, pdf_paths: List[str]):
+    def _require_files(search_results_path: str, original_po_paths: List[str]):
         if not search_results_path or not os.path.isfile(search_results_path):
             raise FileNotFoundError("PO search-results Excel file was not found.")
-        if not pdf_paths:
-            raise FileNotFoundError("No original PO PDF was selected.")
-        missing = [p for p in pdf_paths if not os.path.isfile(p)]
+        if not original_po_paths:
+            raise FileNotFoundError("No original PO PDF or Excel file was selected.")
+        missing = [p for p in original_po_paths if not os.path.isfile(p)]
         if missing:
-            raise FileNotFoundError("Missing PDF file(s): " + ", ".join(missing))
+            raise FileNotFoundError("Missing original PO file(s): " + ", ".join(missing))
 
 
 # -----------------------------------------------------------------------------
@@ -576,8 +589,62 @@ def parse_divert_from_records(text: str) -> List[DivertFromEvent]:
 
 
 # -----------------------------------------------------------------------------
-# PDF reader
+# Original PO readers
 # -----------------------------------------------------------------------------
+
+
+def read_original_excel(path: str, log: Optional[Callable[[str], None]] = None) -> Dict[Tuple[int, int], OrderedDict[str, int]]:
+    logger = log or (lambda _msg: None)
+    wb = load_workbook(path, data_only=True, read_only=True)
+    try:
+        groups: Dict[Tuple[int, int], OrderedDict[str, int]] = {}
+        processed_sheets: List[str] = []
+        skipped_sheets: List[str] = []
+
+        for ws in wb.worksheets:
+            try:
+                header_row = next(ws.iter_rows(min_row=1, max_row=1))
+            except StopIteration:
+                skipped_sheets.append(f"{ws.title} (empty)")
+                continue
+
+            header_map = build_header_map([cell.value for cell in header_row])
+            missing = [h for h in REQUIRED_ORIGINAL_EXCEL_HEADERS if canonical_header(h) not in header_map]
+            if missing:
+                skipped_sheets.append(f"{ws.title} (missing: {', '.join(missing)})")
+                continue
+
+            processed_sheets.append(ws.title)
+            sheet_data_rows = 0
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                po = to_optional_int(get_by_header(row, header_map, "Purchase Order Number"))
+                line = to_optional_int(get_by_header(row, header_map, "PO Line Item Number"))
+                size = normalize_size(get_by_header(row, header_map, "Size Description"))
+                if po is None or line is None or not size:
+                    continue
+
+                qty = to_int(get_by_header(row, header_map, "Size Quantity"))
+                key = (po, line)
+                if key not in groups:
+                    groups[key] = OrderedDict()
+                groups[key][size] = groups[key].get(size, 0) + qty
+                sheet_data_rows += 1
+
+            logger(f"Read worksheet '{ws.title}': {sheet_data_rows} original PO Excel row(s).")
+
+        if not processed_sheets:
+            detail = "; ".join(skipped_sheets) if skipped_sheets else "No worksheets were found."
+            raise ValueError(
+                "No worksheet with the required original PO Excel headers was found. "
+                f"Checked: {detail}"
+            )
+        if skipped_sheets:
+            logger("Skipped worksheet(s) without the required original PO Excel headers: " + "; ".join(skipped_sheets))
+        if not groups:
+            raise ValueError(f"No item size rows were extracted from original PO Excel: {os.path.basename(path)}")
+        return groups
+    finally:
+        wb.close()
 
 
 def read_original_pdf(path: str, log: Optional[Callable[[str], None]] = None) -> Dict[Tuple[int, int], OrderedDict[str, int]]:
@@ -1085,11 +1152,7 @@ def write_section_row(
 
     normalized_values = {normalize_size(size): to_int(qty) for size, qty in (size_values or {}).items()}
     for offset, header in enumerate(size_headers_as_text):
-        value = normalized_values.get(header, 0)
-        if value != 0:
-            ws.cell(row=row, column=size_start + offset, value=value)
-        elif header in normalized_values:
-            ws.cell(row=row, column=size_start + offset, value=0)
+        ws.cell(row=row, column=size_start + offset, value=normalized_values.get(header, 0))
 
     first_size_letter = get_column_letter(size_start)
     last_size_letter = get_column_letter(total_col - 1)
