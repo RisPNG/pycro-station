@@ -28,7 +28,7 @@ DATE_DISPLAY_FORMAT = "d-mmm"
 AMOUNT_DISPLAY_FORMAT = "#,##0.00"
 PAYMENT_DAYS_DISPLAY_FORMAT = "0"
 
-PDF_INVOICE_REF_RE = r"\d{2}[A-Z]\d{4,5}"
+PDF_INVOICE_REF_RE = r"\d{2}[A-Z]\d{4,5}[A-Z]?"
 PDF_MONEY_RE = r"\(?[\d,]+\.\d{2}\)?"
 PDF_INVOICE_ROW_RE = re.compile(
     rf"^(?P<ref>{PDF_INVOICE_REF_RE})\s+"
