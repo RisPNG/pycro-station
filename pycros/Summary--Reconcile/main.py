@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.2.0"
+PYCRO_VERSION = "1.2.1"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -491,19 +491,21 @@ def _read_shipment_forecast(
     wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
         ws = wb["SHIPMENTS"]
+        columns, header_row = _detect_shipment_columns(ws)
+        max_col = max(columns.values())
         for row_number, row in enumerate(
-            ws.iter_rows(min_row=6, max_col=40, values_only=True),
-            start=6,
+            ws.iter_rows(min_row=header_row + 1, max_col=max_col, values_only=True),
+            start=header_row + 1,
         ):
-            full_job = _normalise_job_code(_at(row, 4))
+            full_job = _normalise_job_code(_at(row, columns["job"]))
             if not full_job:
                 continue
             job = _job_group(full_job)
 
-            planned_qty = _number(_at(row, 5))
-            planned_amount = _number(_at(row, 14))
-            actual_qty = _number(_at(row, 26))
-            actual_amount = _number(_at(row, 27))
+            planned_qty = _number(_at(row, columns["planned_qty"]))
+            planned_amount = _number(_at(row, columns["planned_amount"]))
+            actual_qty = _number(_at(row, columns.get("actual_qty", 0)))
+            actual_amount = _number(_at(row, columns.get("actual_amount", 0)))
             qty, amount = _actual_or_planned(
                 actual_qty,
                 actual_amount,
@@ -513,7 +515,7 @@ def _read_shipment_forecast(
             if qty is None or amount is None:
                 continue
 
-            month = _month_key_from_value(_at(row, 20))  # T / PLAN EX-FTY
+            month = _month_key_from_value(_at(row, columns["plan_ex_fty"]))
             if not month:
                 ignored_missing_month += 1
                 continue
@@ -534,8 +536,8 @@ def _read_shipment_forecast(
                     job=job,
                     qty=qty,
                     amount=amount,
-                    invoice=_normalise_identifier(_at(row, 6)),
-                    po=_normalise_identifier(_at(row, 7)),
+                    invoice=_normalise_identifier(_at(row, columns.get("invoice", 0))),
+                    po=_normalise_identifier(_at(row, columns.get("po", 0))),
                     source="Shipment Forecast",
                     row_number=row_number,
                 )
@@ -586,6 +588,54 @@ def _read_shipment_forecast(
             f"{len(grouped):,} jobs, qty {qty:,.0f}, amount {amount:,.2f}"
         )
     return shipment, counts, months, warnings
+
+
+def _detect_shipment_columns(ws) -> Tuple[Dict[str, int], int]:
+    aliases = {
+        "job": {"JOB", "JOB NO", "JOB NUMBER"},
+        "planned_qty": {
+            "QTY", "QUANTITY", "FG", "FG QTY", "TOTAL QTY", "TTL QTY",
+            "PLAN QTY", "PLAN QUANTITY", "PLANNED QTY", "PLANNED QUANTITY",
+        },
+        "planned_amount": {
+            "AMOUNT", "AMT", "TOTAL AMOUNT", "TOTAL AMT", "TTL AMOUNT",
+            "TTL AMT", "PLAN AMOUNT", "PLAN AMT", "PLANNED AMOUNT",
+            "PLANNED AMT",
+        },
+        "plan_ex_fty": {
+            "PLAN EX FTY", "PLAN EXFTY", "PLAN EX FACTORY",
+            "PLANNED EX FTY", "PLANNED EXFTY", "PLANNED EX FACTORY",
+        },
+        "actual_qty": {
+            "ACT QTY", "ACT QUANTITY", "ACTUAL QTY", "ACTUAL QUANTITY",
+            "SHIP QTY", "SHIPPED QTY",
+        },
+        "actual_amount": {
+            "ACT AMOUNT", "ACT AMT", "ACTUAL AMOUNT", "ACTUAL AMT",
+            "SHIP AMOUNT", "SHIP AMT", "SHIPPED AMOUNT", "SHIPPED AMT",
+        },
+        "invoice": {"INV", "INV NO", "INVOICE", "INVOICE NO", "INVOICE NUMBER"},
+        "po": {"PO", "PO NO", "PO NUMBER", "PURCHASE ORDER"},
+    }
+    required = {"job", "planned_qty", "planned_amount", "plan_ex_fty"}
+
+    for row_number, row in enumerate(
+        ws.iter_rows(min_row=1, max_row=min(ws.max_row, 20), values_only=True),
+        start=1,
+    ):
+        columns: Dict[str, int] = {}
+        for column, value in enumerate(row, start=1):
+            header = re.sub(r"[^A-Z0-9]+", " ", _text(value).upper()).strip()
+            for field, names in aliases.items():
+                if field not in columns and header in names:
+                    columns[field] = column
+        if required <= columns.keys():
+            return columns, row_number
+
+    raise ValueError(
+        "SHIPMENTS header row was not found in the first 20 rows. Required "
+        "columns are JOB, quantity, amount, and PLAN EX-FTY."
+    )
 
 
 def _read_weekly_actuals(
