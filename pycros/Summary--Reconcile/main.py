@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.2.1"
+PYCRO_VERSION = "1.2.4"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -70,6 +70,7 @@ class SourceLine:
 
 
 ShipmentLines = Dict[str, List[SourceLine]]
+ShipmentStatuses = Dict[str, Dict[str, float]]
 
 
 @dataclass
@@ -296,10 +297,13 @@ def process_reconciliation(
     _validate_input_paths(paths)
     _validate_workbook_signatures(paths, log)
 
-    shipment_lines, _shipment_counts, months, shipment_warnings = _read_shipment_forecast(
-        paths[ROLE_SHIPMENT],
-        log,
-    )
+    (
+        shipment_lines,
+        shipment_statuses,
+        _shipment_counts,
+        months,
+        shipment_warnings,
+    ) = _read_shipment_forecast(paths[ROLE_SHIPMENT], log)
     range_text = (
         f"{_month_display(months[0])} to {_month_display(months[-1])} "
         f"({len(months)} month{'s' if len(months) != 1 else ''})"
@@ -345,6 +349,7 @@ def process_reconciliation(
         months=months,
         bds=bds,
         ann=ann,
+        shipment_statuses=shipment_statuses,
         weekly_sheets=weekly_sheets,
         unmatched_weekly_jobs=unmatched_weekly_jobs,
         warnings=warnings,
@@ -473,21 +478,24 @@ def _read_bds(
 def _read_shipment_forecast(
     path: str,
     log: LogFn,
-) -> Tuple[ShipmentLines, Dict[str, int], List[str], List[str]]:
+) -> Tuple[ShipmentLines, ShipmentStatuses, Dict[str, int], List[str], List[str]]:
     """Read Ann Forecast lines and derive the contiguous reconciliation range.
 
-    Exact duplicate source rows are ignored. For each line, actual quantity and
-    actual amount are used when both are available; otherwise the planned
-    quantity and amount are used. Full job codes are retained for exact weekly
-    matching, while reconciliation output remains grouped by the base job code.
+    For each line, actual quantity and actual amount are used when available;
+    otherwise the planned quantity and amount are used. Full job codes are
+    retained for exact weekly matching, while reconciliation output remains
+    grouped by the base job code.
+
+    A re-priced order line is re-issued under a later BUY MTH without a CW
+    code, so the same order appears twice at two prices. Only the line that
+    still carries a CW code is the live one; the CW-less twin is superseded.
     """
     log(f"Reading shipment forecast: {os.path.basename(path)}")
-    discovered: Dict[str, List[SourceLine]] = defaultdict(list)
+    discovered: Dict[str, List[Tuple[str, SourceLine]]] = defaultdict(list)
+    shipment_statuses: DefaultDict[str, DefaultDict[str, float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
     ignored_missing_month = 0
-    duplicate_rows = 0
-    duplicate_examples: List[str] = []
-    seen_rows = set()
-
     wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
         ws = wb["SHIPMENTS"]
@@ -515,22 +523,20 @@ def _read_shipment_forecast(
             if qty is None or amount is None:
                 continue
 
-            month = _month_key_from_value(_at(row, columns["plan_ex_fty"]))
+            plan_ex_fty = _at(row, columns["plan_ex_fty"])
+            plan_ex_fty_text = _text(plan_ex_fty).upper()
+            if plan_ex_fty_text in {"SHORTSHIP", "TBA"}:
+                status = "shortship" if plan_ex_fty_text == "SHORTSHIP" else "TBA"
+                shipment_statuses[job][status] += qty
+                continue
+
+            month = _month_key_from_value(plan_ex_fty)
             if not month:
                 ignored_missing_month += 1
                 continue
 
-            fingerprint = _row_fingerprint(row)
-            if fingerprint in seen_rows:
-                duplicate_rows += 1
-                if len(duplicate_examples) < 20:
-                    duplicate_examples.append(
-                        f"SHIPMENTS row {row_number}: {_text(_at(row, 4)) or '(blank job)'}"
-                    )
-                continue
-            seen_rows.add(fingerprint)
-
-            discovered[month].append(
+            discovered[month].append((
+                _text(_at(row, columns.get("colourway", 0))),
                 SourceLine(
                     full_job=full_job,
                     job=job,
@@ -540,12 +546,27 @@ def _read_shipment_forecast(
                     po=_normalise_identifier(_at(row, columns.get("po", 0))),
                     source="Shipment Forecast",
                     row_number=row_number,
-                )
-            )
+                ),
+            ))
     finally:
         wb.close()
 
-    populated_months = sorted(discovered)
+    retained: Dict[str, List[SourceLine]] = {}
+    superseded: List[SourceLine] = []
+    for month, buffered in discovered.items():
+        live_orders = {
+            (line.full_job, line.po)
+            for colourway, line in buffered
+            if colourway
+        }
+        retained[month] = []
+        for colourway, line in buffered:
+            if not colourway and (line.full_job, line.po) in live_orders:
+                superseded.append(line)
+            else:
+                retained[month].append(line)
+
+    populated_months = sorted(retained)
     if not populated_months:
         raise ValueError(
             "Ann Forecast has no usable SHIPMENTS rows with job, quantity, "
@@ -554,11 +575,22 @@ def _read_shipment_forecast(
 
     months = _month_range(populated_months[0], populated_months[-1])
     shipment: ShipmentLines = {month: [] for month in months}
-    for month, lines in discovered.items():
+    for month, lines in retained.items():
         shipment[month] = lines
 
     warnings: List[str] = []
-    missing_months = [month for month in months if month not in discovered]
+    if superseded:
+        detail = ", ".join(
+            f"{line.full_job} row {line.row_number} ({line.qty:,.0f} / {line.amount:,.2f})"
+            for line in superseded
+        )
+        warning = (
+            f"Dropped {len(superseded):,} superseded Ann row(s) re-issued "
+            f"without a CW code against a live order line: {detail}"
+        )
+        warnings.append(warning)
+        log(warning)
+    missing_months = [month for month in months if month not in retained]
     if missing_months:
         warning = (
             "Ann Forecast has no usable rows in intermediate month(s): "
@@ -573,12 +605,6 @@ def _read_shipment_forecast(
         )
         warnings.append(warning)
         log(warning)
-    if duplicate_rows:
-        warning = f"Ignored {duplicate_rows:,} exact duplicate Ann Forecast row(s)."
-        warnings.append(warning)
-        log(warning)
-        warnings.extend(duplicate_examples)
-
     counts = {month: len(shipment[month]) for month in months}
     for month in months:
         grouped = _aggregate_lines(shipment[month])
@@ -587,7 +613,13 @@ def _read_shipment_forecast(
             f"Shipment {_month_display(month)}: {counts[month]:,} unique lines, "
             f"{len(grouped):,} jobs, qty {qty:,.0f}, amount {amount:,.2f}"
         )
-    return shipment, counts, months, warnings
+    return (
+        shipment,
+        {job: dict(statuses) for job, statuses in shipment_statuses.items()},
+        counts,
+        months,
+        warnings,
+    )
 
 
 def _detect_shipment_columns(ws) -> Tuple[Dict[str, int], int]:
@@ -616,6 +648,7 @@ def _detect_shipment_columns(ws) -> Tuple[Dict[str, int], int]:
         },
         "invoice": {"INV", "INV NO", "INVOICE", "INVOICE NO", "INVOICE NUMBER"},
         "po": {"PO", "PO NO", "PO NUMBER", "PURCHASE ORDER"},
+        "colourway": {"CW", "COLOURWAY", "COLORWAY", "CW CODE"},
     }
     required = {"job", "planned_qty", "planned_amount", "plan_ex_fty"}
 
@@ -737,7 +770,9 @@ def _read_weekly_actuals(
         {
             line.job
             for line in lines
-            if line.job not in canonical and line.job not in {"SAMPLE", "SAMPLES"}
+            if line.job not in canonical
+            and line.job not in {"SAMPLE", "SAMPLES"}
+            and "SSS" not in line.job
         }
     )
     for job in unmatched_weekly_jobs:
@@ -773,16 +808,14 @@ def _build_ann_maps(
     The first two detected months use Shipment Forecast. The first month also
     uses weekly actuals, replacing only the exact forecast line already shipped
     and retaining all remaining forecast lines. From the third month onward,
-    Ann follows BDS exactly.
+    Ann remains blank for comparison against Finance.
     """
     ann = _new_month_maps(months)
     warnings: List[str] = []
 
     for index, month in enumerate(months):
         if index >= 2:
-            for job, pair in bds[month].items():
-                ann[month][job] = pair.copy()
-            log(f"Ann {_month_display(month)} follows BDS (month {index + 1} onward)")
+            log(f"Ann {_month_display(month)} is blank for Finance comparison")
             continue
 
         remaining = list(shipment[month])
@@ -857,6 +890,7 @@ def _write_result_workbook(
     months: Sequence[str],
     bds: MonthMaps,
     ann: MonthMaps,
+    shipment_statuses: ShipmentStatuses,
     weekly_sheets: Sequence[str],
     unmatched_weekly_jobs: Sequence[str],
     warnings: Sequence[str],
@@ -873,6 +907,7 @@ def _write_result_workbook(
             months,
             bds,
             ann,
+            shipment_statuses,
             options.quantity_tolerance,
             options.amount_tolerance,
         )
@@ -907,6 +942,7 @@ def _build_reconciliation_rows(
     months: Sequence[str],
     bds: MonthMaps,
     ann: MonthMaps,
+    shipment_statuses: ShipmentStatuses,
     qty_tolerance: float,
     amount_tolerance: float,
 ) -> List[Tuple[str, float, float, float, float, str]]:
@@ -921,6 +957,7 @@ def _build_reconciliation_rows(
             months,
             bds,
             ann,
+            shipment_statuses,
             qty_tolerance,
             amount_tolerance,
         )
@@ -934,6 +971,7 @@ def _classify_variance(
     months: Sequence[str],
     bds: MonthMaps,
     ann: MonthMaps,
+    shipment_statuses: ShipmentStatuses,
     qty_tolerance: float,
     amount_tolerance: float,
 ) -> str:
@@ -944,40 +982,50 @@ def _classify_variance(
     if abs(dq) <= qty_tolerance and abs(da) <= amount_tolerance:
         return ""
 
-    index = months.index(month)
-    signal = dq if abs(dq) > qty_tolerance else da
-    prev_signal = None
-    next_signal = None
-    if index > 0:
-        pbq, pba = bds[months[index - 1]].get(job, [0.0, 0.0])
-        paq, paa = ann[months[index - 1]].get(job, [0.0, 0.0])
-        prev_signal = (pbq - paq) if abs(pbq - paq) > qty_tolerance else (pba - paa)
-    if index + 1 < len(months):
-        nbq, nba = bds[months[index + 1]].get(job, [0.0, 0.0])
-        naq, naa = ann[months[index + 1]].get(job, [0.0, 0.0])
-        next_signal = (nbq - naq) if abs(nbq - naq) > qty_tolerance else (nba - naa)
-
-    if signal > 0 and next_signal is not None and next_signal < 0:
-        return f"Delay ship fr {_month_display(month)} to {_month_display(months[index + 1])}"
-    if signal < 0 and next_signal is not None and next_signal > 0:
-        return f"Early ship fr {_month_display(months[index + 1])} to {_month_display(month)}"
-    if signal < 0 and prev_signal is not None and prev_signal > 0:
-        return f"Delay ship fr {_month_display(months[index - 1])} to {_month_display(month)}"
-    if signal > 0 and prev_signal is not None and prev_signal < 0:
-        return f"Early ship fr {_month_display(month)} to {_month_display(months[index - 1])}"
-
     upper_job = job.upper()
-    if "SAMPLE" in upper_job:
-        return "Sample"
-    if abs(bq) <= qty_tolerance and abs(ba) <= amount_tolerance:
-        return "Demand Pull"
-    if abs(aq) <= qty_tolerance and abs(aa) <= amount_tolerance:
-        return "Missing"
     if abs(dq) <= qty_tolerance and abs(da) > amount_tolerance:
         return "Price Discrepancy"
-    if abs(dq) > qty_tolerance:
-        return "Short Ship" if dq > 0 else "Quantity Variance"
-    return "Amount Variance"
+    if upper_job in {"SAMPLE", "SAMPLES"} or upper_job[5:8] == "SSS":
+        return "Salesman Sample"
+    if len(upper_job) > 5 and upper_job[5].isalpha():
+        return "Demand Pull"
+
+    index = months.index(month)
+    movement_match = None
+    for other_index, other_month in enumerate(months):
+        if other_index == index:
+            continue
+        other_bq, _other_ba = bds[other_month].get(job, [0.0, 0.0])
+        other_aq, _other_aa = ann[other_month].get(job, [0.0, 0.0])
+        other_dq = other_bq - other_aq
+        if (
+            abs(other_dq) > qty_tolerance
+            and abs(dq + other_dq) <= qty_tolerance
+        ):
+            candidate = (abs(other_index - index), other_index, other_dq)
+            if movement_match is None or candidate < movement_match:
+                movement_match = candidate
+
+    if movement_match is not None:
+        _distance, other_index, other_dq = movement_match
+        earlier_index = min(index, other_index)
+        later_index = max(index, other_index)
+        earlier_dq = dq if index == earlier_index else other_dq
+        if earlier_dq > 0:
+            return (
+                f"Delay ship fr {_month_display(months[earlier_index])} "
+                f"to {_month_display(months[later_index])}"
+            )
+        return (
+            f"Early ship fr {_month_display(months[later_index])} "
+            f"to {_month_display(months[earlier_index])}"
+        )
+
+    for status, status_qty in shipment_statuses.get(job, {}).items():
+        if abs(abs(dq) - abs(status_qty)) <= qty_tolerance:
+            return status
+
+    return "Missing"
 
 
 def _write_summary_sheet(
@@ -1315,13 +1363,17 @@ def _write_audit_sheet(
         "BDS: pcp2012, Jobtype B, excluding source group SIE_VN, grouped by GAC date and base job number.",
         "Reconciliation range: earliest through latest usable Ann Forecast PLAN EX-FTY month, including empty calendar months between them.",
         "No fuzzy job correction: job numbers must match exactly. Unmatched weekly jobs remain separate and are reported for source correction.",
-        "Weekly summary rows beginning TOTALWEEK are ignored; SAMPLES is included when it has usable quantity and amount.",
+        "Weekly summary rows beginning TOTALWEEK are ignored; SAMPLES and job numbers whose sixth through eighth characters are SSS are treated as Salesman Sample.",
+        "A job number whose sixth character is a letter and whose sixth through eighth characters are not SSS is treated as Demand Pull.",
         "Actual quantity and amount are used when both are available; otherwise planned quantity and amount are used.",
-        "Exact duplicate Ann Forecast rows are counted once.",
+        "Repeated Ann Forecast rows are retained because identical rows can represent separate shipment quantities.",
+        "An Ann Forecast line re-issued under a later BUY MTH without a CW code is a superseded re-pricing of a live order line with the same job number and PO, so it is dropped instead of added twice.",
         "First two detected months: use Shipment Forecast, supplemented by unassigned/local BDS jobs absent from the forecast.",
         "First detected month: weekly actuals replace only the exact forecast shipment line already actual; remaining forecast lines are retained.",
-        "Third detected month onward: Ann follows BDS exactly.",
-        "Movement remarks are inferred by matching opposite-sign job variances across adjacent months.",
+        "Third detected month onward: Ann remains blank for comparison against Finance.",
+        "Movement remarks require the same job number and equal-and-opposite quantity variances across reconciliation months.",
+        "Shipment Forecast rows whose PLAN EX-FTY value is shortship or TBA are grouped by base job number; a matching variance quantity uses that source status.",
+        "A remaining quantity variance that does not match another reconciliation month or a Shipment Forecast status quantity is Missing.",
         "The fiscal summary reserves an editable Fx Adjustment row directly below Price Discrepancy. Its month values start at zero and are summed with all other variance reasons. Enter the signed variance shown in the approved reconciliation; a negative value increases Ann and reduces BDS - Ann.",
     ]
     row += 1
@@ -1444,27 +1496,10 @@ def _actual_or_planned(
         actual_qty is not None
         and actual_amount is not None
         and abs(actual_qty) > 1e-12
-        and abs(actual_amount) > 1e-12
     )
     if actual_available:
         return actual_qty, actual_amount
     return planned_qty, planned_amount
-
-
-def _row_fingerprint(row: Sequence[object]) -> Tuple[object, ...]:
-    values: List[object] = []
-    for value in row:
-        if isinstance(value, datetime):
-            values.append(("datetime", value.isoformat()))
-        elif isinstance(value, date):
-            values.append(("date", value.isoformat()))
-        elif isinstance(value, float):
-            values.append(("number", round(value, 10)))
-        elif value is None:
-            values.append(None)
-        else:
-            values.append(("text", str(value).strip()))
-    return tuple(values)
 
 
 def _aggregate_lines(lines: Sequence[SourceLine]) -> JobMap:
