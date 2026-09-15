@@ -758,13 +758,14 @@ def parse_pdf_total_line(line: str) -> Optional[int]:
 def build_allocations_from_divert_from_records(
     target_group: POGroup,
     records: List[DivertFromEvent],
+    source_size_limits: Dict[Tuple[int, int], Dict[str, int]],
     log: Optional[Callable[[str], None]] = None,
 ) -> Optional[TargetResult]:
     """
     Some SAP search-result rows only show the complete source breakdown in the
     target row's "Diverted from" text.  Those records do not reliably expose the
     target size ordinal, so we assign the quantities by solving them against the
-    target line's final size quantities.
+    target line's final size quantities and available source size quantities.
 
     Example:
         target XS/S/M/L/XL = 48/36/168/444/504
@@ -785,7 +786,7 @@ def build_allocations_from_divert_from_records(
     if not target_sizes:
         return None
 
-    assignments = solve_event_partition(usable_records, target_sizes)
+    assignments = solve_event_partition(usable_records, target_sizes, source_size_limits)
     if assignments is None:
         return None
 
@@ -818,8 +819,12 @@ def build_allocations_from_divert_from_records(
 def solve_event_partition(
     records: List[DivertFromEvent],
     target_sizes: "OrderedDict[str, int]",
+    source_size_limits: Dict[Tuple[int, int], Dict[str, int]],
 ) -> Optional["OrderedDict[str, Tuple[int, ...]]"]:
-    size_targets = [(size, qty) for size, qty in target_sizes.items() if qty > 0]
+    size_targets = sorted(
+        ((size, qty) for size, qty in target_sizes.items() if qty > 0),
+        key=lambda item: (SIZE_HEADERS_AS_TEXT.index(item[0]) if item[0] in SIZE_HEADERS_AS_TEXT else len(SIZE_HEADERS_AS_TEXT), item[0]),
+    )
     total_target = sum(qty for _size, qty in size_targets)
     total_records = sum(record.qty for record in records)
     if total_records < total_target:
@@ -837,7 +842,20 @@ def solve_event_partition(
             return []
 
         size, required_qty = size_targets[size_index]
-        for subset in candidate_record_subsets(records, remaining, required_qty):
+        eligible = tuple(
+            idx for idx in remaining
+            if (records[idx].source_po, records[idx].source_line) not in source_size_limits
+            or records[idx].qty <= source_size_limits[(records[idx].source_po, records[idx].source_line)].get(size, 0)
+        )
+        for subset in candidate_record_subsets(records, eligible, required_qty):
+            source_quantities: DefaultDict[Tuple[int, int], int] = defaultdict(int)
+            for idx in subset:
+                source_quantities[(records[idx].source_po, records[idx].source_line)] += records[idx].qty
+            if any(
+                key in source_size_limits and qty > source_size_limits[key].get(size, 0)
+                for key, qty in source_quantities.items()
+            ):
+                continue
             subset_set = set(subset)
             next_remaining = tuple(idx for idx in remaining if idx not in subset_set)
             tail = solve_size(size_index + 1, next_remaining)
@@ -880,13 +898,14 @@ def candidate_record_subsets(
         if current_qty + suffix_sums[pos] < target_qty:
             return False
 
-        previous_qty_at_level: Optional[int] = None
+        previous_records_at_level: set[Tuple[int, int, int]] = set()
         for next_pos in range(pos, len(ordered_indices)):
             record_index = ordered_indices[next_pos]
             qty = records[record_index].qty
-            if previous_qty_at_level == qty:
+            record_key = (records[record_index].source_po, records[record_index].source_line, qty)
+            if record_key in previous_records_at_level:
                 continue
-            previous_qty_at_level = qty
+            previous_records_at_level.add(record_key)
             if current_qty + qty > target_qty:
                 continue
             chosen.append(record_index)
@@ -919,16 +938,19 @@ def build_target_results(
 
     source_delta_remaining: DefaultDict[Tuple[int, int], DefaultDict[str, int]] = defaultdict(lambda: defaultdict(int))
 
-    for key in sorted(search_groups):
-        ori_sizes = original_groups.get(key, OrderedDict())
-        now_sizes = search_groups[key].sizes
-        for size in SIZE_HEADERS_AS_TEXT:
+    for key, ori_sizes in original_groups.items():
+        source_delta_remaining[key] = defaultdict(int)
+        now_group = search_groups.get(key)
+        now_sizes = now_group.sizes if now_group else {}
+        for size in ori_sizes:
             delta = ori_sizes.get(size, 0) - now_sizes.get(size, 0)
             if delta > 0:
                 source_delta_remaining[key][size] = delta
 
+    source_size_limits = {key: dict(sizes) for key, sizes in source_delta_remaining.items()}
+
     events_by_target: DefaultDict[Tuple[int, int], List[DivertEvent]] = defaultdict(list)
-    for event in sorted(events, key=lambda e: (e.source_row_order, e.source_line, e.target_line, e.target_ordinal)):
+    for event in sorted(events, key=lambda e: (e.source_po, e.source_line, e.target_line, e.target_ordinal)):
         events_by_target[(event.target_po, event.target_line)].append(event)
 
     results: List[TargetResult] = []
@@ -938,7 +960,9 @@ def build_target_results(
             continue
 
         divert_from_records = parse_divert_from_records(target_group.item_text)
-        from_result = build_allocations_from_divert_from_records(target_group, divert_from_records, logger)
+        from_result = build_allocations_from_divert_from_records(
+            target_group, divert_from_records, source_size_limits, logger
+        )
         if from_result is not None:
             results.append(from_result)
             continue
@@ -948,7 +972,10 @@ def build_target_results(
                 "matched exactly to target sizes. Falling back to diverted-to/source-delta matching."
             )
 
-        target_size_order = list(target_group.sizes.keys())
+        target_size_order = sorted(
+            target_group.sizes,
+            key=lambda size: (SIZE_HEADERS_AS_TEXT.index(size) if size in SIZE_HEADERS_AS_TEXT else len(SIZE_HEADERS_AS_TEXT), size),
+        )
         target_remaining: Dict[str, int] = dict(target_group.sizes)
         allocations: DefaultDict[Tuple[int, int], DefaultDict[str, int]] = defaultdict(lambda: defaultdict(int))
         referenced_sources: List[Tuple[int, int]] = []
