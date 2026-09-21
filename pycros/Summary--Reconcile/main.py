@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.2.4"
+PYCRO_VERSION = "1.3.0"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -311,7 +311,8 @@ def process_reconciliation(
     range_callback(range_text)
     log(f"Reconciliation months detected from Ann Forecast: {range_text}")
 
-    bds, supplements, bds_counts = _read_bds(paths[ROLE_BSD], months, log)
+    previous_month = _month_key(_add_months(date.fromisoformat(months[0] + "-01"), -1))
+    bds, supplements, bds_counts = _read_bds(paths[ROLE_BSD], [previous_month, *months], log)
 
     canonical_jobs = set()
     for month in months:
@@ -334,8 +335,12 @@ def process_reconciliation(
         weekly_lines,
         log,
     )
-    ann_counts = {month: len(ann[month]) for month in months}
-    warnings = list(shipment_warnings) + list(weekly_warnings) + list(build_warnings)
+    previous_actuals, previous_sheets, _previous_unmatched, previous_warnings = _read_weekly_actuals(
+        paths[ROLE_LOCAL], paths[ROLE_VN], previous_month, canonical_jobs, log,
+        report_unmatched=False,
+    )
+    weekly_sheets.extend(previous_sheets)
+    warnings = list(shipment_warnings) + list(weekly_warnings) + list(build_warnings) + previous_warnings
 
     output_dir = output_dir or os.path.dirname(paths[ROLE_BSD])
     os.makedirs(output_dir, exist_ok=True)
@@ -350,6 +355,9 @@ def process_reconciliation(
         bds=bds,
         ann=ann,
         shipment_statuses=shipment_statuses,
+        shipment=shipment_lines,
+        previous_month=previous_month,
+        previous_actuals=previous_actuals,
         weekly_sheets=weekly_sheets,
         unmatched_weekly_jobs=unmatched_weekly_jobs,
         warnings=warnings,
@@ -360,8 +368,8 @@ def process_reconciliation(
     return ProcessingResult(
         output_path=output_path,
         reconciliation_months=list(months),
-        bds_counts=bds_counts,
-        ann_counts=ann_counts,
+        bds_counts={month: bds_counts[month] for month in months},
+        ann_counts={month: len(ann[month]) for month in months},
         weekly_sheets=weekly_sheets,
         unmatched_weekly_jobs=unmatched_weekly_jobs,
         warnings=warnings,
@@ -573,10 +581,11 @@ def _read_shipment_forecast(
             "amount, and PLAN EX-FTY month."
         )
 
-    months = _month_range(populated_months[0], populated_months[-1])
+    months = _month_range(populated_months[0], f"{_fiscal_year_for_month(populated_months[0])}-04")
     shipment: ShipmentLines = {month: [] for month in months}
     for month, lines in retained.items():
-        shipment[month] = lines
+        if month in shipment:
+            shipment[month] = lines
 
     warnings: List[str] = []
     if superseded:
@@ -590,7 +599,7 @@ def _read_shipment_forecast(
         )
         warnings.append(warning)
         log(warning)
-    missing_months = [month for month in months if month not in retained]
+    missing_months = [month for month in months if month < populated_months[-1] and month not in retained]
     if missing_months:
         warning = (
             "Ann Forecast has no usable rows in intermediate month(s): "
@@ -677,6 +686,7 @@ def _read_weekly_actuals(
     current_month: str,
     canonical_jobs: Iterable[str],
     log: LogFn,
+    report_unmatched: bool = True,
 ) -> Tuple[List[SourceLine], List[str], List[str], List[str]]:
     """Read weekly actuals without correcting or fuzzy-matching job numbers."""
     log(f"Reading weekly actual shipments for {_month_display(current_month)}")
@@ -770,7 +780,7 @@ def _read_weekly_actuals(
         {
             line.job
             for line in lines
-            if line.job not in canonical
+            if report_unmatched and line.job not in canonical
             and line.job not in {"SAMPLE", "SAMPLES"}
             and "SSS" not in line.job
         }
@@ -808,7 +818,8 @@ def _build_ann_maps(
     The first two detected months use Shipment Forecast. The first month also
     uses weekly actuals, replacing only the exact forecast line already shipped
     and retaining all remaining forecast lines. From the third month onward,
-    Ann remains blank for comparison against Finance.
+    Ann starts blank for comparison against Finance; confirmed delayed
+    shipments are added by the movement reconciliation.
     """
     ann = _new_month_maps(months)
     warnings: List[str] = []
@@ -891,6 +902,9 @@ def _write_result_workbook(
     bds: MonthMaps,
     ann: MonthMaps,
     shipment_statuses: ShipmentStatuses,
+    shipment: ShipmentLines,
+    previous_month: str,
+    previous_actuals: Sequence[SourceLine],
     weekly_sheets: Sequence[str],
     unmatched_weekly_jobs: Sequence[str],
     warnings: Sequence[str],
@@ -911,6 +925,11 @@ def _write_result_workbook(
             options.quantity_tolerance,
             options.amount_tolerance,
         )
+
+    _reconcile_missing_movements(
+        reconciliations, months, bds, ann, shipment, previous_month,
+        previous_actuals, options.quantity_tolerance,
+    )
 
     _write_summary_sheet(wb, generated_at, months, bds, ann, reconciliations)
     for month in months:
@@ -960,9 +979,81 @@ def _build_reconciliation_rows(
             shipment_statuses,
             qty_tolerance,
             amount_tolerance,
-        )
+        ) if month in months[:2] else ""
         rows.append((job, bq, ba, aq, aa, remark))
     return rows
+
+
+def _reconcile_missing_movements(
+    reconciliations: Dict[str, List[Tuple[str, float, float, float, float, str]]],
+    months: Sequence[str],
+    bds: MonthMaps,
+    ann: MonthMaps,
+    shipment: ShipmentLines,
+    previous_month: str,
+    previous_actuals: Sequence[SourceLine],
+    qty_tolerance: float,
+):
+    previous_shipped = _aggregate_lines(previous_actuals)
+    available = {month: list(shipment[month]) for month in months[2:]}
+    for month in months[:2]:
+        for index, row in enumerate(reconciliations[month]):
+            job, bq, ba, aq, aa, remark = row
+            if remark != "Missing":
+                for future_month in months[2:]:
+                    if remark == f"Early ship fr {_month_display(future_month)} to {_month_display(month)}":
+                        for future_index, future_row in enumerate(reconciliations[future_month]):
+                            if future_row[0] == job:
+                                reconciliations[future_month][future_index] = (*future_row[:5], remark)
+                                break
+                continue
+            variance = bq - aq
+            if month == months[0]:
+                if variance < 0:
+                    previous_qty = bds[previous_month].get(job, [0.0, 0.0])[0]
+                    remaining_qty = previous_qty - previous_shipped.get(job, [0.0, 0.0])[0]
+                    if any(abs(qty + variance) <= qty_tolerance for qty in (previous_qty, remaining_qty)):
+                        remark = f"Delay ship fr {_month_display(previous_month)} to {_month_display(month)}"
+                else:
+                    candidates = [line.qty for line in previous_actuals if line.job == job]
+                    candidates.append(previous_shipped.get(job, [0.0, 0.0])[0])
+                    if any(abs(qty - variance) <= qty_tolerance for qty in candidates):
+                        remark = f"Early ship fr {_month_display(month)} to {_month_display(previous_month)}"
+                if remark != "Missing":
+                    reconciliations[month][index] = (job, bq, ba, aq, aa, remark)
+                    continue
+
+            for future_month, lines in available.items():
+                job_lines = [line for line in lines if line.job == job]
+                groups: Dict[str, List[SourceLine]] = defaultdict(list)
+                for line in job_lines:
+                    groups[line.full_job].append(line)
+                candidates = [job_lines, *groups.values(), *([line] for line in job_lines)]
+                matched = next((group for group in candidates if group and abs(
+                    sum(line.qty for line in group) - abs(variance)
+                ) <= qty_tolerance), None)
+                if matched is None:
+                    continue
+                if variance > 0:
+                    remark = f"Delay ship fr {_month_display(month)} to {_month_display(future_month)}"
+                    qty = sum(line.qty for line in matched)
+                    amount = sum(line.amount for line in matched)
+                    _add_pair(ann[future_month], job, qty, amount)
+                    reconciliations[future_month].append((job, 0.0, 0.0, qty, amount, remark))
+                else:
+                    remark = f"Early ship fr {_month_display(future_month)} to {_month_display(month)}"
+                    for future_index, future_row in enumerate(reconciliations[future_month]):
+                        if future_row[0] == job:
+                            reconciliations[future_month][future_index] = (*future_row[:5], remark)
+                            break
+                    else:
+                        continue
+                reconciliations[month][index] = (job, bq, ba, aq, aa, remark)
+                matched_rows = {line.row_number for line in matched}
+                available[future_month] = [line for line in lines if line.row_number not in matched_rows]
+                break
+    for rows in reconciliations.values():
+        rows.sort(key=lambda row: row[0])
 
 
 def _classify_variance(
@@ -1151,8 +1242,9 @@ def _write_summary_sheet(
         recon_name = f"Recon {_month_display(key)}".replace("'", "''")
         variance_total_col = get_column_letter(start_col + month_offset)
         ws.cell(row=row, column=3, value=f"='{recon_name}'!$C$1")
-        ws.cell(row=row, column=5, value=f"={variance_total_col}${total_variance_row}")
-        ws.cell(row=row, column=4, value=f"=C{row}-E{row}")
+        fx_row = reason_start_row + reasons.index("Fx Adjustment")
+        ws.cell(row=row, column=4, value=f"='{recon_name}'!$E$1-{variance_total_col}${fx_row}")
+        ws.cell(row=row, column=5, value=f"=C{row}-D{row}")
         for col in range(2, 6):
             ws.cell(row=row, column=col).border = border
         row += 1
@@ -1361,7 +1453,7 @@ def _write_audit_sheet(
     ws.cell(row=row, column=1).font = bold_font
     rules = [
         "BDS: pcp2012, Jobtype B, excluding source group SIE_VN, grouped by GAC date and base job number.",
-        "Reconciliation range: earliest through latest usable Ann Forecast PLAN EX-FTY month, including empty calendar months between them.",
+        "Reconciliation range: earliest usable Ann Forecast PLAN EX-FTY month through fiscal April. The preceding BDS GAC month is read for movement checks only.",
         "No fuzzy job correction: job numbers must match exactly. Unmatched weekly jobs remain separate and are reported for source correction.",
         "Weekly summary rows beginning TOTALWEEK are ignored; SAMPLES and job numbers whose sixth through eighth characters are SSS are treated as Salesman Sample.",
         "A job number whose sixth character is a letter and whose sixth through eighth characters are not SSS is treated as Demand Pull.",
@@ -1370,8 +1462,10 @@ def _write_audit_sheet(
         "An Ann Forecast line re-issued under a later BUY MTH without a CW code is a superseded re-pricing of a live order line with the same job number and PO, so it is dropped instead of added twice.",
         "First two detected months: use Shipment Forecast, supplemented by unassigned/local BDS jobs absent from the forecast.",
         "First detected month: weekly actuals replace only the exact forecast shipment line already actual; remaining forecast lines are retained.",
-        "Third detected month onward: Ann remains blank for comparison against Finance.",
-        "Movement remarks require the same job number and equal-and-opposite quantity variances across reconciliation months.",
+        "Third detected month onward: ordinary remarks stay blank. Confirmed delayed shipments add Ann rows using the destination forecast quantity and amount; confirmed early shipments mark the existing BDS row.",
+        "Movement checks use the same base job and matching quantities; amounts may differ. First two months also match equal-and-opposite quantity variances.",
+        "First-month Missing: a negative variance matches the preceding BDS GAC month's quantity or its remainder after preceding weekly shipments for Delay; a positive variance matches preceding weekly shipment quantities for Early.",
+        "Remaining Missing rows in the first two months match later forecast quantities by job total, full-job total, or individual line. A matched forecast line is consumed once.",
         "Shipment Forecast rows whose PLAN EX-FTY value is shortship or TBA are grouped by base job number; a matching variance quantity uses that source status.",
         "A remaining quantity variance that does not match another reconciliation month or a Shipment Forecast status quantity is Missing.",
         "The fiscal summary reserves an editable Fx Adjustment row directly below Price Discrepancy. Its month values start at zero and are summed with all other variance reasons. Enter the signed variance shown in the approved reconciliation; a negative value increases Ann and reduces BDS - Ann.",
