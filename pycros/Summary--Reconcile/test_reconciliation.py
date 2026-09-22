@@ -12,6 +12,18 @@ spec.loader.exec_module(recon)
 
 
 class MovementReconciliationTests(unittest.TestCase):
+    def test_full_early_movements_preserve_original_amount_in_one_row(self):
+        for job, qty, bds_amount, moved_amount in [
+            ("BJ131190LS", 3439, 28646.87, 28543.70),
+            ("BJ131191LS", 3138, 26139.54, 26045.40),
+            ("AH001000LS", 10, 100, 110),
+        ]:
+            with self.subTest(job=job):
+                rows = [(job, qty, bds_amount, 0, 0, "")]
+                remark = "Early ship fr Oct'26 to Sep'26"
+                self.assertTrue(recon._allocate_early_shipment(rows, job, qty, moved_amount, remark))
+                self.assertEqual(rows, [(job, qty, bds_amount, 0, 0, remark)])
+
     def test_partial_delay_carries_net_amount_not_forecast_price(self):
         months = ["2026-08", "2026-09", "2026-10"]
         job = "BH082022MJ"
@@ -74,8 +86,8 @@ class MovementReconciliationTests(unittest.TestCase):
         recon._reconcile_missing_movements(rows, months, bds, ann, {month: [] for month in months}, "2026-07", [], 0.5)
         self.assertEqual(rows[months[0]][0][-1], "Early ship fr Oct'26 to Aug'26")
         self.assertEqual(rows[months[2]][0][-1], rows[months[0]][0][-1])
-        self.assertEqual(rows[months[2]][0][1:3], (10, 110))
-        self.assertEqual(rows[months[2]][1], (job, 0, -10, 0, 0, ""))
+        self.assertEqual(rows[months[2]][0][1:3], (10, 100))
+        self.assertEqual(len(rows[months[2]]), 1)
 
     def test_summary_uses_full_totals_and_retains_manual_fx(self):
         months = ["2026-08", "2026-09", "2026-10"]

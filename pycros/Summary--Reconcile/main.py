@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.3.1"
+PYCRO_VERSION = "1.3.2"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -1063,6 +1063,9 @@ def _allocate_early_shipment(
     for index, row in enumerate(rows):
         if row[0] != job or row[5] or row[1] < qty:
             continue
+        if row[1] == qty:
+            rows[index] = (*row[:5], remark)
+            return True
         remainder = (job, row[1] - qty, row[2] - amount, row[3], row[4], "")
         rows[index] = (job, qty, amount, 0.0, 0.0, remark)
         if any(abs(value) > 1e-8 for value in remainder[1:5]):
@@ -1477,7 +1480,7 @@ def _write_audit_sheet(
         "An Ann Forecast line re-issued under a later BUY MTH without a CW code is a superseded re-pricing of a live order line with the same job number and PO, so it is dropped instead of added twice.",
         "First two detected months: use Shipment Forecast, supplemented by unassigned/local BDS jobs absent from the forecast.",
         "First detected month: weekly actuals replace only the exact forecast shipment line already actual; remaining forecast lines are retained.",
-        "Third detected month onward: ordinary remarks stay blank. Confirmed delayed shipments add Ann rows using the source month's balancing quantity and amount. Confirmed early shipments split that balancing quantity and amount from the BDS row, leaving the remainder unmarked and preserving BDS totals.",
+        "Third detected month onward: ordinary remarks stay blank. Confirmed delayed shipments add Ann rows using the source month's balancing quantity and amount. Partial early shipments split that balancing quantity and amount from the BDS row, leaving the remainder unmarked. Full-quantity early shipments keep the original BDS amount on one marked row. BDS totals are preserved.",
         "Movement checks use the same base job and matching quantities; amounts may differ. First two months also match equal-and-opposite quantity variances.",
         "First-month Missing: a negative variance matches the preceding BDS GAC month's quantity or its remainder after preceding weekly shipments for Delay; a positive variance matches preceding weekly shipment quantities for Early.",
         "Remaining Missing rows in the first two months match later forecast quantities by job total, full-job total, or individual line. A matched forecast line is consumed once.",
