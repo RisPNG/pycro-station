@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.3.0"
+PYCRO_VERSION = "1.3.1"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -1002,10 +1002,9 @@ def _reconcile_missing_movements(
             if remark != "Missing":
                 for future_month in months[2:]:
                     if remark == f"Early ship fr {_month_display(future_month)} to {_month_display(month)}":
-                        for future_index, future_row in enumerate(reconciliations[future_month]):
-                            if future_row[0] == job:
-                                reconciliations[future_month][future_index] = (*future_row[:5], remark)
-                                break
+                        _allocate_early_shipment(
+                            reconciliations[future_month], job, aq - bq, aa - ba, remark,
+                        )
                 continue
             variance = bq - aq
             if month == months[0]:
@@ -1036,17 +1035,15 @@ def _reconcile_missing_movements(
                     continue
                 if variance > 0:
                     remark = f"Delay ship fr {_month_display(month)} to {_month_display(future_month)}"
-                    qty = sum(line.qty for line in matched)
-                    amount = sum(line.amount for line in matched)
+                    qty = variance
+                    amount = ba - aa
                     _add_pair(ann[future_month], job, qty, amount)
                     reconciliations[future_month].append((job, 0.0, 0.0, qty, amount, remark))
                 else:
                     remark = f"Early ship fr {_month_display(future_month)} to {_month_display(month)}"
-                    for future_index, future_row in enumerate(reconciliations[future_month]):
-                        if future_row[0] == job:
-                            reconciliations[future_month][future_index] = (*future_row[:5], remark)
-                            break
-                    else:
+                    if not _allocate_early_shipment(
+                        reconciliations[future_month], job, -variance, aa - ba, remark,
+                    ):
                         continue
                 reconciliations[month][index] = (job, bq, ba, aq, aa, remark)
                 matched_rows = {line.row_number for line in matched}
@@ -1054,6 +1051,24 @@ def _reconcile_missing_movements(
                 break
     for rows in reconciliations.values():
         rows.sort(key=lambda row: row[0])
+
+
+def _allocate_early_shipment(
+    rows: List[Tuple[str, float, float, float, float, str]],
+    job: str,
+    qty: float,
+    amount: float,
+    remark: str,
+) -> bool:
+    for index, row in enumerate(rows):
+        if row[0] != job or row[5] or row[1] < qty:
+            continue
+        remainder = (job, row[1] - qty, row[2] - amount, row[3], row[4], "")
+        rows[index] = (job, qty, amount, 0.0, 0.0, remark)
+        if any(abs(value) > 1e-8 for value in remainder[1:5]):
+            rows.insert(index + 1, remainder)
+        return True
+    return False
 
 
 def _classify_variance(
@@ -1462,7 +1477,7 @@ def _write_audit_sheet(
         "An Ann Forecast line re-issued under a later BUY MTH without a CW code is a superseded re-pricing of a live order line with the same job number and PO, so it is dropped instead of added twice.",
         "First two detected months: use Shipment Forecast, supplemented by unassigned/local BDS jobs absent from the forecast.",
         "First detected month: weekly actuals replace only the exact forecast shipment line already actual; remaining forecast lines are retained.",
-        "Third detected month onward: ordinary remarks stay blank. Confirmed delayed shipments add Ann rows using the destination forecast quantity and amount; confirmed early shipments mark the existing BDS row.",
+        "Third detected month onward: ordinary remarks stay blank. Confirmed delayed shipments add Ann rows using the source month's balancing quantity and amount. Confirmed early shipments split that balancing quantity and amount from the BDS row, leaving the remainder unmarked and preserving BDS totals.",
         "Movement checks use the same base job and matching quantities; amounts may differ. First two months also match equal-and-opposite quantity variances.",
         "First-month Missing: a negative variance matches the preceding BDS GAC month's quantity or its remainder after preceding weekly shipments for Delay; a positive variance matches preceding weekly shipment quantities for Early.",
         "Remaining Missing rows in the first two months match later forecast quantities by job total, full-job total, or individual line. A matched forecast line is consumed once.",

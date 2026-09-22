@@ -12,6 +12,33 @@ spec.loader.exec_module(recon)
 
 
 class MovementReconciliationTests(unittest.TestCase):
+    def test_partial_delay_carries_net_amount_not_forecast_price(self):
+        months = ["2026-08", "2026-09", "2026-10"]
+        job = "BH082022MJ"
+        rows = {month: [] for month in months}
+        rows[months[0]] = [(job, 568, 19993.60, 561, 19360.11, "Missing")]
+        shipment = {month: [] for month in months}
+        shipment[months[2]] = [recon.SourceLine(job, job, 7, 250.81, "", "", "Forecast", 1)]
+        ann = recon._new_month_maps(months)
+        recon._reconcile_missing_movements(rows, months, {"2026-07": {}}, ann, shipment, "2026-07", [], 0.5)
+        self.assertEqual(rows[months[2]][0][3], 7)
+        self.assertAlmostEqual(rows[months[2]][0][4], 633.49)
+        self.assertAlmostEqual(ann[months[2]][job][1], 633.49)
+        self.assertEqual(rows[months[0]][0][:5], (job, 568, 19993.60, 561, 19360.11))
+
+    def test_early_allocations_use_only_unmarked_remainder(self):
+        job = "BF285013MJ"
+        rows = [(job, 1102, 18028.72, 0, 0, "")]
+        first = "Early ship fr Oct'26 to Aug'26"
+        second = "Early ship fr Oct'26 to Sep'26"
+        self.assertTrue(recon._allocate_early_shipment(rows, job, 252, 3678.63, first))
+        self.assertFalse(recon._allocate_early_shipment(rows, job, 851, 14350.09, second))
+        self.assertTrue(recon._allocate_early_shipment(rows, job, 850, 14350.09, second))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row[-1] for row in rows], [first, second])
+        self.assertEqual(sum(row[1] for row in rows), 1102)
+        self.assertAlmostEqual(sum(row[2] for row in rows), 18028.72)
+
     def test_forecast_range_extends_to_fiscal_april(self):
         wb = recon.Workbook()
         ws = wb.active
@@ -47,6 +74,8 @@ class MovementReconciliationTests(unittest.TestCase):
         recon._reconcile_missing_movements(rows, months, bds, ann, {month: [] for month in months}, "2026-07", [], 0.5)
         self.assertEqual(rows[months[0]][0][-1], "Early ship fr Oct'26 to Aug'26")
         self.assertEqual(rows[months[2]][0][-1], rows[months[0]][0][-1])
+        self.assertEqual(rows[months[2]][0][1:3], (10, 110))
+        self.assertEqual(rows[months[2]][1], (job, 0, -10, 0, 0, ""))
 
     def test_summary_uses_full_totals_and_retains_manual_fx(self):
         months = ["2026-08", "2026-09", "2026-10"]
@@ -84,7 +113,7 @@ class MovementReconciliationTests(unittest.TestCase):
         self.assertEqual(rows[months[0]][0][-1], "Delay ship fr Jul'26 to Aug'26")
         self.assertEqual(rows[months[0]][0][4], 99032.35)
 
-    def test_future_delay_uses_forecast_amount_and_consumes_rows(self):
+    def test_future_delay_uses_source_balance_and_consumes_rows(self):
         months = ["2026-08", "2026-09", "2026-10"]
         job = "BJ119062MJ"
         rows = {month: [] for month in months}
@@ -97,9 +126,9 @@ class MovementReconciliationTests(unittest.TestCase):
         ]
         ann = recon._new_month_maps(months)
         recon._reconcile_missing_movements(rows, months, {"2026-07": {}}, ann, shipment, "2026-07", [], 0.5)
-        self.assertEqual(rows[months[2]], [(job, 0, 0, 402, 6878.22, "Delay ship fr Aug'26 to Oct'26")])
+        self.assertEqual(rows[months[2]], [(job, 0, 0, 402, 7364.64, "Delay ship fr Aug'26 to Oct'26")])
         self.assertEqual(rows[months[1]][0][-1], "Missing")
-        self.assertEqual(ann[months[2]][job], [402, 6878.22])
+        self.assertEqual(ann[months[2]][job], [402, 7364.64])
 
     def test_early_matches_individual_line_and_preserves_future_bds(self):
         months = ["2026-08", "2026-09", "2026-10"]
@@ -114,7 +143,13 @@ class MovementReconciliationTests(unittest.TestCase):
         ]
         recon._reconcile_missing_movements(rows, months, {"2026-07": {}}, recon._new_month_maps(months), shipment, "2026-07", [], 0.5)
         self.assertEqual(rows[months[1]][0][-1], "Early ship fr Oct'26 to Sep'26")
-        self.assertEqual(rows[months[2]][0], (job, 1102, 18028.72, 0, 0, "Early ship fr Oct'26 to Sep'26"))
+        self.assertEqual(rows[months[2]][0][0:2], (job, 252))
+        self.assertAlmostEqual(rows[months[2]][0][2], 3678.63)
+        self.assertEqual(rows[months[2]][0][-1], "Early ship fr Oct'26 to Sep'26")
+        self.assertEqual(rows[months[2]][1][0:2], (job, 850))
+        self.assertAlmostEqual(rows[months[2]][1][2], 14350.09)
+        self.assertEqual(rows[months[2]][1][-1], "")
+        self.assertAlmostEqual(sum(row[2] for row in rows[months[2]]), 18028.72)
 
     def test_later_months_have_no_ordinary_missing_remark(self):
         months = ["2026-08", "2026-09", "2026-10"]
