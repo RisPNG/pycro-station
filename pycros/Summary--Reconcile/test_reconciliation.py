@@ -12,6 +12,42 @@ spec.loader.exec_module(recon)
 
 
 class MovementReconciliationTests(unittest.TestCase):
+    def test_bds_header_layouts_read_same_business_fields(self):
+        for stacked in (False, True):
+            with self.subTest(stacked=stacked):
+                wb = recon.Workbook()
+                ws = wb.active
+                ws.title = "pcp2012"
+                ws.append(["Order Control List"])
+                if stacked:
+                    ws.append([None, None, None, None, "Order"])
+                    ws.append([None, None, None, "GAC", "Qty", "Total"])
+                    ws.append(["Job Number", "Job Number", "MCO", "Date", "FG", "Amount", "FtyLoc", "Jobtype"])
+                else:
+                    ws.append(["Job Number", "Job Number", "MCO", "GAC Date", "Order Qty FG", "Total Amount", "FtyLoc", "Jobtype"])
+                ws.append(["WRONG", "AH001000LS", "VN", recon.date(2026, 9, 1), 5, 75, None, "B"])
+                ws.append(["WRONG", "AH001001LS", "SIE_VN", recon.date(2026, 9, 1), 8, 80, None, "B"])
+                ws.append(["WRONG", "AH001002LS", "VN", recon.date(2026, 9, 1), 9, 90, None, "Q"])
+                ws.insert_cols(3, 2)
+                with patch.object(recon, "load_workbook", return_value=wb):
+                    bds, supplements, counts = recon._read_bds("bds.xlsx", ["2026-09"], lambda message: None)
+                self.assertEqual(dict(bds["2026-09"]), {"AH001000LS": [5, 75]})
+                self.assertEqual(dict(supplements["2026-09"]), {"AH001000LS": [5, 75]})
+                self.assertEqual(counts, {"2026-09": 1})
+
+    def test_bds_invalid_headers_fail_explicitly(self):
+        for last_header, message in [("Wrong amount", "missing required column: amount"), ("Total Amount", "ambiguous columns for amount")]:
+            with self.subTest(last_header=last_header):
+                wb = recon.Workbook()
+                ws = wb.active
+                ws.append(["Job Number", "Jobtype", "MCO", "GAC Date", "Order Qty FG", last_header, last_header, "Ftyloc"])
+                with self.assertRaisesRegex(ValueError, message):
+                    recon._detect_bds_columns(ws)
+        wb = recon.Workbook()
+        wb.active.append(["Not an Order Control header"])
+        with self.assertRaisesRegex(ValueError, "header row was not found"):
+            recon._detect_bds_columns(wb.active)
+
     def test_full_early_movements_preserve_original_amount_in_one_row(self):
         for job, qty, bds_amount, moved_amount in [
             ("BJ131190LS", 3439, 28646.87, 28543.70),

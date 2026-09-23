@@ -1,14 +1,16 @@
 > Build a shipment reconciliation using confirmed forecast, actual-shipment, duplicate, and source-precedence rules.
 > [!info]
-> [Version 1.3.2](#bae1ffff)
+> [Version 1.3.3](#bae1ffff)
 >
 > [Author](#bae1ffff)
 > OpenAI
 >
 > [Last updated date](#bae1ffff)
-> 2026/09/22
+> 2026/09/23
 
 Creates an Excel reconciliation from the Order Control workbook, Shipment Forecast, Weekly Export Local, and Weekly Export VN files.
+
+BDS columns are detected by header names in both single-row and stacked-header exports. Missing or ambiguous required columns stop processing with an error instead of silently producing zero totals. Where Job Number is repeated, the rightmost Job Number column is used, matching the original base-job export field.
 
 Includes the previous month's BDS records for quantity-based movement checks and reports through fiscal April. Later-month remarks remain blank except for confirmed shipment movements. Include the previous month's GAC records in the same Order Control export; no additional input file is required.
 

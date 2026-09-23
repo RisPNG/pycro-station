@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.3.2"
+PYCRO_VERSION = "1.3.3"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -453,17 +453,18 @@ def _read_bds(
     wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
         ws = wb["pcp2012"]
-        for row in ws.iter_rows(min_row=11, max_col=110, values_only=True):
-            job_type = _text(_at(row, 106))
-            source_group = _text(_at(row, 41)).upper()  # AO / MCO source group
+        columns, header_row = _detect_bds_columns(ws)
+        for row in ws.iter_rows(min_row=header_row + 1, max_col=max(columns.values()), values_only=True):
+            job_type = _text(_at(row, columns["job_type"]))
+            source_group = _text(_at(row, columns["source_group"])).upper()  # MCO source group
             if job_type.upper() != "B" or source_group == "SIE_VN":
                 continue
 
-            job = _normalise_job(_at(row, 11))
-            month = _month_key_from_value(_at(row, 33))  # AG / GAC date
-            qty = _number(_at(row, 42))                  # AP / FG
-            amount = _number(_at(row, 47))               # AU / Amount
-            fty_location = _text(_at(row, 110))          # DF / FtyLoc
+            job = _normalise_job(_at(row, columns["job"]))
+            month = _month_key_from_value(_at(row, columns["gac_date"]))  # GAC date
+            qty = _number(_at(row, columns["qty"]))                  # Order Qty FG
+            amount = _number(_at(row, columns["amount"]))            # Total Amount
+            fty_location = _text(_at(row, columns["fty_location"]))   # FtyLoc
 
             if not job or month not in bds or qty is None or amount is None:
                 continue
@@ -481,6 +482,42 @@ def _read_bds(
             f"qty {qty:,.0f}, amount {amount:,.2f}"
         )
     return bds, supplements, counts
+
+
+def _detect_bds_columns(ws) -> Tuple[Dict[str, int], int]:
+    aliases = {
+        "job": {"JOB NUMBER"},
+        "job_type": {"JOBTYPE", "JOB TYPE"},
+        "source_group": {"MCO"},
+        "gac_date": {"GAC DATE"},
+        "qty": {"ORDER QTY FG"},
+        "amount": {"TOTAL AMOUNT"},
+        "fty_location": {"FTYLOC", "FTY LOC"},
+    }
+    headers = []
+    for row_number, row in enumerate(
+        ws.iter_rows(min_row=1, max_row=min(ws.max_row, 20), values_only=True), start=1,
+    ):
+        headers.append([re.sub(r"[^A-Z0-9]+", " ", _text(value).upper()).strip() for value in row])
+        if "JOB NUMBER" not in headers[-1] or not ({"JOBTYPE", "JOB TYPE"} & set(headers[-1])):
+            continue
+        columns: Dict[str, int] = {}
+        for field, names in aliases.items():
+            matches = []
+            for column in range(len(row)):
+                candidates = {
+                    " ".join(parts[column] for parts in headers[-depth:] if parts[column])
+                    for depth in range(1, min(3, len(headers)) + 1)
+                }
+                if candidates & names:
+                    matches.append(column + 1)
+            if not matches:
+                raise ValueError(f"BDS pcp2012 header is missing required column: {field} ({', '.join(sorted(names))}).")
+            if len(matches) > 1 and field != "job":
+                raise ValueError(f"BDS pcp2012 header has ambiguous columns for {field}: {matches}.")
+            columns[field] = matches[-1]
+        return columns, row_number
+    raise ValueError("BDS pcp2012 header row was not found in the first 20 rows. Required headers include Job Number and Jobtype.")
 
 
 def _read_shipment_forecast(
@@ -1470,7 +1507,7 @@ def _write_audit_sheet(
     ws.cell(row=row, column=1, value="Processing rules").fill = sub_fill
     ws.cell(row=row, column=1).font = bold_font
     rules = [
-        "BDS: pcp2012, Jobtype B, excluding source group SIE_VN, grouped by GAC date and base job number.",
+        "BDS: pcp2012, columns detected from single-row or stacked headers; repeated Job Number headers use the rightmost base-job field. Jobtype B, excluding source group SIE_VN, grouped by GAC date and base job number.",
         "Reconciliation range: earliest usable Ann Forecast PLAN EX-FTY month through fiscal April. The preceding BDS GAC month is read for movement checks only.",
         "No fuzzy job correction: job numbers must match exactly. Unmatched weekly jobs remain separate and are reported for source correction.",
         "Weekly summary rows beginning TOTALWEEK are ignored; SAMPLES and job numbers whose sixth through eighth characters are SSS are treated as Salesman Sample.",
