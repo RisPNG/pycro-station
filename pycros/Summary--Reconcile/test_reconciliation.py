@@ -12,6 +12,51 @@ spec.loader.exec_module(recon)
 
 
 class MovementReconciliationTests(unittest.TestCase):
+    def test_weekly_descriptive_samples_and_amount_only_dn(self):
+        wb = recon.Workbook()
+        ws = wb.active
+        ws.title = "Sep'26 Wk 3"
+        for _ in range(6):
+            ws.append([])
+        for name, qty, planned, actual in [
+            ("GGP SAMPLES", 805, 17109.05, 17109.05),
+            ("GGP SAMPLES", 2116, 52416.04, 52416.04),
+            ("GGP SAMPLES", 248, 5532.10, 5532.10),
+            ("SAMPLES (MEETING)", 6, 156.96, 156.69),
+            ("sample (Photoshoot )", 2, 62, 62),
+            ("SAMPLES (SPA )", 61, 898, 898),
+            ("SAMPLES (PHOTOSHOOT )", 42, 1096.83, 1096.83),
+            ("SAMPLES (P1 )", 4, 49.20, 49.20),
+            ("DN", None, 283, 283),
+            ("SAMPLES", 100, 3342, 3342),
+        ]:
+            row = [None] * 18
+            row[1], row[2], row[8] = name, qty, planned
+            row[16], row[17] = qty, actual
+            ws.append(row)
+        with patch.object(recon, "load_workbook", return_value=wb):
+            lines, sheets, unmatched, warnings = recon._read_weekly_actuals(
+                "local.xlsx", "vn.xlsx", "2026-09", [], lambda message: None,
+            )
+        grouped = recon._aggregate_lines(lines)
+        self.assertEqual(grouped["GGP SAMPLES"][0], 3169)
+        self.assertAlmostEqual(grouped["GGP SAMPLES"][1], 75057.19)
+        self.assertEqual(grouped["SAMPLES (MEETING)"], [6, 156.69])
+        self.assertEqual(grouped["DN"], [0, 283])
+        self.assertEqual(grouped["SAMPLES"], [100, 3342])
+        self.assertEqual(len(grouped), 8)
+        self.assertEqual(unmatched, [])
+        self.assertEqual(warnings, [])
+        months = ["2026-09", "2026-10"]
+        bds = recon._new_month_maps(months)
+        ann, _ = recon._build_ann_maps(
+            months, {month: [] for month in months}, recon._new_month_maps(months),
+            bds, lines, lambda message: None,
+        )
+        for job, pair in ann["2026-09"].items():
+            reason = recon._classify_variance(job, months[0], months, bds, ann, {}, 0.5, 0.01)
+            self.assertEqual(reason, "DN" if job == "DN" else "Salesman Sample")
+
     def test_bds_header_layouts_read_same_business_fields(self):
         for stacked in (False, True):
             with self.subTest(stacked=stacked):

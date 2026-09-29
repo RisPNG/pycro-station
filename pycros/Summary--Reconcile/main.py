@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.3.3"
+PYCRO_VERSION = "1.3.4"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -792,6 +792,8 @@ def _read_weekly_actuals(
                         _number(_at(row, planned_qty_col)),
                         _number(_at(row, planned_amount_col)),
                     )
+                    if job == "DN" and qty is None and amount is not None:
+                        qty = 0.0
                     if qty is None or amount is None:
                         continue
                     if abs(qty) < 1e-12 and abs(amount) < 1e-12:
@@ -818,7 +820,8 @@ def _read_weekly_actuals(
             line.job
             for line in lines
             if report_unmatched and line.job not in canonical
-            and line.job not in {"SAMPLE", "SAMPLES"}
+            and line.job != "DN"
+            and not re.search(r"\bSAMPLES?\b", line.job)
             and "SSS" not in line.job
         }
     )
@@ -1129,9 +1132,11 @@ def _classify_variance(
         return ""
 
     upper_job = job.upper()
+    if upper_job == "DN":
+        return "DN"
     if abs(dq) <= qty_tolerance and abs(da) > amount_tolerance:
         return "Price Discrepancy"
-    if upper_job in {"SAMPLE", "SAMPLES"} or upper_job[5:8] == "SSS":
+    if re.search(r"\bSAMPLES?\b", upper_job) or upper_job[5:8] == "SSS":
         return "Salesman Sample"
     if len(upper_job) > 5 and upper_job[5].isalpha():
         return "Demand Pull"
@@ -1510,7 +1515,7 @@ def _write_audit_sheet(
         "BDS: pcp2012, columns detected from single-row or stacked headers; repeated Job Number headers use the rightmost base-job field. Jobtype B, excluding source group SIE_VN, grouped by GAC date and base job number.",
         "Reconciliation range: earliest usable Ann Forecast PLAN EX-FTY month through fiscal April. The preceding BDS GAC month is read for movement checks only.",
         "No fuzzy job correction: job numbers must match exactly. Unmatched weekly jobs remain separate and are reported for source correction.",
-        "Weekly summary rows beginning TOTALWEEK are ignored; SAMPLES and job numbers whose sixth through eighth characters are SSS are treated as Salesman Sample.",
+        "Weekly summary rows beginning TOTALWEEK are ignored. Descriptive sample labels retain their distinct names and are treated as Salesman Sample, as are job numbers whose sixth through eighth characters are SSS. An amount-only DN weekly row uses zero quantity and the DN remark.",
         "A job number whose sixth character is a letter and whose sixth through eighth characters are not SSS is treated as Demand Pull.",
         "Actual quantity and amount are used when both are available; otherwise planned quantity and amount are used.",
         "Repeated Ann Forecast rows are retained because identical rows can represent separate shipment quantities.",
@@ -1597,16 +1602,17 @@ def _number(value: object) -> Optional[float]:
 
 
 def _normalise_job_code(value: object) -> str:
-    """Validate a job code without guessing or correcting its characters.
+    """Validate a job code or an approved weekly sample/DN label without guessing.
 
     Case, outer whitespace, and Unicode dash presentation are standardised. A
     malformed code is rejected rather than repaired. Valid but different codes
-    such as AM06008MS and AM060008MS remain distinct.
+    such as AM06008MS and AM060008MS remain distinct; descriptive sample labels
+    retain their separate names.
     """
     text = _text(value).upper().replace("–", "-").replace("—", "-")
     if not text:
         return ""
-    if text in {"SAMPLE", "SAMPLES"}:
+    if text == "DN" or re.fullmatch(r"(?:[A-Z0-9]+ )?SAMPLES?(?: \([A-Z0-9 ]+\))?", text):
         return text
     if len(text) < 6 or not any(char.isdigit() for char in text):
         return ""
@@ -1616,7 +1622,7 @@ def _normalise_job_code(value: object) -> str:
 
 
 def _job_group(full_job: str) -> str:
-    if full_job in {"SAMPLE", "SAMPLES"}:
+    if full_job == "DN" or re.search(r"\bSAMPLES?\b", full_job):
         return full_job
     return full_job.split("-", 1)[0]
 
