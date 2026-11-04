@@ -1,12 +1,12 @@
 > Build a shipment reconciliation using confirmed forecast, actual-shipment, duplicate, and source-precedence rules.
 > [!info]
-> [Version 1.3.4](#bae1ffff)
+> [Version 1.3.5](#bae1ffff)
 >
 > [Author](#bae1ffff)
-> OpenAI
+> SIG4475
 >
 > [Last updated date](#bae1ffff)
-> 2026/09/29
+> 2026/11/04
 
 Creates an Excel reconciliation from the Order Control workbook, Shipment Forecast, Weekly Export Local, and Weekly Export VN files.
 
@@ -18,4 +18,4 @@ Includes the previous month's BDS records for quantity-based movement checks and
 
 Delayed movements carry the source month's balancing quantity and amount into the later Ann sheet. Partial early movements split the later BDS row into the moved balance and an unmarked remainder. Full-quantity early movements keep one marked row with the original BDS amount, without a separate amount-only remainder. BDS totals are preserved.
 
-The starting month is still the earliest usable PLAN EX-FTY month in the forecast, not the export date or filename. A forecast containing August shipments therefore starts the reconciliation in August, even if exported in September. Unmatched quantities remain Missing for manual review; differing amounts alone do not prevent a movement match.
+The reporting month comes from the Order Control workbook's Date Prepared in pcp2012!A1, using DD/MM/YYYY. A BDS prepared on 3 November 2026 starts the reconciliation in November and uses November and December for Ann, even when the Shipment Forecast retains October shipments. October BDS records and weekly actuals supply movement context only. The report continues through fiscal April. A missing or invalid prepared date stops processing with an error. Unmatched quantities remain Missing for manual review; differing amounts alone do not prevent a movement match.

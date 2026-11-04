@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 
@@ -63,22 +64,70 @@ class MovementReconciliationTests(unittest.TestCase):
                 wb = recon.Workbook()
                 ws = wb.active
                 ws.title = "pcp2012"
-                ws.append(["Order Control List"])
+                ws.append(["Date Prepared : 04/09/2026"])
                 if stacked:
                     ws.append([None, None, None, None, "Order"])
                     ws.append([None, None, None, "GAC", "Qty", "Total"])
                     ws.append(["Job Number", "Job Number", "MCO", "Date", "FG", "Amount", "FtyLoc", "Jobtype"])
                 else:
-                    ws.append(["Job Number", "Job Number", "MCO", "GAC Date", "Order Qty FG", "Total Amount", "FtyLoc", "Jobtype"])
+                    ws.append(
+                        [
+                            "Job Number",
+                            "Job Number",
+                            "MCO",
+                            "GAC Date",
+                            "Order Qty FG",
+                            "Total Amount",
+                            "FtyLoc",
+                            "Jobtype",
+                        ]
+                    )
                 ws.append(["WRONG", "AH001000LS", "VN", recon.date(2026, 9, 1), 5, 75, None, "B"])
                 ws.append(["WRONG", "AH001001LS", "SIE_VN", recon.date(2026, 9, 1), 8, 80, None, "B"])
                 ws.append(["WRONG", "AH001002LS", "VN", recon.date(2026, 9, 1), 9, 90, None, "Q"])
                 ws.insert_cols(3, 2)
                 with patch.object(recon, "load_workbook", return_value=wb):
-                    bds, supplements, counts = recon._read_bds("bds.xlsx", ["2026-09"], lambda message: None)
+                    bds, supplements, counts, months = recon._read_bds("bds.xlsx", lambda message: None)
                 self.assertEqual(dict(bds["2026-09"]), {"AH001000LS": [5, 75]})
                 self.assertEqual(dict(supplements["2026-09"]), {"AH001000LS": [5, 75]})
-                self.assertEqual(counts, {"2026-09": 1})
+                self.assertEqual(counts["2026-09"], 1)
+                self.assertEqual(sum(counts.values()), 1)
+                self.assertEqual(months, recon._month_range("2026-09", "2027-04"))
+
+    def test_bds_prepared_month_sets_reporting_range_and_previous_context(self):
+        for prepared, start, end, previous in [
+            ("04/12/2026", "2026-12", "2027-04", "2026-11"),
+            ("04/01/2027", "2027-01", "2027-04", "2026-12"),
+            ("04/04/2027", "2027-04", "2027-04", "2027-03"),
+            ("04/05/2027", "2027-05", "2028-04", "2027-04"),
+        ]:
+            with self.subTest(prepared=prepared):
+                wb = recon.Workbook()
+                ws = wb.active
+                ws.title = "pcp2012"
+                ws.append([f"Date Prepared : {prepared}"])
+                ws.append(["Job Number", "Jobtype", "MCO", "GAC Date", "Order Qty FG", "Total Amount", "Ftyloc"])
+                ws.append(["AH001000LS", "B", "VN", recon.date.fromisoformat(previous + "-01"), 5, 75, "VN"])
+                ws.append(["AH001001LS", "B", "VN", recon.date.fromisoformat(start + "-01"), 10, 100, "VN"])
+                with patch.object(recon, "load_workbook", return_value=wb):
+                    bds, supplements, counts, months = recon._read_bds("bds.xlsx", lambda message: None)
+                self.assertEqual(months, recon._month_range(start, end))
+                self.assertNotIn(previous, months)
+                self.assertEqual(dict(bds[previous]), {"AH001000LS": [5, 75]})
+                self.assertEqual(dict(bds[start]), {"AH001001LS": [10, 100]})
+                self.assertEqual(counts[previous], 1)
+
+    def test_bds_requires_valid_prepared_date(self):
+        for prepared in (None, "Order Control List", "Date Prepared : 31/02/2026"):
+            with self.subTest(prepared=prepared):
+                wb = recon.Workbook()
+                ws = wb.active
+                ws.title = "pcp2012"
+                ws.append([prepared])
+                ws.append(["Job Number", "Jobtype", "MCO", "GAC Date", "Order Qty FG", "Total Amount", "Ftyloc"])
+                with patch.object(recon, "load_workbook", return_value=wb):
+                    with self.assertRaisesRegex(ValueError, "Date Prepared"):
+                        recon._read_bds("bds.xlsx", lambda message: None)
 
     def test_bds_invalid_headers_fail_explicitly(self):
         for last_header, message in [("Wrong amount", "missing required column: amount"), ("Total Amount", "ambiguous columns for amount")]:
@@ -132,17 +181,107 @@ class MovementReconciliationTests(unittest.TestCase):
         self.assertEqual(sum(row[1] for row in rows), 1102)
         self.assertAlmostEqual(sum(row[2] for row in rows), 18028.72)
 
-    def test_forecast_range_extends_to_fiscal_april(self):
+    def test_forecast_preserves_reporting_range_despite_older_shipments(self):
         wb = recon.Workbook()
         ws = wb.active
         ws.title = "SHIPMENTS"
         ws.append(["JOB", "QTY", "AMOUNT", "PLAN EX-FTY"])
         ws.append(["AH001000LS", 10, 100, recon.date(2026, 8, 1)])
+        ws.append(["AH001001LS", 20, 200, recon.date(2026, 12, 1)])
+        ws.append(["AH001002LS", 30, 300, recon.date(2027, 5, 1)])
+        months = recon._month_range("2026-11", "2027-04")
         with patch.object(recon, "load_workbook", return_value=wb):
-            shipment, statuses, counts, months, warnings = recon._read_shipment_forecast("forecast.xlsx", lambda message: None)
-        self.assertEqual(months, recon._month_range("2026-08", "2027-04"))
+            shipment, statuses, counts, warnings = recon._read_shipment_forecast(
+                "forecast.xlsx", months, lambda message: None
+            )
+        self.assertEqual(list(shipment), months)
+        self.assertEqual(counts["2026-11"], 0)
         self.assertEqual(counts["2027-04"], 0)
-        self.assertEqual(len(shipment["2026-08"]), 1)
+        self.assertEqual([line.full_job for line in shipment["2026-12"]], ["AH001001LS"])
+
+    def test_reconciliation_uses_bds_month_for_forecast_actuals_and_movements(self):
+        with TemporaryDirectory() as directory:
+            paths = {role: str(Path(directory) / f"{role}.xlsx") for role in ("bsd", "shipment", "local", "vn")}
+            wb = recon.Workbook()
+            ws = wb.active
+            ws.title = "pcp2012"
+            ws.append(["Date Prepared : 04/11/2026"])
+            ws.append(["Job Number", "Jobtype", "MCO", "GAC Date", "Order Qty FG", "Total Amount", "Ftyloc"])
+            for job, month, qty, amount in [
+                ("AH001000LS", 11, 10, 100),
+                ("AH001001LS", 12, 20, 200),
+                ("AH001002LS", 1, 30, 300),
+                ("AH001003LS", 10, 7, 70),
+                ("AH001004LS", 11, 4, 40),
+                ("AH001005LS", 10, 8, 80),
+                ("AH001006LS", 11, 9, 90),
+            ]:
+                ws.append([job, "B", "VN", recon.date(2027 if month == 1 else 2026, month, 1), qty, amount, "VN"])
+            wb.save(paths["bsd"])
+            wb.close()
+
+            wb = recon.Workbook()
+            ws = wb.active
+            ws.title = "SHIPMENTS"
+            ws.append(["JOB", "QTY", "AMOUNT", "PLAN EX-FTY", "INVOICE"])
+            for job, month, qty, amount, invoice in [
+                ("AH001007LS", 10, 100, 1000, "OCT-OLD"),
+                ("AH001000LS", 11, 10, 100, "NOV-0"),
+                ("AH001003LS", 11, 7, 77, "NOV-3"),
+                ("AH001005LS", 11, 5, 55, "NOV-5"),
+                ("AH001006LS", 11, 9, 90, "NOV-6"),
+                ("AH001001LS", 12, 20, 210, "DEC-1"),
+                ("AH001002LS", 1, 30, 300, "JAN-2"),
+            ]:
+                ws.append([job, qty, amount, recon.date(2027 if month == 1 else 2026, month, 1), invoice])
+            wb.save(paths["shipment"])
+            wb.close()
+
+            for role in ("local", "vn"):
+                wb = recon.Workbook()
+                wb.remove(wb.active)
+                for month in ("Oct", "Nov"):
+                    ws = wb.create_sheet(f"{month}'26 Wk 1")
+                    for _ in range(6):
+                        ws.append([])
+                    if role == "local":
+                        shipments = (
+                            [("AH001004LS", 4, 40, "OCT-4"), ("AH001005LS", 3, 30, "OCT-5")]
+                            if month == "Oct"
+                            else [("AH001006LS", 9, 99, "NOV-6")]
+                        )
+                        for job, qty, amount, invoice in shipments:
+                            row = [None] * 18
+                            row[1], row[2], row[3], row[8], row[16], row[17] = job, qty, invoice, amount, qty, amount
+                            ws.append(row)
+                wb.save(paths[role])
+                wb.close()
+
+            result = recon.process_reconciliation(paths, directory, recon.ProcessingOptions())
+            self.assertEqual(result.reconciliation_months, recon._month_range("2026-11", "2027-04"))
+            self.assertEqual(
+                set(result.weekly_sheets),
+                {f"{role}: {month}'26 Wk 1" for role in ("Local", "VN") for month in ("Oct", "Nov")},
+            )
+            wb = recon.load_workbook(result.output_path, read_only=True, data_only=False)
+            try:
+                self.assertNotIn("Recon Oct'26", wb.sheetnames)
+                november = {row[0]: row for row in wb["Recon Nov'26"].iter_rows(min_row=4, values_only=True)}
+                december = {row[0]: row for row in wb["Recon Dec'26"].iter_rows(min_row=4, values_only=True)}
+                january = {row[0]: row for row in wb["Recon Jan'27"].iter_rows(min_row=4, values_only=True)}
+                self.assertEqual(november["AH001000LS"][3:5], (10, 100))
+                self.assertEqual(november["AH001006LS"][3:5], (9, 99))
+                self.assertEqual(december["AH001001LS"][3:5], (20, 210))
+                self.assertEqual(november["AH001003LS"][7], "Delay ship fr Oct'26 to Nov'26")
+                self.assertEqual(november["AH001005LS"][7], "Delay ship fr Oct'26 to Nov'26")
+                self.assertEqual(november["AH001004LS"][7], "Early ship fr Nov'26 to Oct'26")
+                self.assertNotIn("AH001007LS", november)
+                self.assertEqual(january["AH001002LS"][3:5], (None, None))
+                self.assertIsNone(january["AH001002LS"][7])
+                self.assertEqual(wb["Processing Log"]["A5"].value, "Reporting month (BDS Date Prepared)")
+                self.assertEqual(wb["Processing Log"]["B5"].value, "Nov'26")
+            finally:
+                wb.close()
 
     def test_unmatched_quantity_stays_missing(self):
         months = ["2026-08", "2026-09"]

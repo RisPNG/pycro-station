@@ -32,7 +32,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "Summary Reconcile"
-PYCRO_VERSION = "1.3.4"
+PYCRO_VERSION = "1.3.5"
 
 ROLE_BSD = "bsd"
 ROLE_SHIPMENT = "shipment"
@@ -155,7 +155,7 @@ class MainWidget(QWidget):
 
         self.range_field = QLineEdit(self)
         self.range_field.setReadOnly(True)
-        self.range_field.setText("Auto-detected from Ann Forecast during processing")
+        self.range_field.setText("Auto-detected from BDS Date Prepared during processing")
         self.range_field.setStyleSheet(
             "QLineEdit {background: #1f1f1f; color: #d0d0d0; "
             "border: 1px solid #3a3a3a; border-radius: 6px; padding: 6px;}"
@@ -297,22 +297,21 @@ def process_reconciliation(
     _validate_input_paths(paths)
     _validate_workbook_signatures(paths, log)
 
+    bds, supplements, bds_counts, months = _read_bds(paths[ROLE_BSD], log)
     (
         shipment_lines,
         shipment_statuses,
         _shipment_counts,
-        months,
         shipment_warnings,
-    ) = _read_shipment_forecast(paths[ROLE_SHIPMENT], log)
+    ) = _read_shipment_forecast(paths[ROLE_SHIPMENT], months, log)
     range_text = (
         f"{_month_display(months[0])} to {_month_display(months[-1])} "
         f"({len(months)} month{'s' if len(months) != 1 else ''})"
     )
     range_callback(range_text)
-    log(f"Reconciliation months detected from Ann Forecast: {range_text}")
+    log(f"Reconciliation months from BDS Date Prepared: {range_text}")
 
     previous_month = _month_key(_add_months(date.fromisoformat(months[0] + "-01"), -1))
-    bds, supplements, bds_counts = _read_bds(paths[ROLE_BSD], [previous_month, *months], log)
 
     canonical_jobs = set()
     for month in months:
@@ -443,16 +442,27 @@ def _add_pair(target: MutableMapping[str, AmountPair], job: str, qty: float, amo
 
 def _read_bds(
     path: str,
-    months: Sequence[str],
     log: LogFn,
-) -> Tuple[MonthMaps, MonthMaps, Dict[str, int]]:
-    log(f"Reading BSD: {os.path.basename(path)}")
-    bds = _new_month_maps(months)
-    supplements = _new_month_maps(months)
-
+) -> Tuple[MonthMaps, MonthMaps, Dict[str, int], List[str]]:
+    log(f"Reading BDS: {os.path.basename(path)}")
     wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
         ws = wb["pcp2012"]
+        prepared = re.fullmatch(r"Date\s+Prepared\s*:\s*(\d{1,2}/\d{1,2}/\d{4})", _text(ws["A1"].value), re.I)
+        if not prepared:
+            raise ValueError("BDS pcp2012!A1 must contain Date Prepared : DD/MM/YYYY to determine the reporting month.")
+        try:
+            prepared_date = datetime.strptime(prepared[1], "%d/%m/%Y").date()
+        except ValueError as error:
+            raise ValueError(
+                f"BDS pcp2012!A1 has an invalid Date Prepared: {prepared[1]} (expected DD/MM/YYYY)."
+            ) from error
+        current_month = _month_key(prepared_date)
+        months = _month_range(current_month, f"{_fiscal_year_for_month(current_month)}-04")
+        previous_month = _month_key(_add_months(prepared_date.replace(day=1), -1))
+        bds = _new_month_maps([previous_month, *months])
+        supplements = _new_month_maps([previous_month, *months])
+        log(f"BDS Date Prepared: {prepared_date:%d %b %Y}; reporting month {_month_display(current_month)}")
         columns, header_row = _detect_bds_columns(ws)
         for row in ws.iter_rows(min_row=header_row + 1, max_col=max(columns.values()), values_only=True):
             job_type = _text(_at(row, columns["job_type"]))
@@ -474,14 +484,14 @@ def _read_bds(
     finally:
         wb.close()
 
-    counts = {month: len(bds[month]) for month in months}
-    for month in months:
+    counts = {month: len(jobs) for month, jobs in bds.items()}
+    for month in bds:
         qty, amount = _map_totals(bds[month])
         log(
             f"BDS {_month_display(month)}: {counts[month]:,} jobs, "
             f"qty {qty:,.0f}, amount {amount:,.2f}"
         )
-    return bds, supplements, counts
+    return bds, supplements, counts, months
 
 
 def _detect_bds_columns(ws) -> Tuple[Dict[str, int], int]:
@@ -522,9 +532,10 @@ def _detect_bds_columns(ws) -> Tuple[Dict[str, int], int]:
 
 def _read_shipment_forecast(
     path: str,
+    months: Sequence[str],
     log: LogFn,
-) -> Tuple[ShipmentLines, ShipmentStatuses, Dict[str, int], List[str], List[str]]:
-    """Read Ann Forecast lines and derive the contiguous reconciliation range.
+) -> Tuple[ShipmentLines, ShipmentStatuses, Dict[str, int], List[str]]:
+    """Read Ann Forecast lines for the BDS reporting range.
 
     For each line, actual quantity and actual amount are used when available;
     otherwise the planned quantity and amount are used. Full job codes are
@@ -611,14 +622,13 @@ def _read_shipment_forecast(
             else:
                 retained[month].append(line)
 
-    populated_months = sorted(retained)
+    populated_months = sorted(month for month, lines in retained.items() if lines)
     if not populated_months:
         raise ValueError(
             "Ann Forecast has no usable SHIPMENTS rows with job, quantity, "
             "amount, and PLAN EX-FTY month."
         )
 
-    months = _month_range(populated_months[0], f"{_fiscal_year_for_month(populated_months[0])}-04")
     shipment: ShipmentLines = {month: [] for month in months}
     for month, lines in retained.items():
         if month in shipment:
@@ -636,10 +646,14 @@ def _read_shipment_forecast(
         )
         warnings.append(warning)
         log(warning)
-    missing_months = [month for month in months if month < populated_months[-1] and month not in retained]
+    missing_months = [
+        month
+        for month in months
+        if month not in populated_months and (month in months[:2] or month < populated_months[-1])
+    ]
     if missing_months:
         warning = (
-            "Ann Forecast has no usable rows in intermediate month(s): "
+            "Ann Forecast has no usable rows in reporting month(s): "
             + ", ".join(_month_display(month) for month in missing_months)
         )
         warnings.append(warning)
@@ -663,7 +677,6 @@ def _read_shipment_forecast(
         shipment,
         {job: dict(statuses) for job, statuses in shipment_statuses.items()},
         counts,
-        months,
         warnings,
     )
 
@@ -855,7 +868,7 @@ def _build_ann_maps(
 ) -> Tuple[MonthMaps, List[str]]:
     """Build Ann using confirmed source precedence rules.
 
-    The first two detected months use Shipment Forecast. The first month also
+    The BDS reporting month and following month use Shipment Forecast. The first month also
     uses weekly actuals, replacing only the exact forecast line already shipped
     and retaining all remaining forecast lines. From the third month onward,
     Ann starts blank for comparison against Finance; confirmed delayed
@@ -1441,7 +1454,7 @@ def _write_audit_sheet(
     rows = [
         ("Pycro version", PYCRO_VERSION),
         ("Generated", generated_at),
-        ("Detected Ann start month", _month_display(months[0])),
+        ("Reporting month (BDS Date Prepared)", _month_display(months[0])),
         ("Detected Ann end month", _month_display(months[-1])),
         ("Detected reconciliation months", len(months)),
     ]
@@ -1513,16 +1526,16 @@ def _write_audit_sheet(
     ws.cell(row=row, column=1).font = bold_font
     rules = [
         "BDS: pcp2012, columns detected from single-row or stacked headers; repeated Job Number headers use the rightmost base-job field. Jobtype B, excluding source group SIE_VN, grouped by GAC date and base job number.",
-        "Reconciliation range: earliest usable Ann Forecast PLAN EX-FTY month through fiscal April. The preceding BDS GAC month is read for movement checks only.",
+        "Reconciliation range: BDS Date Prepared month through fiscal April. The preceding BDS GAC month is read for movement checks only.",
         "No fuzzy job correction: job numbers must match exactly. Unmatched weekly jobs remain separate and are reported for source correction.",
         "Weekly summary rows beginning TOTALWEEK are ignored. Descriptive sample labels retain their distinct names and are treated as Salesman Sample, as are job numbers whose sixth through eighth characters are SSS. An amount-only DN weekly row uses zero quantity and the DN remark.",
         "A job number whose sixth character is a letter and whose sixth through eighth characters are not SSS is treated as Demand Pull.",
         "Actual quantity and amount are used when both are available; otherwise planned quantity and amount are used.",
         "Repeated Ann Forecast rows are retained because identical rows can represent separate shipment quantities.",
         "An Ann Forecast line re-issued under a later BUY MTH without a CW code is a superseded re-pricing of a live order line with the same job number and PO, so it is dropped instead of added twice.",
-        "First two detected months: use Shipment Forecast, supplemented by unassigned/local BDS jobs absent from the forecast.",
-        "First detected month: weekly actuals replace only the exact forecast shipment line already actual; remaining forecast lines are retained.",
-        "Third detected month onward: ordinary remarks stay blank. Confirmed delayed shipments add Ann rows using the source month's balancing quantity and amount. Partial early shipments split that balancing quantity and amount from the BDS row, leaving the remainder unmarked. Full-quantity early shipments keep the original BDS amount on one marked row. BDS totals are preserved.",
+        "BDS reporting month and following month: use Shipment Forecast, supplemented by unassigned/local BDS jobs absent from the forecast.",
+        "BDS reporting month: weekly actuals replace only the exact forecast shipment line already actual; remaining forecast lines are retained.",
+        "Third reporting month onward: ordinary remarks stay blank. Confirmed delayed shipments add Ann rows using the source month's balancing quantity and amount. Partial early shipments split that balancing quantity and amount from the BDS row, leaving the remainder unmarked. Full-quantity early shipments keep the original BDS amount on one marked row. BDS totals are preserved.",
         "Movement checks use the same base job and matching quantities; amounts may differ. First two months also match equal-and-opposite quantity variances.",
         "First-month Missing: a negative variance matches the preceding BDS GAC month's quantity or its remainder after preceding weekly shipments for Delay; a positive variance matches preceding weekly shipment quantities for Early.",
         "Remaining Missing rows in the first two months match later forecast quantities by job total, full-job total, or individual line. A matched forecast line is consumed once.",
