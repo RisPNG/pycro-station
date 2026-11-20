@@ -1,13 +1,14 @@
 """
 The main python file. Run this file to use the app.
 """
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 SHOW_REPO_FIELDS_IN_SETTINGS = False
 import datetime
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -685,25 +686,61 @@ class Settings(QWidget):
     @staticmethod
     def _download_url_to_file(url: str, dst_path: str, *, timeout: int = 60, attempts: int = 3):
         """Download a URL to a local file with retry/backoff for transient network failures."""
-        headers = {"User-Agent": "pycro-station"}
         attempts = max(1, int(attempts))
         last_err: Exception | None = None
 
         for attempt in range(1, attempts + 1):
+            http_status = None
             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=timeout) as resp, open(dst_path, "wb") as out:
-                    shutil.copyfileobj(resp, out)
+                if sys.platform == "win32":
+                    powershell = os.path.join(os.environ["SystemRoot"], "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+                    script = """
+$ProgressPreference = 'SilentlyContinue'
+try {
+    $request = @{
+        Uri = $env:PYCRO_UPDATE_URL
+        OutFile = $env:PYCRO_UPDATE_FILE
+        UserAgent = 'pycro-station'
+        TimeoutSec = [int] $env:PYCRO_UPDATE_TIMEOUT
+        UseBasicParsing = $true
+        ErrorAction = 'Stop'
+    }
+    Invoke-WebRequest @request
+} catch {
+    Write-Output ([int] $_.Exception.Response.StatusCode)
+    Write-Output $_.Exception.Message
+    exit 1
+}
+"""
+                    result = subprocess.run(
+                        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+                        env={
+                            **os.environ,
+                            "PYCRO_UPDATE_URL": url,
+                            "PYCRO_UPDATE_FILE": dst_path,
+                            "PYCRO_UPDATE_TIMEOUT": str(timeout),
+                        },
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        capture_output=True,
+                        encoding="oem",
+                        errors="replace",
+                    )
+                    if result.returncode:
+                        status, _, detail = result.stdout.partition("\n")
+                        if status.strip().isdecimal():
+                            http_status = int(status) or None
+                        raise OSError(detail.strip() or result.stderr.strip() or f"Windows PowerShell exited with code {result.returncode}.")
+                else:
+                    req = urllib.request.Request(url, headers={"User-Agent": "pycro-station"})
+                    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dst_path, "wb") as out:
+                        shutil.copyfileobj(resp, out)
                 return
-            except urllib.error.HTTPError as e:
-                last_err = e
-                code = int(getattr(e, "code", 0) or 0)
-                # Retry 5xx errors; surface others immediately.
-                if not (500 <= code < 600 and attempt < attempts):
-                    raise RuntimeError(f"Failed to download archive (HTTP {e.code}).") from e
-            except (urllib.error.URLError, ConnectionResetError, TimeoutError, OSError) as e:
-                last_err = e
             except Exception as e:
+                if isinstance(e, urllib.error.HTTPError):
+                    http_status = e.code
+                # Retry 5xx errors; surface others immediately.
+                if http_status is not None and not (500 <= http_status < 600 and attempt < attempts):
+                    raise RuntimeError(f"Failed to download archive (HTTP {http_status}).") from e
                 last_err = e
 
             if attempt < attempts:
@@ -876,8 +913,6 @@ class Settings(QWidget):
             ok = False
 
         if not ok:
-            import subprocess
-
             try:
                 kwargs = {"cwd": workdir, "close_fds": True}
                 if os.name == "nt":
